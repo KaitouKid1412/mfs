@@ -1,0 +1,50 @@
+data_dir: data
+
+rolling:
+  windows_years: [3, 5]
+  step: "1w"          # weekly Friday close; flip to "1d" for daily audit run
+
+returns:
+  trading_days_per_year: 252
+  regression_basis: log
+  display_basis: simple
+
+ingest:
+  amfi_nav:
+    backfill_start: "2008-01-01"
+    bulk_window_days: 90
+  benchmarks:
+    history_start: "2008-01-01"
+
+quality:
+  min_history_years_for_ranking: 5
+  max_missing_pct_in_window: 0.05
+
+freshness:
+  # Maximum acceptable staleness for each curated dataset. Pipeline hard-fails
+  # before compute/rank if any check is exceeded.
+  max_nav_lag_bdays: 5             # AMFI NAV (Indian business days)
+  max_bench_lag_bdays: 5           # NSE equity TRI closes
+  max_rf_lag_days: 14              # 91-day T-bill auction (weekly; allow holiday slip)
+  max_scheme_master_lag_days: 1    # scheme master rebuilt within last day
+  max_tbill_scrape_failure_rate: 0.05  # halt T-bill walk if >5% of prids fail their retries
+
+filters:
+  plan_type: DIRECT
+  option_type: GROWTH
+  capture_efficiency_min: 1.00
+  info_ratio_3y_min: 0.2
+  r_squared_band: [0.70, 0.98]
+
+composite_weights:
+  ret_3y_median: 0.20
+  ret_3y_p25:    0.15
+  alpha_3y:      0.25
+  sortino_3y:    0.15
+  info_ratio_3y: 0.15
+  capture_efficiency: 0.10
+
+output:
+  top_n_per_category: 10
+
+pipeline_version: "v1.0.0"
