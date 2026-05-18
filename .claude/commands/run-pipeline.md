@@ -19,7 +19,7 @@ Arguments passed: `$ARGUMENTS`
 ## How to narrate
 
 Before every command:
-- State what stage you're in (e.g., "Stage 3 of 7: NSE benchmark ingestion")
+- State what stage you're in (e.g., "Stage 3 of 10: NSE benchmark ingestion")
 - State what the command will do in one sentence
 - State the expected runtime ("~5 min", "instant")
 
@@ -151,7 +151,115 @@ If `--no-rank-ask`: relax `configs/pipeline.yaml`:
 
 Then rerun `uv run mfs rank --top-n 25`.
 
-## Stage 9: Final report
+## Stage 9: Sanity-check the final output
+
+After the rank stage writes the shortlist CSVs, read every category file back and run a three-tier checklist. Surface findings inline so the user knows whether to trust the output. Do **not** auto-fix anomalies — flag them and let the user decide.
+
+Run this single diagnostic script (it covers all three tiers and prints a structured report):
+
+```bash
+uv run python - <<'PY'
+import polars as pl, glob, os, sys
+from datetime import date
+
+as_of = date.today().isoformat()
+files = sorted(glob.glob(f'data/output/shortlist/{as_of}/*.parquet'))
+EXPECTED_COLS = {
+    "as_of_date","canonical_category","rank","scheme_code","scheme_name","composite_score",
+    "z_ret_3y_median","z_ret_3y_p25","z_alpha_3y_annualized","z_sortino_3y","z_info_ratio_3y",
+    "z_capture_efficiency","ret_3y_median","ret_3y_p25","alpha_3y_annualized","sortino_3y",
+    "info_ratio_3y","capture_up","capture_down","capture_efficiency","r_squared_3y","beta_3y",
+    "data_quality_flag",
+}
+TOP_N_CAP = 25  # matches --top-n on the rank call
+
+structural = []
+statistical = []
+methodological = []
+all_rows = []
+
+for p in files:
+    cat = os.path.basename(p).replace('.parquet','').replace('_',' ')
+    df = pl.read_parquet(p)
+    all_rows.append(df.with_columns(pl.lit(cat).alias('_cat')))
+
+    missing = EXPECTED_COLS - set(df.columns)
+    if missing:
+        structural.append(f"{cat}: missing columns {sorted(missing)}")
+    if df['rank'].to_list() != list(range(1, df.height+1)):
+        structural.append(f"{cat}: ranks not contiguous 1..N")
+    if df['scheme_code'].n_unique() != df.height:
+        structural.append(f"{cat}: duplicate scheme_code within category")
+    if df['composite_score'].null_count() > 0:
+        structural.append(f"{cat}: null composite_score rows")
+    if df.height > TOP_N_CAP:
+        structural.append(f"{cat}: {df.height} rows exceeds top_n cap of {TOP_N_CAP}")
+
+    # Statistical
+    for r in df.iter_rows(named=True):
+        b = r['beta_3y']; r2 = r['r_squared_3y']; a = r['alpha_3y_annualized']; ce = r['capture_efficiency']
+        sc = r['scheme_code']; nm = r['scheme_name']
+        if b is not None and not (0.3 <= b <= 1.5):
+            statistical.append(f"{cat:18s} {sc} {nm[:55]:55s}  beta={b:+.3f} out of [0.3,1.5]")
+        if r2 is not None and r2 < 0.60:
+            statistical.append(f"{cat:18s} {sc} {nm[:55]:55s}  r2={r2:.3f} < 0.60")
+        if a is not None and abs(a) > 0.30:
+            statistical.append(f"{cat:18s} {sc} {nm[:55]:55s}  alpha={a:+.3f} > |30%|")
+        if ce is not None and ce > 2.0:
+            statistical.append(f"{cat:18s} {sc} {nm[:55]:55s}  capture_eff={ce:.3f} > 2.0")
+
+    # near-duplicate composite_scores within category
+    scores = df['composite_score'].to_list()
+    for i in range(len(scores)-1):
+        if scores[i] is not None and scores[i+1] is not None and abs(scores[i]-scores[i+1]) < 1e-3:
+            statistical.append(
+                f"{cat:18s} rank {i+1} and {i+2} composite scores within 1e-3 — possible undetected duplicate"
+            )
+
+    # Methodological
+    if df.height < 3:
+        methodological.append(f"{cat}: only {df.height} fund(s) — peer-relative scoring fragile")
+    bad_quality = df.filter(pl.col('data_quality_flag') != 'GOOD').height
+    if bad_quality > 0:
+        methodological.append(f"{cat}: {bad_quality} shortlisted fund(s) with data_quality_flag != GOOD")
+    top = df.head(1).to_dicts()[0]
+    if top['composite_score'] is not None and top['composite_score'] < 0:
+        methodological.append(f"{cat}: rank-1 fund has negative composite_score ({top['composite_score']:+.3f})")
+    if top['alpha_3y_annualized'] is not None and top['alpha_3y_annualized'] < 0:
+        methodological.append(f"{cat}: rank-1 fund has negative alpha ({top['alpha_3y_annualized']:+.3f})")
+
+# Cross-category overlap
+union = pl.concat(all_rows)
+dup = union.group_by('scheme_code').agg(pl.col('_cat').unique().alias('cats')).filter(pl.col('cats').list.len() > 1)
+if dup.height > 0:
+    for r in dup.iter_rows(named=True):
+        structural.append(f"cross-cat: scheme_code {r['scheme_code']} appears in {r['cats']}")
+
+print(f"=== Structural ({len(structural)}) ===")
+for x in structural: print(f"  FAIL: {x}")
+if not structural: print("  PASS")
+print(f"=== Statistical ({len(statistical)}) ===")
+for x in statistical: print(f"  WARN: {x}")
+if not statistical: print("  PASS")
+print(f"=== Methodological ({len(methodological)}) ===")
+for x in methodological: print(f"  WARN: {x}")
+if not methodological: print("  PASS")
+print(f"\nTotal funds across categories: {union.height}")
+sys.exit(2 if structural else 0)
+PY
+```
+
+**Interpretation rules:**
+- Exit code 2 → at least one **structural** check failed. **STOP**; tell the user the shortlist is corrupted and do NOT present the top picks. Investigate the rank stage code or rerun with `--clean`.
+- Exit code 0 → structural passed. Surface the warnings (if any) inline and continue to the final report.
+
+**Report format to surface to the user:**
+1. Per-tier counts (e.g., "Structural: PASS · Statistical: 3 warnings · Methodological: 1 warning").
+2. If any warnings: a small table listing each flagged row (`category | scheme | metric | value`).
+3. Top-3 per category (rank, scheme_name, composite_score, alpha_3y, sortino_3y) — same as before.
+4. Offer to: open a specific category's CSV, deep-dive into any flagged fund, or rerun with different composite weights.
+
+## Stage 10: Final report
 
 Print to the user:
 - Total schemes ingested
@@ -215,4 +323,4 @@ If you change `configs/pipeline.yaml` (composite weights, filter thresholds, R²
 
 ## End of skill
 
-After Stage 8, end the turn with the final report and the offer-to-inspect prompt. Do not loop. Do not auto-run a second pipeline.
+After Stage 10, end the turn with the final report and the offer-to-inspect prompt. Do not loop. Do not auto-run a second pipeline.

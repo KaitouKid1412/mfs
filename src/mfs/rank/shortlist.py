@@ -47,9 +47,73 @@ OUTPUT_COLS = [
 def _join_scheme_master(metrics: pl.DataFrame) -> pl.DataFrame:
     sm_path = paths.scheme_master_file()
     if not sm_path.exists():
-        return metrics.with_columns(pl.lit(None, dtype=pl.Utf8).alias("scheme_name"))
-    sm = pl.read_parquet(sm_path).select(["scheme_code", "scheme_name"])
+        return metrics.with_columns(
+            pl.lit(None, dtype=pl.Utf8).alias("scheme_name"),
+            pl.lit(None, dtype=pl.Utf8).alias("base_fund_id"),
+        )
+    sm = pl.read_parquet(sm_path).select(["scheme_code", "scheme_name", "base_fund_id"])
     return metrics.join(sm, on="scheme_code", how="left")
+
+
+def _dedupe_legacy_unit_classes(scored: pl.DataFrame) -> pl.DataFrame:
+    """Collapse AMFI's legacy 'Bonus Option' duplicates within each category.
+
+    AMFI lists Growth Option and Bonus Option of the same underlying portfolio under
+    separate scheme_codes with distinct ISINs. Both pass our Direct+Growth filter
+    (the scheme_name contains "Growth Plan"), produce identical NAV histories, and
+    so produce identical metrics. An investor today only buys the Growth Option;
+    the Bonus Option is a legacy listing. Detect by stripping a trailing `_bonus`
+    from base_fund_id, and keep the row with the highest composite_score (ties
+    broken by preferring the non-`_bonus` row).
+    """
+    if "base_fund_id" not in scored.columns or scored.is_empty():
+        return scored
+    with_key = scored.with_columns(
+        pl.col("base_fund_id")
+        .fill_null("")
+        .str.replace(r"_bonus$", "")
+        .alias("_dedup_key"),
+        pl.col("base_fund_id")
+        .fill_null("")
+        .str.ends_with("_bonus")
+        .alias("_is_legacy"),
+    )
+    # Sort priority: non-legacy first (_is_legacy ascending), then highest score
+    # within that class. This guarantees the Bonus Option is dropped whenever a
+    # Growth Option sibling exists, regardless of float-noise rank inversions.
+    winners = (
+        with_key.sort(
+            ["_is_legacy", "composite_score"], descending=[False, True], nulls_last=True
+        )
+        .unique(subset=["canonical_category", "_dedup_key"], keep="first")
+        .select(["canonical_category", "_dedup_key", "scheme_code"])
+        .rename({"scheme_code": "_winner_code"})
+    )
+    enriched = with_key.join(winners, on=["canonical_category", "_dedup_key"], how="left")
+    losers = enriched.filter(pl.col("scheme_code") != pl.col("_winner_code"))
+    for r in losers.iter_rows(named=True):
+        log.info(
+            "rank.dedup.dropped",
+            category=r["canonical_category"],
+            dropped_scheme_code=r["scheme_code"],
+            dropped_scheme_name=r.get("scheme_name"),
+            kept_scheme_code=r["_winner_code"],
+            base_fund_id=r["base_fund_id"],
+            reason="legacy_bonus_option",
+        )
+    if losers.height > 0:
+        tally = losers.group_by("canonical_category").len().sort("canonical_category")
+        log.info(
+            "rank.dedup.tally",
+            total_dropped=losers.height,
+            by_category={
+                r["canonical_category"]: r["len"] for r in tally.iter_rows(named=True)
+            },
+        )
+    return (
+        enriched.filter(pl.col("scheme_code") == pl.col("_winner_code"))
+        .drop(["_dedup_key", "_is_legacy", "_winner_code"])
+    )
 
 
 def rank(
@@ -80,6 +144,7 @@ def rank(
     zscored = zscore_within_category(survivors)
     scored = composite_score(zscored)
     scored = _join_scheme_master(scored)
+    scored = _dedupe_legacy_unit_classes(scored)
     scored = scored.with_columns(pl.lit(as_of).cast(pl.Date).alias("as_of_date"))
 
     out_dir = paths.shortlist_dir(as_of.isoformat())
