@@ -10,14 +10,11 @@ Indian business days approximated by skipping Saturday/Sunday only — the
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
-import polars as pl
-
-from mfs import paths
 from mfs.config import get_pipeline_config
+from mfs.db import queries as q
 from mfs.errors import FreshnessError
-from mfs.ingest.benchmarks import NSE_TRI_MAP, ticker_slug
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -31,6 +28,9 @@ class FreshnessReport:
     benchmark_latest: dict[str, date] = field(default_factory=dict)
     risk_free_latest: date | None = None
     scheme_master_mtime: date | None = None
+    holdings_latest: date | None = None
+    constituents_latest: date | None = None
+    ptr_latest: date | None = None
     issues: list[str] = field(default_factory=list)
 
     def __str__(self) -> str:  # pragma: no cover - cosmetic
@@ -61,61 +61,14 @@ def business_days_between(start: date, end: date) -> int:
     return days
 
 
-def _latest_nav_date() -> date | None:
-    p = paths.nav_daily_dataset()
-    if not p.exists():
-        return None
+def _gather_latest() -> dict:
+    """Single Postgres round-trip for all freshness anchors."""
     try:
-        scan = pl.scan_parquet(str(p / "**" / "*.parquet"))
-        result = scan.select(pl.col("nav_date").max()).collect()
-        if result.is_empty():
-            return None
-        return result.item()
+        return q.latest_dates()
     except Exception as e:  # noqa: BLE001
-        log.warning("freshness.nav_scan_failed", err=str(e))
-        return None
-
-
-def _latest_benchmark_dates() -> dict[str, date]:
-    """Return {ticker_slug: latest close date} for each equity TRI on disk."""
-    out: dict[str, date] = {}
-    root = paths.benchmark_daily_dataset()
-    if not root.exists():
-        return out
-    for ticker, (trad, _) in NSE_TRI_MAP.items():
-        if not trad:
-            continue  # hybrid/multi-asset — needs manual CSV, skip freshness
-        slug = ticker_slug(ticker)
-        part = root / f"ticker={slug}" / "data.parquet"
-        if not part.exists():
-            out[slug] = None  # type: ignore[assignment]
-            continue
-        try:
-            df = pl.read_parquet(part, columns=["date"])
-            out[slug] = df["date"].max()
-        except Exception as e:  # noqa: BLE001
-            log.warning("freshness.bench_scan_failed", ticker=ticker, err=str(e))
-            out[slug] = None  # type: ignore[assignment]
-    return out
-
-
-def _latest_risk_free_date() -> date | None:
-    p = paths.risk_free_daily_file()
-    if not p.exists():
-        return None
-    try:
-        df = pl.read_parquet(p, columns=["date"])
-        return df["date"].max()
-    except Exception as e:  # noqa: BLE001
-        log.warning("freshness.rf_scan_failed", err=str(e))
-        return None
-
-
-def _scheme_master_mtime() -> date | None:
-    p = paths.scheme_master_file()
-    if not p.exists():
-        return None
-    return datetime.fromtimestamp(p.stat().st_mtime).date()
+        log.warning("freshness.db_query_failed", err=str(e))
+        return {"nav_latest": None, "rf_latest": None,
+                "scheme_master_latest": None, "benchmarks": {}}
 
 
 def check_freshness(as_of: date | None = None, *, raise_on_fail: bool = False) -> FreshnessReport:
@@ -128,12 +81,13 @@ def check_freshness(as_of: date | None = None, *, raise_on_fail: bool = False) -
     as_of = as_of or date.today()
     last_bday = last_business_day(as_of)
     report = FreshnessReport(ok=True, as_of=as_of)
+    latest = _gather_latest()
 
     # --- NAV ---
-    nav_latest = _latest_nav_date()
+    nav_latest = latest["nav_latest"]
     report.nav_latest = nav_latest
     if nav_latest is None:
-        report.issues.append("NAV dataset missing (data/curated/nav_daily/).")
+        report.issues.append("NAV dataset missing (nav_daily table empty).")
     else:
         lag = business_days_between(nav_latest, last_bday)
         if lag > cfg.max_nav_lag_bdays:
@@ -143,21 +97,23 @@ def check_freshness(as_of: date | None = None, *, raise_on_fail: bool = False) -
             )
 
     # --- Benchmarks ---
-    bench = _latest_benchmark_dates()
-    report.benchmark_latest = {k: v for k, v in bench.items() if v is not None}
-    for slug, dt in bench.items():
+    bench = latest["benchmarks"]
+    report.benchmark_latest = {t: d for t, d in bench.items() if d is not None}
+    if not bench:
+        report.issues.append("Benchmarks missing (benchmark_daily table empty).")
+    for ticker, dt in bench.items():
         if dt is None:
-            report.issues.append(f"Benchmark missing: ticker_slug={slug}")
+            report.issues.append(f"Benchmark missing: {ticker}")
             continue
         lag = business_days_between(dt, last_bday)
         if lag > cfg.max_bench_lag_bdays:
             report.issues.append(
-                f"Benchmark stale: {slug} latest={dt}, "
+                f"Benchmark stale: {ticker} latest={dt}, "
                 f"lag={lag} bdays > max={cfg.max_bench_lag_bdays}"
             )
 
     # --- Risk-free ---
-    rf_latest = _latest_risk_free_date()
+    rf_latest = latest["rf_latest"]
     report.risk_free_latest = rf_latest
     if rf_latest is None:
         report.issues.append("Risk-free series missing.")
@@ -170,17 +126,53 @@ def check_freshness(as_of: date | None = None, *, raise_on_fail: bool = False) -
             )
 
     # --- Scheme master ---
-    sm_mtime = _scheme_master_mtime()
-    report.scheme_master_mtime = sm_mtime
-    if sm_mtime is None:
-        report.issues.append("Scheme master not built.")
+    sm_latest = latest["scheme_master_latest"]
+    report.scheme_master_mtime = sm_latest
+    if sm_latest is None:
+        report.issues.append("Scheme master not built (scheme_master table empty).")
     else:
-        lag = (as_of - sm_mtime).days
+        lag = (as_of - sm_latest).days
         if lag > cfg.max_scheme_master_lag_days:
             report.issues.append(
-                f"Scheme master stale: built {sm_mtime}, "
+                f"Scheme master stale: last_seen={sm_latest}, "
                 f"lag={lag} days > max={cfg.max_scheme_master_lag_days}"
             )
+
+    # --- Holdings / constituents / PTR / ADV / AUM (Phase 2.2+ / 2.3+) ---
+    # Each is independently togglable via its lag threshold in pipeline.yaml.
+    # None = skip entirely.
+    for label, threshold, getter, setter in (
+        ("Holdings", cfg.max_holdings_lag_days, q.latest_holdings_date,
+         lambda v: setattr(report, "holdings_latest", v)),
+        ("Index constituents", cfg.max_constituents_lag_days,
+         q.latest_constituents_date,
+         lambda v: setattr(report, "constituents_latest", v)),
+        ("Portfolio turnover", cfg.max_ptr_lag_days, q.latest_ptr_date,
+         lambda v: setattr(report, "ptr_latest", v)),
+        ("Stock ADV", cfg.max_stock_adv_lag_days, q.latest_stock_adv_date,
+         lambda v: None),  # no separate field on report — query stays nominal
+        ("Scheme AUM", cfg.max_aum_lag_days, q.latest_aum_date,
+         lambda v: None),
+    ):
+        if threshold is None:
+            continue
+        try:
+            latest = getter()
+        except Exception as e:  # noqa: BLE001
+            log.warning("freshness.query_failed", source=label, err=str(e))
+            latest = None
+        setter(latest)
+        if latest is None:
+            report.issues.append(
+                f"{label} missing but max_{label.lower().replace(' ', '_')}"
+                "_lag_days is set; ingest or set the threshold to null to skip."
+            )
+        else:
+            lag = (as_of - latest).days
+            if lag > threshold:
+                report.issues.append(
+                    f"{label} stale: latest={latest}, lag={lag} days > max={threshold}"
+                )
 
     report.ok = not report.issues
     if not report.ok:

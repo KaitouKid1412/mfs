@@ -1,4 +1,5 @@
-"""Top-level ranker: filters → zscore → score → write shortlist per category."""
+"""Top-level ranker: filters → zscore → composite_score_stage1 → write
+shortlist per category, then orchestrate Stage 2 and Stage 3."""
 
 from __future__ import annotations
 
@@ -8,16 +9,18 @@ from pathlib import Path
 import polars as pl
 
 from mfs import paths
-from mfs.config import get_pipeline_config
-from mfs.io.parquet import read_partition
+from mfs.db import queries as q
 from mfs.rank.filters import apply_hard_filters
-from mfs.rank.score import composite_score
+from mfs.rank.score import composite_score_stage1
 from mfs.rank.zscore import zscore_within_category
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-OUTPUT_COLS = [
+# Stage 1 only carries Phase 1 metric columns. Phase 2 columns (active_share,
+# style_drift, ptr, aum_impact) are intentionally omitted from Stage 1 output
+# — the architecture says Stage 1 is pure Performance & Consistency.
+STAGE1_OUTPUT_COLS = [
     "as_of_date",
     "canonical_category",
     "rank",
@@ -26,12 +29,16 @@ OUTPUT_COLS = [
     "composite_score",
     "z_ret_3y_median",
     "z_ret_3y_p25",
+    "z_ret_5y_median",
+    "z_ret_5y_p25",
     "z_alpha_3y_annualized",
     "z_sortino_3y",
     "z_info_ratio_3y",
     "z_capture_efficiency",
     "ret_3y_median",
     "ret_3y_p25",
+    "ret_5y_median",
+    "ret_5y_p25",
     "alpha_3y_annualized",
     "sortino_3y",
     "info_ratio_3y",
@@ -43,28 +50,28 @@ OUTPUT_COLS = [
     "data_quality_flag",
 ]
 
+REPORT_TOP_N_PER_CATEGORY = 5
+REPORT_FILENAME = "mf_report"
+
 
 def _join_scheme_master(metrics: pl.DataFrame) -> pl.DataFrame:
-    sm_path = paths.scheme_master_file()
-    if not sm_path.exists():
+    sm = q.scheme_master()
+    if sm.is_empty():
         return metrics.with_columns(
             pl.lit(None, dtype=pl.Utf8).alias("scheme_name"),
             pl.lit(None, dtype=pl.Utf8).alias("base_fund_id"),
         )
-    sm = pl.read_parquet(sm_path).select(["scheme_code", "scheme_name", "base_fund_id"])
+    sm = sm.select(["scheme_code", "scheme_name", "base_fund_id"])
     return metrics.join(sm, on="scheme_code", how="left")
 
 
 def _dedupe_legacy_unit_classes(scored: pl.DataFrame) -> pl.DataFrame:
     """Collapse AMFI's legacy 'Bonus Option' duplicates within each category.
 
-    AMFI lists Growth Option and Bonus Option of the same underlying portfolio under
-    separate scheme_codes with distinct ISINs. Both pass our Direct+Growth filter
-    (the scheme_name contains "Growth Plan"), produce identical NAV histories, and
-    so produce identical metrics. An investor today only buys the Growth Option;
-    the Bonus Option is a legacy listing. Detect by stripping a trailing `_bonus`
-    from base_fund_id, and keep the row with the highest composite_score (ties
-    broken by preferring the non-`_bonus` row).
+    AMFI lists Growth Option and Bonus Option of the same underlying portfolio
+    under separate scheme_codes; both pass our Direct+Growth filter, produce
+    identical NAV histories, and so produce identical metrics. Keep the
+    Growth Option (non-`_bonus`); drop the Bonus Option.
     """
     if "base_fund_id" not in scored.columns or scored.is_empty():
         return scored
@@ -78,9 +85,6 @@ def _dedupe_legacy_unit_classes(scored: pl.DataFrame) -> pl.DataFrame:
         .str.ends_with("_bonus")
         .alias("_is_legacy"),
     )
-    # Sort priority: non-legacy first (_is_legacy ascending), then highest score
-    # within that class. This guarantees the Bonus Option is dropped whenever a
-    # Growth Option sibling exists, regardless of float-noise rank inversions.
     winners = (
         with_key.sort(
             ["_is_legacy", "composite_score"], descending=[False, True], nulls_last=True
@@ -116,46 +120,90 @@ def _dedupe_legacy_unit_classes(scored: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def rank(
+def build_scored_stage1(
     as_of: date | None = None,
     category: str | None = None,
-    top_n: int | None = None,
     skip_filters: bool = False,
-) -> dict[str, Path]:
-    cfg = get_pipeline_config()
-    as_of = as_of or _latest_metrics_date()
+) -> tuple[date, pl.DataFrame]:
+    """Stage 1 in-memory: load metrics, filter, z-score, composite_score_stage1,
+    dedupe legacy bonus options. Returns ``(as_of, scored_dataframe)``.
+    """
+    as_of = as_of or q.latest_computed_metrics_date()
     if as_of is None:
-        raise RuntimeError("No computed_metrics available; run `mfs compute metrics` first")
-    top_n = top_n or cfg.output.top_n_per_category
+        raise RuntimeError("No computed_metrics available; run `mfs compute phase1` first")
 
-    metrics = read_partition(paths.computed_metrics_dataset(), as_of.isoformat(), "as_of_date")
+    metrics = q.computed_metrics_at(as_of)
     if metrics.is_empty():
-        raise RuntimeError(f"No metrics partition for as_of={as_of.isoformat()}")
+        raise RuntimeError(f"No computed_metrics rows for as_of={as_of.isoformat()}")
 
     if skip_filters:
-        # Debug path: keep all schemes with a canonical_category and required metrics non-null
         survivors = metrics.filter(pl.col("canonical_category").is_not_null())
-        survivors = survivors.filter(pl.col("alpha_3y_annualized").is_not_null())
     else:
         survivors = apply_hard_filters(metrics)
     if category:
         survivors = survivors.filter(pl.col("canonical_category") == category)
 
     zscored = zscore_within_category(survivors)
-    scored = composite_score(zscored)
+    scored = composite_score_stage1(zscored)
     scored = _join_scheme_master(scored)
     scored = _dedupe_legacy_unit_classes(scored)
     scored = scored.with_columns(pl.lit(as_of).cast(pl.Date).alias("as_of_date"))
+    return as_of, scored
 
-    out_dir = paths.shortlist_dir(as_of.isoformat())
+
+def _write_stage1_outputs(scored: pl.DataFrame, as_of: date) -> dict[str, Path]:
+    """Disk-write side of Stage 1: per-category CSV + parquet plus the
+    consolidated ``mf_report`` (top-5 per category)."""
+    out_dir = paths.shortlist_dir(as_of.isoformat()) / "stage1"
     out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
+    report_chunks: list[pl.DataFrame] = []
+    for cat, grp in scored.group_by("canonical_category"):
+        cat_name = cat[0]
+        ranked = grp.sort("composite_score", descending=True).with_row_index(
+            "rank", offset=1,
+        )
+        cols = [c for c in STAGE1_OUTPUT_COLS if c in ranked.columns]
+        slim = ranked.select(cols)
+        safe = "".join(c if c.isalnum() else "_" for c in cat_name)
+        parquet_path = out_dir / f"{safe}.parquet"
+        csv_path = out_dir / f"{safe}.csv"
+        slim.write_parquet(parquet_path, compression="zstd")
+        slim.write_csv(csv_path)
+        written[cat_name] = csv_path
+        report_chunks.append(slim.head(REPORT_TOP_N_PER_CATEGORY))
+    if report_chunks:
+        report = pl.concat(report_chunks, how="diagonal_relaxed").sort(
+            ["canonical_category", "rank"]
+        )
+        report.write_csv(out_dir / f"{REPORT_FILENAME}.csv")
+        report.write_parquet(
+            out_dir / f"{REPORT_FILENAME}.parquet", compression="zstd",
+        )
+    return written
+
+
+def rank(
+    as_of: date | None = None,
+    category: str | None = None,
+    top_n: int | None = None,
+    skip_filters: bool = False,
+) -> dict[str, Path]:
+    """Stage 1 only. Apply hard filters + z-score + composite_score_stage1
+    and write per-category CSVs under ``<as_of>/stage1/``."""
+    as_of, scored = build_scored_stage1(
+        as_of=as_of, category=category, skip_filters=skip_filters,
+    )
+    out_dir = paths.shortlist_dir(as_of.isoformat()) / "stage1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+    report_chunks: list[pl.DataFrame] = []
     for cat, grp in scored.group_by("canonical_category"):
         cat_name = cat[0]
         ranked = grp.sort("composite_score", descending=True).with_row_index("rank", offset=1)
-        ranked = ranked.head(top_n)
-        # Ensure we only project the OUTPUT_COLS that actually exist
-        cols = [c for c in OUTPUT_COLS if c in ranked.columns]
+        if top_n is not None:
+            ranked = ranked.head(top_n)
+        cols = [c for c in STAGE1_OUTPUT_COLS if c in ranked.columns]
         slim = ranked.select(cols)
         safe = "".join(c if c.isalnum() else "_" for c in cat_name)
         parquet_path = out_dir / f"{safe}.parquet"
@@ -164,19 +212,168 @@ def rank(
         slim.write_csv(csv_path)
         written[cat_name] = csv_path
         log.info("rank.category_written", category=cat_name, n=slim.height, path=str(csv_path))
+        report_chunks.append(slim.head(REPORT_TOP_N_PER_CATEGORY))
+
+    if report_chunks:
+        report = pl.concat(report_chunks, how="diagonal_relaxed").sort(
+            ["canonical_category", "rank"]
+        )
+        report_csv = out_dir / f"{REPORT_FILENAME}.csv"
+        report_parquet = out_dir / f"{REPORT_FILENAME}.parquet"
+        report.write_csv(report_csv)
+        report.write_parquet(report_parquet, compression="zstd")
+        log.info(
+            "rank.report_written",
+            n_rows=report.height,
+            n_categories=len(report_chunks),
+            top_n_per_category=REPORT_TOP_N_PER_CATEGORY,
+            path=str(report_csv),
+        )
 
     return written
 
 
-def _latest_metrics_date() -> date | None:
-    root = paths.computed_metrics_dataset()
-    if not root.exists():
-        return None
-    parts = sorted(root.glob("as_of_date=*"))
-    if not parts:
-        return None
-    last = parts[-1].name.split("=", 1)[1]
-    try:
-        return date.fromisoformat(last)
-    except ValueError:
-        return None
+def _top_n_per_category(scored: pl.DataFrame, n: int) -> pl.DataFrame:
+    """Return the top-N rows per ``canonical_category`` from a scored frame."""
+    if scored.is_empty():
+        return scored
+    return (
+        scored.sort(
+            ["canonical_category", "composite_score"],
+            descending=[False, True], nulls_last=True,
+        )
+        .group_by("canonical_category", maintain_order=True)
+        .head(n)
+    )
+
+
+def _build_aum_map(scored: pl.DataFrame) -> dict[str, float]:
+    if scored.is_empty():
+        return {}
+    codes = scored["scheme_code"].unique().to_list()
+    aum_map: dict[str, float] = {}
+    for code in codes:
+        row = q.latest_scheme_aum(code)
+        if row is not None:
+            aum_map[code] = float(row[1])
+    return aum_map
+
+
+def _latest_holdings_loader():
+    def loader(scheme_code: str) -> pl.DataFrame:
+        h = q.holdings_for_scheme(scheme_code)
+        if h.is_empty():
+            return h
+        last_month = h["as_of_month"].max()
+        return h.filter(pl.col("as_of_month") == last_month)
+    return loader
+
+
+def rank_deep(
+    as_of: date | None = None,
+    pool_size: int = 20,
+    final_size: int = 5,
+    overlap_threshold_pct: float = 30.0,
+    *,
+    skip_phase2_compute: bool = False,
+) -> dict:
+    """Three-stage staged pipeline.
+
+    Stage 1: load computed_metrics, hard-filter, z-score, ``composite_score_stage1``,
+    dedupe; write ``<as_of>/stage1/``.
+    Stage 2: take top ``pool_size`` per category from Stage 1, run Phase 2
+    compute on just those schemes (unless ``skip_phase2_compute=True``), then
+    re-z-score and re-composite with Stage 2 weights; write ``<as_of>/stage2/``.
+    Stage 3: iterative pairwise-overlap drop on Stage 2 survivors; write
+    ``<as_of>/stage3/``.
+    """
+    from mfs.compute import orchestrator
+    from mfs.rank import stage2 as stage2_mod
+    from mfs.rank import stage3 as stage3_mod
+
+    # Stage 1.
+    as_of, scored_stage1 = build_scored_stage1(as_of=as_of)
+    stage1_paths = _write_stage1_outputs(scored_stage1, as_of)
+    out_dir = paths.shortlist_dir(as_of.isoformat())
+
+    # Identify Stage 2 candidate pool: top-N per category from Stage 1.
+    pool_df = _top_n_per_category(scored_stage1, n=pool_size)
+    candidate_codes = pool_df["scheme_code"].unique().to_list()
+
+    # Phase 2 compute, restricted to the candidate set (~520 schemes).
+    if not skip_phase2_compute and candidate_codes:
+        orchestrator.run_phase2(as_of=as_of, scheme_codes=candidate_codes)
+
+    # Reload computed_metrics for the candidate set so Stage 2 sees the
+    # filled Phase 2 columns. Join scheme_master back on for scheme_name +
+    # base_fund_id since the raw computed_metrics row doesn't carry those.
+    candidates_with_phase2 = q.computed_metrics_for_schemes(as_of, candidate_codes)
+    if candidates_with_phase2.is_empty():
+        log.warning("rank.rank_deep.no_candidates_after_phase2")
+        stage2_result = {
+            "stage2_dir": str(out_dir / "stage2"),
+            "category_files": {},
+            "dropped_file": "",
+            "coverage_file": "",
+            "n_survivors": 0,
+            "n_dropped": 0,
+            "survivors": pl.DataFrame(),
+            "dropped": pl.DataFrame(),
+            "coverage": pl.DataFrame(),
+        }
+    else:
+        candidates_with_phase2 = _join_scheme_master(candidates_with_phase2)
+        # Carry source_amc from holdings if present in the original Stage 1
+        # scored frame (Stage 2's coverage report uses it).
+        if "source_amc" in scored_stage1.columns:
+            sa = scored_stage1.select(["scheme_code", "source_amc"]).unique(
+                subset=["scheme_code"], keep="first"
+            )
+            candidates_with_phase2 = candidates_with_phase2.join(
+                sa, on="scheme_code", how="left",
+            )
+        # Re-score with Stage 1 weights so stage2.apply_stage2 has the
+        # ``composite_score_stage1`` it needs for pool ranking.
+        zscored = zscore_within_category(candidates_with_phase2)
+        scored_pool = composite_score_stage1(zscored)
+        aum_map = _build_aum_map(scored_pool)
+        stage2_result = stage2_mod.run(
+            scored_pool, aum_map, out_dir,
+            pool_size=pool_size, final_size=final_size,
+        )
+
+    # Stage 3.
+    stage3_result = stage3_mod.run(
+        stage2_result["survivors"],
+        _latest_holdings_loader(),
+        out_dir,
+        threshold_pct=overlap_threshold_pct,
+    )
+
+    log.info(
+        "rank.rank_deep.done",
+        n_stage1_categories=len(stage1_paths),
+        n_stage2_survivors=stage2_result["n_survivors"],
+        n_stage2_dropped=stage2_result["n_dropped"],
+        n_stage3_final=stage3_result["n_final"],
+        n_stage3_dropped=stage3_result["n_dropped"],
+    )
+    return {
+        "as_of": as_of.isoformat(),
+        "out_dir": str(out_dir),
+        "stage1": {cat: str(p) for cat, p in stage1_paths.items()},
+        "stage2": {
+            "dir": stage2_result["stage2_dir"],
+            "n_survivors": stage2_result["n_survivors"],
+            "n_dropped": stage2_result["n_dropped"],
+            "coverage_file": stage2_result["coverage_file"],
+            "dropped_file": stage2_result["dropped_file"],
+        },
+        "stage3": {
+            "dir": stage3_result["stage3_dir"],
+            "n_final": stage3_result["n_final"],
+            "n_dropped": stage3_result["n_dropped"],
+            "dropped_file": stage3_result["dropped_file"],
+            "overlap_pairs_file": stage3_result["overlap_pairs_file"],
+        },
+    }

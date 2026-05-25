@@ -79,6 +79,26 @@ Hard rules: if RBI returns 5xx for more than `max_tbill_scrape_failure_rate` (de
 
 `uv run mfs build scheme-master` — ~5 sec. Derives the canonical scheme dimension from today's AMFI NAVAll snapshot + the NAV history. Should report ~14k rows.
 
+## Stage 5b: Manager-tenure ingest (Phase 2.1+)
+
+`uv run mfs ingest managers` — runs every registered AMC adapter (currently `hdfc`; more added in Phase 2.1 PRs). Each adapter downloads the latest monthly factsheet PDF, parses out per-scheme (manager_name, start_date) rows, fuzzy-matches scheme names to scheme_codes, and writes to the `managers` table. Expected ~10-30 sec per AMC adapter.
+
+Coverage report per AMC:
+- `rows_written` — rows upserted to the managers table.
+- `matched_schemes` — printed scheme names that matched something in scheme_master.
+- `unmatched` — printed names that scored below the fuzzy-match threshold (logged with their best score). Investigate if this number is non-trivial.
+
+If an adapter raises `IngestError`, **stop** and surface the cause. Likely root causes:
+- URL pattern changed (AMC moved their factsheet location).
+- Layout changed (parser extracts 0 manager rows).
+- Scheme master amc_code doesn't match the adapter's amc_slug — re-run `mfs build scheme-master` after fresh NAV ingest.
+
+If `max_manager_data_lag_days` in pipeline.yaml is non-null and the managers table is older than that window, freshness check (Stage 6) will fail. Either re-run this stage or temporarily set the threshold to null while debugging.
+
+### Stage 5b.1 (optional): User-provided manager gap-fill (Phase 3.B)
+
+`uv run mfs ingest managers --user-provided` — loads `data/raw/managers/user_provided.csv` if it exists. This is the narrow gap-fill path for genuinely un-scrapable AMCs: user supplies complete `(scheme_code, manager_name, manager_start_date, is_lead)` tuples and they're upserted with `source_amc='user'`. The CSV is OPTIONAL — if absent, this stage no-ops cleanly. If present, unknown scheme_codes are skipped (logged) and malformed rows are rejected per-row without crashing the stage. Run it AFTER the factsheet adapters so user rows can overwrite an auto-scraped value on the same `(scheme, manager, start_date)` PK if needed.
+
 ## Stage 6: Freshness gate (always run before compute)
 
 `uv run python -c "from mfs.freshness import check_freshness; r = check_freshness(raise_on_fail=True); print(r)"`
@@ -98,7 +118,17 @@ uv run python -c "
 import polars as pl
 df = pl.read_parquet('data/metrics/computed_metrics/as_of_date=$(date +%Y-%m-%d)/data.parquet')
 print('Total:', df.height)
-for col in ['r_squared_3y','beta_3y','capture_efficiency','info_ratio_3y','alpha_3y_annualized']:
+cols = [
+    'r_squared_3y','beta_3y','capture_efficiency','info_ratio_3y','alpha_3y_annualized',
+    # Phase 2 metrics (beta_3y_std, r_squared_3y_mean, style_drift_3y populated
+    # from v2.0; the remainder are filled by Phase 2.1-2.3).
+    'beta_3y_std','r_squared_3y_mean','style_drift_3y',
+    'active_share_median_1y','ptr_latest','aum_impact_cost_days',
+    'stress_test_days_50pct','manager_tenure_years',
+]
+for col in cols:
+    if col not in df.columns:
+        continue
     s = df[col].drop_nulls()
     if not s.is_empty():
         print(f'{col:25s} p25={s.quantile(0.25):.3f}  med={s.median():.3f}  p75={s.quantile(0.75):.3f}')
@@ -163,12 +193,25 @@ import polars as pl, glob, os, sys
 from datetime import date
 
 as_of = date.today().isoformat()
-files = sorted(glob.glob(f'data/output/shortlist/{as_of}/*.parquet'))
+# Per-category parquets only — exclude the consolidated mf_report.parquet (validated separately).
+files = sorted(
+    p for p in glob.glob(f'data/output/shortlist/{as_of}/stage1/*.parquet')
+    if not os.path.basename(p).startswith('mf_report')
+)
 EXPECTED_COLS = {
     "as_of_date","canonical_category","rank","scheme_code","scheme_name","composite_score",
     "z_ret_3y_median","z_ret_3y_p25","z_alpha_3y_annualized","z_sortino_3y","z_info_ratio_3y",
     "z_capture_efficiency","ret_3y_median","ret_3y_p25","alpha_3y_annualized","sortino_3y",
     "info_ratio_3y","capture_up","capture_down","capture_efficiency","r_squared_3y","beta_3y",
+    # Phase 2 columns. z_active_share_median_1y and z_style_drift_3y may be all-null
+    # until Phase 2.1+ ingestion lands, but the columns must be present in the
+    # shortlist schema.
+    "z_active_share_median_1y","z_style_drift_3y",
+    "beta_3y_std","r_squared_3y_mean","style_drift_3y",
+    "active_share_median_1y","ptr_latest","aum_impact_cost_days",
+    "stress_test_days_50pct","manager_tenure_years",
+    # Phase 3.F transparency column.
+    "tenure_data_status",
     "data_quality_flag",
 }
 TOP_N_CAP = 25  # matches --top-n on the rank call
@@ -259,7 +302,26 @@ PY
 3. Top-3 per category (rank, scheme_name, composite_score, alpha_3y, sortino_3y) — same as before.
 4. Offer to: open a specific category's CSV, deep-dive into any flagged fund, or rerun with different composite weights.
 
-## Stage 10: Final report
+## Stage 10: Two-stage deep ranking (Phase 3 hybrid)
+
+`uv run mfs rank-deep`
+
+This is the production ranking path. It runs Stage 1 (same as `mfs rank` above), then layers Stage 2 + Stage 3 on top:
+
+- **Stage 2 — Phase 2 data-completeness filter**. From each category's Stage 1 top-20, keep only funds that have every Phase 2 metric measured (Style Drift, Active Share, PTR, AUM Impact Cost, Manager Tenure — plus Stress Test for Mid Cap / Small Cap only). Output: top-5 survivors per category at `data/output/shortlist/<as_of>/stage2/<category>.csv`. If fewer than 5 survive in a category, every row gets `partial_coverage_flag=True`. Also emits:
+  - `stage2/dropped.csv` — every fund dropped from a Stage 2 pool with the list of NULL metrics that disqualified it + AUM.
+  - `stage2/coverage.csv` — per-category n/AUM survival rates with `top_dropped_amc` (the AMC contributing the most drops in that category — i.e. the next ingest gap to close).
+
+- **Stage 3 — Cross-category pairwise overlap**. Across the full Stage 2 survivor set, compute pairwise portfolio overlap (sum of min-weight on shared securities, keyed by ISIN when present, normalized security_name as fallback). Pairs above 30% overlap get listed in `stage3/overlap_pairs.csv` with their top-3 shared holdings; no funds are dropped — this is informational so the user knows which pairs are too correlated to hold together. Summary at `stage3/overlap_summary.csv`.
+
+Surface to the user after `rank-deep` runs:
+1. **Coverage summary**: how many categories had < 5 survivors and why (from `coverage.csv`).
+2. **Top dropped AMC overall**: the AMC most often missing data — the next ingestion gap to fix.
+3. **Pairs flagged for overlap**: if any, list them with their overlap % so the user can prune their selection.
+
+If the user is using `--no-rank-ask`, default to skipping the Stage 2/3 review prompt and just report the file paths.
+
+## Stage 11: Final report
 
 Print to the user:
 - Total schemes ingested

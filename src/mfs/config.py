@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -49,6 +50,14 @@ class FreshnessConfig(BaseModel):
     max_rf_lag_days: int = 14  # T-bills auction weekly; allow holiday slip
     max_scheme_master_lag_days: int = 1
     max_tbill_scrape_failure_rate: float = 0.05
+    # Phase 2.1+ ingestion staleness windows. None = freshness check skipped
+    # (used when an ingestion stage hasn't shipped yet, so the table is empty).
+    max_holdings_lag_days: Optional[int] = 45        # monthly disclosures (AMFI mandate: by 10th)
+    max_constituents_lag_days: Optional[int] = 45    # monthly index rebalance cadence
+    max_ptr_lag_days: Optional[int] = 45             # same as holdings (same source PDF)
+    # Phase 2.3
+    max_stock_adv_lag_days: Optional[int] = 7        # NSE bhavcopy daily; allow weekend slip
+    max_aum_lag_days: Optional[int] = 45             # AUM tracks holdings cadence
 
 
 class FiltersConfig(BaseModel):
@@ -63,6 +72,44 @@ class OutputConfig(BaseModel):
     top_n_per_category: int = 10
 
 
+class PtrPenalty(BaseModel):
+    """Soft-penalty curve for high Portfolio Turnover Ratio (Phase 2.2.H).
+
+    PTR is stored as a fraction (1.27 = 127% turnover). The penalty ramps
+    linearly above `threshold` and caps at `max_penalty`:
+
+        penalty(ptr) = clip(0, max_penalty,
+                            max_penalty × max(0, (ptr − threshold) / threshold))
+
+    For threshold=1.50 and max_penalty=0.10: PTR=1.50 → 0, PTR=3.00 → 0.10
+    (capped). Disabled flag → no deduction even when PTR is high.
+    """
+    enabled: bool = True
+    max_penalty: float = 0.10
+    threshold: float = 1.50   # 150% PTR begins the penalty ramp
+
+
+class AumImpactCostPenalty(BaseModel):
+    """Soft-penalty curve for AUM Impact Cost (days-to-liquidate).
+
+    Mirrors PtrPenalty but on a days scale: the ramp begins at
+    ``threshold_days`` and caps at ``max_penalty``. Null impact-cost → exempt
+    (the row didn't reach Stage 2 anyway if Phase 2.3.C couldn't measure it).
+    """
+    enabled: bool = True
+    max_penalty: float = 0.05
+    threshold_days: float = 5.0
+
+
+class SoftPenaltiesConfig(BaseModel):
+    """Non-linear penalty terms layered on top of the Stage 2 z-score
+    composite. Each penalty has its own enabled flag so we can A/B individual
+    signals without re-jiggering the weights vector. Stage 1 ignores these.
+    """
+    ptr: PtrPenalty = Field(default_factory=PtrPenalty)
+    aum_impact_cost: AumImpactCostPenalty = Field(default_factory=AumImpactCostPenalty)
+
+
 class PipelineConfig(BaseModel):
     data_dir: str = "data"
     rolling: RollingConfig
@@ -71,7 +118,9 @@ class PipelineConfig(BaseModel):
     quality: QualityConfig
     freshness: FreshnessConfig = Field(default_factory=FreshnessConfig)
     filters: FiltersConfig
-    composite_weights: dict[str, float]
+    composite_weights_stage1: dict[str, float]
+    composite_weights_stage2: dict[str, float]
+    soft_penalties: SoftPenaltiesConfig = Field(default_factory=SoftPenaltiesConfig)
     output: OutputConfig
     pipeline_version: str = "v1.0.0"
 

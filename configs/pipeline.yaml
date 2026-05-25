@@ -11,10 +11,12 @@ returns:
 
 ingest:
   amfi_nav:
-    backfill_start: "2008-01-01"
+    # 2013-01-01 = SEBI's mandated Direct Plan launch date. Pre-2013 there were
+    # only Regular Plans, which we don't rank anyway.
+    backfill_start: "2013-01-01"
     bulk_window_days: 90
   benchmarks:
-    history_start: "2008-01-01"
+    history_start: "2013-01-01"
 
 quality:
   min_history_years_for_ranking: 5
@@ -28,6 +30,16 @@ freshness:
   max_rf_lag_days: 14              # 91-day T-bill auction (weekly; allow holiday slip)
   max_scheme_master_lag_days: 1    # scheme master rebuilt within last day
   max_tbill_scrape_failure_rate: 0.05  # halt T-bill walk if >5% of prids fail their retries
+  # Phase 2.2+: holdings, benchmark constituents, and PTR. All monthly cadence
+  # (AMFI mandate: publish by 10th of next month) — 45-day lag is one full
+  # cycle plus slack. Set to null while the corresponding tables are empty.
+  max_holdings_lag_days: null
+  max_constituents_lag_days: null
+  max_ptr_lag_days: null
+  # Phase 2.3: stock ADV (NSE bhavcopy), per-scheme AUM.
+  # All null until the respective ingestion stage has shipped data.
+  max_stock_adv_lag_days: null
+  max_aum_lag_days: null
 
 filters:
   plan_type: DIRECT
@@ -36,15 +48,49 @@ filters:
   info_ratio_3y_min: 0.2
   r_squared_band: [0.70, 0.98]
 
-composite_weights:
-  ret_3y_median: 0.20
-  ret_3y_p25:    0.15
+composite_weights_stage1:
+  # Stage 1 — Performance & Consistency only. Positive weights sum to 1.00.
+  # No Phase 2 metrics; no pro-rata redistribution (all eight z-scores are
+  # available for every fund that survives the hard-filter floor).
+  ret_3y_median: 0.15
+  ret_3y_p25:    0.10
+  ret_5y_median: 0.15
+  ret_5y_p25:    0.10
   alpha_3y:      0.25
-  sortino_3y:    0.15
-  info_ratio_3y: 0.15
-  capture_efficiency: 0.10
+  sortino_3y:    0.10
+  info_ratio_3y: 0.10
+  capture_efficiency: 0.05
+
+composite_weights_stage2:
+  # Stage 2 — re-rank the top-20 per category from Stage 1 with Phase 2
+  # metrics layered in. Positive weights sum to 0.95; style_drift is a
+  # signed penalty subtracted on top, and PTR + AUM-Impact soft penalties
+  # ramp on top of that.
+  ret_3y_median: 0.10
+  ret_3y_p25:    0.07
+  ret_5y_median: 0.10
+  ret_5y_p25:    0.07
+  alpha_3y:      0.20
+  sortino_3y:    0.08
+  info_ratio_3y: 0.08
+  capture_efficiency: 0.05
+  active_share:  0.10
+  style_drift:  -0.05
+
+soft_penalties:
+  # Non-linear deductions layered on top of the Stage 2 z-score composite.
+  # Each penalty has its own enabled flag so we can A/B individual signals
+  # without re-balancing the weights vector. Stage 1 ignores these.
+  ptr:
+    enabled: true
+    max_penalty: 0.05
+    threshold: 1.50        # 150% PTR begins the ramp (Phase 2.2.H)
+  aum_impact_cost:
+    enabled: true
+    max_penalty: 0.05
+    threshold_days: 5.0    # days-to-liquidate above 5 begins the ramp
 
 output:
   top_n_per_category: 10
 
-pipeline_version: "v1.0.0"
+pipeline_version: "v2.3.0-phase2.3a"

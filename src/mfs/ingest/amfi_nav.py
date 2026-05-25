@@ -22,9 +22,9 @@ import polars as pl
 
 from mfs import paths
 from mfs.config import get_pipeline_config
+from mfs.db import writers as w
 from mfs.errors import IngestError
 from mfs.io import http
-from mfs.io.parquet import write_partition
 from mfs.utils.calendar import iter_windows
 from mfs.utils.logging import get_logger
 
@@ -182,27 +182,15 @@ def _save_raw(content: bytes, path: Path) -> Path:
 
 
 def _append_year_partition(new_rows: pl.DataFrame) -> list[int]:
-    """Merge new_rows into nav_daily/year=YYYY/data.parquet partitions, deduping on
-    (scheme_code, nav_date). Returns the list of years touched."""
+    """Upsert NAV rows into Postgres (idempotent on PK scheme_code, nav_date) and
+    refresh the fund_log_returns cache for affected schemes. The
+    `_append_year_partition` name is retained for callsite compatibility — the
+    actual partitioning is by table/PK now, not by parquet year folder."""
     if new_rows.is_empty():
         return []
-    years_touched: set[int] = set()
-    new_rows = new_rows.with_columns(pl.col("nav_date").dt.year().alias("year"))
-    for year, chunk in new_rows.group_by("year"):
-        year_int = int(year[0])
-        part = paths.nav_daily_dataset() / f"year={year_int}" / "data.parquet"
-        chunk = chunk.drop("year")
-        if part.exists():
-            existing = pl.read_parquet(part)
-            combined = pl.concat([existing, chunk], how="diagonal_relaxed")
-        else:
-            combined = chunk
-        combined = combined.unique(subset=["scheme_code", "nav_date"], keep="last").sort(
-            ["scheme_code", "nav_date"]
-        )
-        write_partition(combined, paths.nav_daily_dataset(), str(year_int), "year")
-        years_touched.add(year_int)
-    return sorted(years_touched)
+    w.upsert_nav_daily(new_rows)
+    years = sorted(set(int(d.year) for d in new_rows["nav_date"].to_list()))
+    return years
 
 
 def ingest_today() -> tuple[int, list[int]]:
@@ -231,12 +219,21 @@ def ingest_today() -> tuple[int, list[int]]:
     return df.height, years
 
 
-def ingest_backfill(start: date | None = None, end: date | None = None) -> tuple[int, list[int]]:
+def ingest_backfill(
+    start: date | None = None,
+    end: date | None = None,
+    *,
+    fail_on_missing: bool = True,
+) -> tuple[int, list[int]]:
     """Fetch full historical NAVs in bulk_window_days chunks. Idempotent.
 
-    Raises IngestError if any individual window fails all HTTP retries OR parses to
-    zero rows. We do not silently skip partial windows because a 2008 hole becomes
-    invisible in the curated parquet — alpha for that period would still be computed.
+    By default raises IngestError if any window fails all HTTP retries OR parses
+    to zero rows, so daily incremental jobs don't silently proceed with holes.
+
+    For full historical backfills (e.g., walking back to 2013), AMFI's bulk
+    endpoint sometimes refuses very old windows; pass `fail_on_missing=False` to
+    record those windows and continue. The list of failed windows is written to
+    `data/raw/amfi_nav_history/_missing_windows.txt` for the inventory report.
     """
     cfg = get_pipeline_config()
     start = start or cfg.ingest.amfi_nav.backfill_start
@@ -277,10 +274,19 @@ def ingest_backfill(start: date | None = None, end: date | None = None) -> tuple
             rows=df.height,
         )
     if failures:
-        raise IngestError(
-            f"AMFI NAV backfill: {len(failures)} window(s) failed after retries:\n  - "
-            + "\n  - ".join(failures)
+        missing_log = paths.raw_dir() / "amfi_nav_history" / "_missing_windows.txt"
+        missing_log.parent.mkdir(parents=True, exist_ok=True)
+        missing_log.write_text("\n".join(failures) + "\n")
+        log.warning(
+            "amfi_nav.backfill.missing_windows",
+            n=len(failures),
+            written_to=str(missing_log),
         )
+        if fail_on_missing:
+            raise IngestError(
+                f"AMFI NAV backfill: {len(failures)} window(s) failed after retries:\n  - "
+                + "\n  - ".join(failures)
+            )
     return total_rows, sorted(years_touched)
 
 

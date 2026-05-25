@@ -10,8 +10,9 @@ Computed over rolling 3Y windows; reported as median across windows.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 import polars as pl
+
+from mfs.compute.rolling import iter_windows
 
 
 def _capture_one_window(fund: np.ndarray, bench: np.ndarray) -> tuple[float | None, float | None]:
@@ -37,29 +38,16 @@ def rolling_capture(aligned: pl.DataFrame, window_years: int = 3, step: str = "1
     if df.is_empty():
         return {"capture_up": None, "capture_down": None, "capture_efficiency": None}
     pdf = df.to_pandas().set_index("date").sort_index()
-    win_days = int(365.25 * window_years)
-    approx_obs = int(252 * window_years)
-    if len(pdf) < approx_obs - 30:
-        return {"capture_up": None, "capture_down": None, "capture_efficiency": None}
-    step_days = 7 if step == "1w" else 1
 
-    end = pdf.index.max()
-    cur = pdf.index.min() + pd.Timedelta(days=win_days)
     ucrs: list[float] = []
     dcrs: list[float] = []
-    while cur <= end:
-        sp = cur - pd.Timedelta(days=win_days)
-        window = pdf.loc[sp:cur]
-        if len(window) < approx_obs - 30:
-            cur += pd.Timedelta(days=step_days)
-            continue
+    for window in iter_windows(pdf, window_years, step):
         fund = window["fund_log_ret"].values
         bench = window["bench_log_ret"].values
         ucr, dcr = _capture_one_window(fund, bench)
         if ucr is not None and dcr is not None:
             ucrs.append(ucr)
             dcrs.append(dcr)
-        cur += pd.Timedelta(days=step_days)
 
     if not ucrs or not dcrs:
         return {"capture_up": None, "capture_down": None, "capture_efficiency": None}

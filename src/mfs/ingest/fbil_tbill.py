@@ -36,9 +36,9 @@ from tenacity import (
 
 from mfs import paths
 from mfs.config import get_pipeline_config, get_settings
+from mfs.db import writers as w
 from mfs.errors import IngestError
 from mfs.io.http import TransientHttpError
-from mfs.io.parquet import write_single
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -51,32 +51,37 @@ RBI_RSS_URL = "https://www.rbi.org.in/pressreleases_RSS.xml"
 # Approximate prid issue rate at RBI (~2500/year). Used for bounding the backwards walk.
 PRIDS_PER_YEAR = 2600
 
-# Regex pieces to detect the 91/182/364-day T-bill cut-off press release in HTML.
-# Two wordings have been observed historically:
-#   2017–2021: "91 days, 182 days and 364 days T-Bill Auction Result: Cut off"
-#   2022+:     "91-Day, 182-Day and 364-Day T-Bill Auction Result: Cut-off"
-# We check three independent fragments rather than one rigid regex.
+# Title patterns for RBI T-bill auction press releases. Two PR variants both
+# contain the 91-day cut-off yield:
+#   (a) Cut-off PR: title like "91 days, 182 days and 364 days T-Bill Auction
+#       Result: Cut off" (older) or "91-Day, 182-Day and 364-Day T-Bill Auction
+#       Result: Cut-off" (newer).
+#   (b) Full Auction Result PR: title "Treasury Bills: Full Auction Result"
+#       published alongside (a) on the same auction date.
+# Some weeks RBI publishes only (b). The parser accepts either.
 _TENORS_RE = re.compile(
-    r"91\s*-?\s*[Dd]ays?.{1,10}182\s*-?\s*[Dd]ays?.{1,15}364\s*-?\s*[Dd]ays?",
+    r"91\s*-?\s*[Dd]ays?.{1,15}182\s*-?\s*[Dd]ays?.{1,25}364\s*-?\s*[Dd]ays?",
     re.IGNORECASE,
 )
-_TBILL_AUCTION_RE = re.compile(r"T-?Bill\s+Auction\s+Result", re.IGNORECASE)
-_CUTOFF_RE = re.compile(r"Cut\s*-?\s*off", re.IGNORECASE)
-# We restrict the title check to the <tableheader> bold tags so an unrelated PR
-# that merely mentions "91-day T-bill" in its body cannot collide.
+_TBILL_RESULT_TITLE_RE = re.compile(
+    r"(?:T-?Bill|Treasury\s+Bills?)\s*:?\s*(?:Full\s+)?Auction\s+Result",
+    re.IGNORECASE,
+)
+_FULL_AUCTION_RESULT_RE = re.compile(r"Full\s+Auction\s+Result", re.IGNORECASE)
+# Title block lives inside <td class="tableheader" ...>; the <b> wrapper is
+# present on the Cut-off variant but absent on the Full Auction Result variant,
+# so we accept both forms.
 _TITLE_BLOCK_RE = re.compile(
-    r'class="tableheader"><b>([^<]{0,250})</b>',
+    r'class="tableheader"[^>]*>(?:\s*<b>)?\s*([^<]{1,300})',
     re.IGNORECASE,
 )
 
 
-def _looks_like_tbill_cutoff_title(html: str) -> bool:
-    titles = _TITLE_BLOCK_RE.findall(html)
-    for t in titles:
-        if (
-            _TENORS_RE.search(t)
-            and _TBILL_AUCTION_RE.search(t)
-            and _CUTOFF_RE.search(t)
+def _looks_like_tbill_result(html: str) -> bool:
+    """True if the page is a 91/182/364-day T-bill auction result PR (either variant)."""
+    for t in _TITLE_BLOCK_RE.findall(html):
+        if _TBILL_RESULT_TITLE_RE.search(t) and (
+            _TENORS_RE.search(t) or _FULL_AUCTION_RESULT_RE.search(t)
         ):
             return True
     return False
@@ -84,9 +89,13 @@ _DATE_RE = re.compile(
     r"Date\s*:\s*(\w+\s+\d{1,2},\s+\d{4})",
     re.IGNORECASE,
 )
-# After "Cut-off Price and Implicit Yield", the 91-day cell is the first YTM.
+# Unified YTM extractor covering both PR formats. Anchor on a "Cut-off" token
+# followed by "Price" or "Yield" within a short window (excluding tag chars),
+# then take the FIRST YTM percentage after it — that's the 91-day cell.
+#   Cut-off variant: "Cut-off Price and Implicit Yield ... YTM: 3.5594%"
+#   Full Auction Result variant: "Cut-off price / Yield ... (YTM: 3.5594%)"
 _YTM_BLOCK_RE = re.compile(
-    r"Cut-?off\s+Price\s+and\s+Implicit\s+Yield.*?YTM\s*:\s*([0-9]+\.[0-9]+)\s*%",
+    r"Cut-?off[^<>]{0,80}(?:Price|Yield).*?YTM\s*:\s*([0-9]+\.[0-9]+)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -224,10 +233,17 @@ def _fetch_prid_with_retry(client: httpx.Client, prid: int) -> str:
         raise TransientHttpError(str(e)) from e
     if r.status_code in (429, 500, 502, 503, 504):
         raise TransientHttpError(f"{r.status_code} from RBI for prid={prid}")
-    if r.status_code == 404 or not r.text or len(r.text) < 500:
-        raise _PermanentFetchError(f"prid {prid}: status={r.status_code}, body_len={len(r.text)}")
+    if r.status_code == 404:
+        raise _PermanentFetchError(f"prid {prid}: 404 not found")
     if r.status_code != 200:
         raise TransientHttpError(f"unexpected status {r.status_code} for prid={prid}")
+    # Status 200 but tiny body = RBI rate-limit truncation. We previously treated
+    # this as permanent and skipped forever; that lost ~91% of PRs in some
+    # windows and is the root cause of the historical gaps. Treat as transient.
+    if not r.text or len(r.text) < 500:
+        raise TransientHttpError(
+            f"prid {prid}: 200 OK but body_len={len(r.text)} (likely rate-limited)"
+        )
     return r.text
 
 
@@ -255,8 +271,9 @@ def _fetch_prid_html(client: httpx.Client, prid: int) -> tuple[str | None, str |
 
 
 def _parse_tbill_html(html: str, prid: int) -> dict | None:
-    """If HTML is a 91-day T-bill cut-off PR, return {prid, auction_date, rate_annual_pct}."""
-    if not _looks_like_tbill_cutoff_title(html):
+    """If HTML is a 91-day T-bill auction-result PR (Cut-off OR Full Auction Result
+    variant), return {prid, auction_date, rate_annual_pct}; otherwise None."""
+    if not _looks_like_tbill_result(html):
         return None
     m_date = _DATE_RE.search(html)
     m_ytm = _YTM_BLOCK_RE.search(html)
@@ -276,8 +293,8 @@ def _walk_prid_range(
     prid_lo: int,
     prid_hi: int,
     *,
-    max_workers: int = 12,
-    rate_limit_s: float = 0.05,
+    max_workers: int = 4,
+    rate_limit_s: float = 0.25,
 ) -> tuple[list[dict], int]:
     """Fetch prids in [prid_lo, prid_hi] inclusive.
 
@@ -292,6 +309,16 @@ def _walk_prid_range(
     completed = 0
 
     def _do(prid: int) -> tuple[dict | None, str | None]:
+        # Cache hits skip the rate-limit sleep entirely so gap-fill walks over a
+        # mostly-cached range stay fast.
+        cache = paths.rbi_press_release_raw(prid)
+        if cache.exists() and cache.stat().st_size > 200:
+            try:
+                html = cache.read_text(encoding="utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001
+                html = None
+            if html is not None:
+                return _parse_tbill_html(html, prid), None
         time.sleep(rate_limit_s)
         with _rbi_client() as c:
             html, failure = _fetch_prid_html(c, prid)
@@ -360,21 +387,68 @@ def _save_scraped_csv(rates: dict[date, float]) -> None:
     df.write_csv(p)
 
 
+def reparse_cache() -> dict[date, float]:
+    """Re-parse every cached PR HTML and return {auction_date: rate_annual_pct}.
+
+    Useful after parser improvements (e.g., adding a new title variant): the
+    cache is the source of truth, so we recompute the date→rate map locally
+    rather than re-fetching from RBI.
+    """
+    cache_dir = paths.rbi_press_release_raw(0).parent
+    if not cache_dir.exists():
+        return {}
+    out: dict[date, float] = {}
+    n_files = 0
+    n_parsed = 0
+    for f in cache_dir.glob("prid_*.html"):
+        n_files += 1
+        try:
+            prid = int(f.stem.replace("prid_", ""))
+        except ValueError:
+            continue
+        try:
+            html = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            continue
+        parsed = _parse_tbill_html(html, prid)
+        if parsed:
+            n_parsed += 1
+            out[parsed["auction_date"]] = parsed["rate_annual_pct"]
+    log.info(
+        "fbil.rbi.reparse_cache",
+        n_files=n_files,
+        n_parsed=n_parsed,
+        n_unique_dates=len(out),
+    )
+    return out
+
+
 def ingest_from_rbi_press_releases(
     *,
-    years: float = 5.0,
+    years: float = 13.5,
     start_prid: int | None = None,
     end_prid: int | None = None,
-    max_workers: int = 12,
+    max_workers: int = 4,
+    gap_fill: bool = True,
 ) -> dict[date, float]:
     """Scrape RBI T-bill cut-off press releases; return {auction_date: rate_annual_pct}.
 
-    Strategy: walk a contiguous prid range and pluck out the ~52/year T-bill cut-off
-    releases. Caches every fetched HTML to disk, and persists a per-date CSV so
-    repeated runs only fetch new prids beyond the last-seen high-water mark.
+    Strategy: walk a contiguous prid range and pluck out the ~52/year T-bill
+    auction-result releases. Caches every fetched HTML to disk, and persists a
+    per-date CSV so repeated runs only fetch new prids beyond the last-seen
+    high-water mark.
+
+    `gap_fill=True` (default) re-attempts every prid in the previously-walked
+    range that is missing from the cache. This is how we recover from the
+    historical bug where rate-limited tiny-body responses got swallowed as
+    permanent failures. Cached prids are not re-fetched (cache check is inside
+    `_fetch_prid_html`), so the cost is roughly one HTTP call per missing prid.
     """
     state = _read_state()
-    existing = _load_scraped_csv()
+    # Always rebuild the in-memory rate dict by re-parsing the on-disk cache,
+    # so parser improvements (new title variants etc.) take effect even when no
+    # new prids are walked.
+    existing = reparse_cache() or _load_scraped_csv()
 
     # Determine end_prid (upper bound to walk).
     if end_prid is None:
@@ -396,8 +470,27 @@ def ingest_from_rbi_press_releases(
             # Need to extend history backwards (or no prior state).
             start_prid = backfill_floor
 
+    # Optional gap-fill pass: re-walk the full historical range so any prids
+    # that previously failed transiently (and got mis-classified as permanent)
+    # are re-attempted. `_fetch_prid_html` skips already-cached prids, so this
+    # only HTTPs the holes.
+    if gap_fill and state.get("oldest_prid_walked") is not None:
+        gap_lo = state["oldest_prid_walked"]
+        gap_hi = end_prid
+        log.info("fbil.rbi.gap_fill.start", prid_lo=gap_lo, prid_hi=gap_hi)
+        gap_hits, gap_failed = _walk_prid_range(gap_lo, gap_hi, max_workers=max_workers)
+        for h in gap_hits:
+            existing[h["auction_date"]] = h["rate_annual_pct"]
+        log.info(
+            "fbil.rbi.gap_fill.done",
+            n_new_hits=len(gap_hits),
+            n_failed=gap_failed,
+            n_total_dates=len(existing),
+        )
+
     if start_prid > end_prid:
         log.info("fbil.rbi.already_current", start_prid=start_prid, end_prid=end_prid)
+        _save_scraped_csv(existing)
         return existing
 
     hits, n_failed = _walk_prid_range(start_prid, end_prid, max_workers=max_workers)
@@ -444,7 +537,7 @@ def ingest_fallback_constant(start: date | None = None, end: date | None = None)
     end = end or date.today()
     rate_by_date = {start: FALLBACK_RATE_ANNUAL, end: FALLBACK_RATE_ANNUAL}
     series = _build_daily_series(rate_by_date, start, end)
-    write_single(series, paths.risk_free_daily_file())
+    w.upsert_risk_free_daily(series)
     log.warning(
         "fbil.fallback_constant",
         rate=FALLBACK_RATE_ANNUAL,
@@ -531,7 +624,7 @@ def ingest(
     # If user requests an `end` past the latest observation, the last observed
     # rate is forward-filled — fine for valuation purposes.
     series = _build_daily_series(rates, span_start, end)
-    write_single(series, paths.risk_free_daily_file())
+    w.upsert_risk_free_daily(series)
     log.info(
         "fbil.ingested",
         rows=series.height,

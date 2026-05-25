@@ -19,15 +19,19 @@ from datetime import date
 
 import polars as pl
 
-from mfs import paths
+from mfs.db import queries as q
+from mfs.db import writers as w
 from mfs.ingest import amfi_nav
-from mfs.io.parquet import read_dataset, write_single
 from mfs.master.benchmark_map import benchmark_for
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 # Map AMFI category strings to our canonical names. Match by substring (case-insensitive).
+# "Sector" / "Thematic" categories are deliberately mapped to the placeholder
+# "Sectoral/Thematic" which is then resolved to a specific sector via SECTOR_RULES
+# below, using the scheme NAME (since AMFI puts the sector detail there, not in
+# its own category field).
 CATEGORY_RULES: list[tuple[str, str]] = [
     ("Large Cap", "Large Cap"),
     ("Large & Mid", "Large & Mid Cap"),
@@ -50,6 +54,40 @@ CATEGORY_RULES: list[tuple[str, str]] = [
     ("Sector", "Sectoral/Thematic"),
     ("Thematic", "Sectoral/Thematic"),
 ]
+
+# Sector classification rules — applied AFTER CATEGORY_RULES resolves a scheme to
+# the catchall "Sectoral/Thematic". Order matters: more specific tokens come
+# first (e.g., FMCG before Consumption, Healthcare before Pharma to keep
+# combined-sector funds in the broader bucket).
+SECTOR_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bESG\b|responsible", re.IGNORECASE), "ESG"),
+    (re.compile(r"\bMNC\b|multinational", re.IGNORECASE), "MNC"),
+    (re.compile(r"\bFMCG\b", re.IGNORECASE), "FMCG"),
+    (re.compile(r"\bbank(ing)?\b|financial services|finserv|fin\.?\s*serv", re.IGNORECASE),
+     "Banking & Financial Services"),
+    (re.compile(r"\b(IT|Tech(nology)?|Digital|Software)\b", re.IGNORECASE), "IT"),
+    (re.compile(r"pharma|health\s*care|health|biotech", re.IGNORECASE),
+     "Pharma & Healthcare"),
+    (re.compile(r"\bauto(mobile)?\b|transport(ation)?|mobility", re.IGNORECASE), "Auto"),
+    (re.compile(r"energy|power|oil\s*&?\s*gas|natural\s*resources", re.IGNORECASE), "Energy"),
+    (re.compile(r"infra(structure)?", re.IGNORECASE), "Infrastructure"),
+    (re.compile(r"\bPSU\b|public\s+sector|PSE\b|PSU Equity", re.IGNORECASE), "PSU"),
+    (re.compile(r"manufactur", re.IGNORECASE), "Manufacturing"),
+    (re.compile(r"consum(ption|er)", re.IGNORECASE), "Consumption"),
+]
+
+
+def _classify_sector(scheme_name: str) -> str:
+    """Map a Sectoral/Thematic scheme to a specific sector bucket using its name.
+
+    Returns one of the 12 sector buckets, or 'Thematic' as the residual.
+    """
+    if not scheme_name:
+        return "Thematic"
+    for pat, sector in SECTOR_RULES:
+        if pat.search(scheme_name):
+            return sector
+    return "Thematic"
 
 
 def _amc_slug(s: str) -> str:
@@ -112,6 +150,9 @@ def build() -> pl.DataFrame:
         amc_name = r["amc_name"] or "Unknown"
         plan, option = _classify_plan_option(scheme_name)
         canon = _canonical_category(r["amfi_category"])
+        # Sub-classify sectoral/thematic funds based on scheme name.
+        if canon == "Sectoral/Thematic":
+            canon = _classify_sector(scheme_name)
         amc_code = _amc_slug(amc_name)
         rows.append(
             {
@@ -135,12 +176,24 @@ def build() -> pl.DataFrame:
 
     df = pl.DataFrame(rows)
 
-    # Compute inception_date and last_seen_date from nav_daily history (if present)
-    navs = read_dataset(paths.nav_daily_dataset())
-    if not navs.is_empty():
-        bounds = navs.group_by("scheme_code").agg(
-            pl.col("nav_date").min().alias("inception_date"),
-            pl.col("nav_date").max().alias("last_seen_date_hist"),
+    # Compute inception_date and last_seen_date from nav_daily history (Postgres-side
+    # aggregation; pulling 30M+ NAV rows into the process just to GROUP BY is wasteful).
+    from mfs.db.connection import connect
+
+    with connect() as c:
+        bounds_rows = c.execute(
+            "SELECT scheme_code, MIN(nav_date) AS inception_date, "
+            "MAX(nav_date) AS last_seen_date_hist FROM nav_daily GROUP BY scheme_code"
+        ).fetchall()
+    if bounds_rows:
+        bounds = pl.DataFrame(
+            bounds_rows,
+            schema={
+                "scheme_code": pl.Utf8,
+                "inception_date": pl.Date,
+                "last_seen_date_hist": pl.Date,
+            },
+            orient="row",
         )
         df = df.join(bounds, on="scheme_code", how="left")
         df = df.with_columns(
@@ -158,6 +211,6 @@ def build() -> pl.DataFrame:
         pl.col("last_seen_date").cast(pl.Date),
     )
 
-    write_single(df, paths.scheme_master_file())
+    w.upsert_scheme_master(df)
     log.info("scheme_master.built", rows=df.height)
     return df

@@ -32,9 +32,10 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from mfs import paths
 from mfs.config import get_pipeline_config, get_settings
+from mfs.db import queries as q
+from mfs.db import writers as w
 from mfs.errors import IngestError
 from mfs.io.http import TransientHttpError
-from mfs.io.parquet import write_partition
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -57,12 +58,26 @@ NSE_TRI_MAP: dict[str, tuple[str, str]] = {
     "NIFTY 500 Multicap 50:25:25 TRI": ("NIFTY500 MULTICAP", "NIFTY500 MULTICAP 50:25:25"),
     "NIFTY 500 Value 50 TRI": ("NIFTY500 VALUE 50", "Nifty500 Value 50"),
     "NIFTY Dividend Opportunities 50 TRI": ("NIFTY DIV OPPS 50", "Nifty Dividend Opportunities 50"),
-    # Hybrid/multi-asset benchmarks: TRI section on niftyindices.com only covers equity.
-    # These indices are total-return by construction; users supply them via
-    # data/raw/benchmarks/manual/<slug>.csv.
-    "NIFTY 50 Hybrid 65:35 TRI": ("", ""),
-    "NIFTY 50 Hybrid 50:50 TRI": ("", ""),
-    "NIFTY Equity Savings TRI": ("", ""),
+    # Sector / thematic equity TRIs. (Trading_Index_Name, Index_long_name) sourced
+    # from NSE's IndexMapping.json.
+    "NIFTY Bank TRI":                ("NIFTY BANK", "Nifty Bank"),
+    "NIFTY Financial Services TRI":  ("NIFTY FIN SERVICE", "Nifty Financial Services"),
+    "NIFTY IT TRI":                  ("NIFTY IT", "Nifty IT"),
+    "NIFTY Pharma TRI":              ("NIFTY PHARMA", "Nifty Pharma"),
+    "NIFTY Healthcare TRI":          ("NIFTY HEALTHCARE", "Nifty Healthcare INDEX"),
+    "NIFTY FMCG TRI":                ("NIFTY FMCG", "Nifty FMCG"),
+    "NIFTY Auto TRI":                ("NIFTY AUTO", "Nifty Auto"),
+    "NIFTY Energy TRI":              ("NIFTY ENERGY", "Nifty Energy"),
+    "NIFTY Infrastructure TRI":      ("NIFTY INFRA", "Nifty Infrastructure"),
+    "NIFTY PSE TRI":                 ("NIFTY PSE", "Nifty PSE"),
+    "NIFTY India Consumption TRI":   ("NIFTY CONSUMPTION", "Nifty India Consumption"),
+    "NIFTY MNC TRI":                 ("NIFTY MNC", "Nifty MNC"),
+    "NIFTY100 ESG TRI":              ("NIFTY100 ESG", "NIFTY100 ESG"),
+    "NIFTY India Manufacturing TRI": ("NIFTY INDIA MFG", "Nifty India Manufacturing"),
+    # Hybrid TRIs (Nifty 50 Hybrid 65:35 / 50:50, Equity Savings) are NOT fetched
+    # from NSE — niftyindices.com doesn't expose them via the public TRI endpoint.
+    # They are synthesized from Nifty 50 TRI + risk-free in `synthetic_hybrid.py`,
+    # invoked by the CLI after the equity ingest.
 }
 
 # Back-compat for callers that still reference the old constant name.
@@ -350,24 +365,7 @@ def ingest_ticker(ticker: str, start: date | None = None, end: date | None = Non
         )
         return 0
     df = df.with_columns(pl.lit(ticker).alias("ticker"))
-    # Pre-compute daily log return
-    df = df.with_columns(
-        (pl.col("close").log() - pl.col("close").shift(1).log()).alias("total_return")
-    )
-    # Merge into existing ticker partition (dedupe on date)
-    part = paths.benchmark_daily_dataset() / f"ticker={slug}" / "data.parquet"
-    if part.exists():
-        existing = pl.read_parquet(part)
-        combined = pl.concat([existing, df], how="diagonal_relaxed")
-    else:
-        combined = df
-    combined = combined.unique("date", keep="last").sort("date")
-    write_partition(
-        combined.select(["ticker", "date", "close", "total_return"]),
-        paths.benchmark_daily_dataset(),
-        slug,
-        "ticker",
-    )
+    w.upsert_benchmark_daily(df.select(["ticker", "date", "close"]))
     log.info("benchmark.ingested", ticker=ticker, rows=df.height)
     return df.height
 

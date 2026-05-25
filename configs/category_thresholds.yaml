@@ -13,8 +13,27 @@ beta_bands:
   Aggressive Hybrid:   [0.55, 0.80]
   Balanced Advantage:  [0.30, 0.70]
   Equity Savings:      [0.20, 0.50]
+  # Sector funds: benchmarked against their own sector TRI, so beta should
+  # tightly hug 1.0. Wider band on the upside accommodates concentrated
+  # high-conviction funds.
+  Banking & Financial Services: [0.85, 1.20]
+  IT:                  [0.85, 1.20]
+  Pharma & Healthcare: [0.85, 1.20]
+  FMCG:                [0.85, 1.15]
+  Auto:                [0.85, 1.20]
+  Energy:              [0.85, 1.20]
+  Infrastructure:      [0.85, 1.20]
+  PSU:                 [0.85, 1.20]
+  Consumption:         [0.85, 1.15]
+  MNC:                 [0.80, 1.15]
+  ESG:                 [0.85, 1.10]
+  Manufacturing:       [0.85, 1.20]
+  # Residual thematic funds: benchmarked vs NIFTY 500 TRI, so beta band mirrors
+  # a diversified equity fund.
+  Thematic:            [0.80, 1.20]
 
-# Categories that participate in v1 ranking. Sectoral/thematic excluded — see plan.
+# Categories that participate in ranking. Sector funds added in v1.1; "Thematic"
+# is the residual bucket for scheme names that don't fit any specific sector.
 rankable_categories:
   - Large Cap
   - Large & Mid Cap
@@ -30,3 +49,16 @@ rankable_categories:
   - Aggressive Hybrid
   - Balanced Advantage
   - Equity Savings
+  - Banking & Financial Services
+  - IT
+  - Pharma & Healthcare
+  - FMCG
+  - Auto
+  - Energy
+  - Infrastructure
+  - PSU
+  - Consumption
+  - MNC
+  - ESG
+  - Manufacturing
+  - Thematic
