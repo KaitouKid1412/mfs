@@ -310,18 +310,16 @@ def stock_adv_history(isins: list[str], window_days: int = 90) -> pl.DataFrame:
 def latest_scheme_aum(scheme_code: str) -> tuple[date, float] | None:
     """Return (as_of_month, aum_crore) for the most recent AUM snapshot.
 
-    Source preference: AMFI quarterly AAUM (source_amc='amfi_aaum') wins
-    over per-AMC factsheet rows, even when the factsheet row is one month
-    more recent. AMFI is authoritative (SEBI-registered AMCs report into
-    it) and is the right metric semantically for impact-cost (quarterly
-    average is what the impact-cost denominator wants, not month-end).
-    Within a source, the latest `as_of_month` wins.
+    AUM comes exclusively from AMFI's quarterly AAUM endpoint
+    (source_amc='amfi_aaum'); the per-AMC factsheet path was removed and a
+    CHECK constraint enforces the single-source invariant. The latest
+    `as_of_month` wins.
     """
     with connect() as c:
         row = c.execute(
             "SELECT as_of_month, aum_crore FROM scheme_aum_monthly "
             "WHERE scheme_code = %s "
-            "ORDER BY (source_amc = 'amfi_aaum') DESC, as_of_month DESC "
+            "ORDER BY as_of_month DESC "
             "LIMIT 1",
             (scheme_code,),
         ).fetchone()

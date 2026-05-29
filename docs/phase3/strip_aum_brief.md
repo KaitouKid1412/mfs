@@ -1,5 +1,14 @@
 # AUM extraction strip — adapter cleanup brief
 
+> **Status: COMPLETED 2026-05-29.** `parse_aum` / `ParsedAumRecord` and the
+> factsheet AUM write path are removed from `src/mfs/ingest/managers/`.
+> `scheme_aum_monthly` rows where `source_amc <> 'amfi_aaum'` were
+> deleted (1,252 rows) and the table now carries a CHECK constraint
+> `source_amc = 'amfi_aaum'`. `latest_scheme_aum()` ORDER BY simplified
+> to `as_of_month DESC`. Ranked-fund AUM coverage unchanged at 666/682.
+> See `src/mfs/ingest/amfi_aum.py` for the sole AUM ingester. This brief
+> is retained as historical record of the cleanup.
+
 ## Why
 
 AMFI publishes per-scheme quarterly AAUM at the JSON endpoint

@@ -220,11 +220,13 @@ def ingest_managers(
         False, "--list", help="List registered AMC adapters and exit."
     ),
 ):
-    """Ingest holdings + PTR + AUM signals from AMC factsheet PDFs.
+    """Ingest holdings + PTR signals from AMC factsheet PDFs.
 
     The CLI name remains ``ingest managers`` for backward compatibility, but
-    manager-tenure extraction was retired — these adapters now produce
-    holdings (factsheet path, no ISIN), PTR, and AUM only.
+    manager-tenure extraction was retired (manual verification for Stage 2
+    survivors) and AUM extraction was removed in favour of AMFI's quarterly
+    AAUM endpoint — these adapters now produce holdings (factsheet path, no
+    ISIN) and PTR only.
     """
     configure_logging()
     from pathlib import Path
@@ -246,16 +248,14 @@ def ingest_managers(
         )
         typer.echo(
             f"{amc}: holdings={result['rows_written_holdings']} "
-            f"ptr={result['rows_written_ptr']} "
-            f"aum={result['rows_written_aum']}"
+            f"ptr={result['rows_written_ptr']}"
         )
     else:
         results = managers.run_all(ym=ym)
         for slug, r in results.items():
             typer.echo(
                 f"{slug}: holdings={r['rows_written_holdings']} "
-                f"ptr={r['rows_written_ptr']} "
-                f"aum={r['rows_written_aum']}"
+                f"ptr={r['rows_written_ptr']}"
             )
 
 

@@ -170,15 +170,19 @@ CREATE TABLE IF NOT EXISTS stock_adv_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_stock_adv_date ON stock_adv_daily (date);
 
--- Phase 2.3: per-scheme monthly AUM in INR Crore. Extracted from the same
--- factsheet PDFs as holdings/PTR/managers.
+-- Phase 2.3: per-scheme quarterly AUM in INR Crore.
+-- Sourced exclusively from AMFI's quarterly AAUM endpoint (see
+-- mfs.ingest.amfi_aum). The legacy factsheet-extraction path was removed
+-- and the CHECK constraint enforces the single-source invariant — any
+-- attempt to write with a different source_amc will be rejected.
 CREATE TABLE IF NOT EXISTS scheme_aum_monthly (
     scheme_code         TEXT             NOT NULL,
     as_of_month         DATE             NOT NULL,
     aum_crore           DOUBLE PRECISION NOT NULL,  -- INR Crore (1 Cr = 10M INR)
     source_amc          TEXT             NOT NULL,
     computed_at         TIMESTAMP        NOT NULL,
-    PRIMARY KEY (scheme_code, as_of_month)
+    PRIMARY KEY (scheme_code, as_of_month),
+    CONSTRAINT chk_scheme_aum_source_amfi CHECK (source_amc = 'amfi_aaum')
 );
 CREATE INDEX IF NOT EXISTS idx_aum_scheme ON scheme_aum_monthly (scheme_code);
 

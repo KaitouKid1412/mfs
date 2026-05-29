@@ -1,18 +1,23 @@
 # AMC factsheet adapter — build brief
 
-Anyone (sub-agent or human) building a new AMC adapter for Stage 2 PTR/AUM
+Anyone (sub-agent or human) building a new AMC adapter for Stage 2 PTR
 coverage should read this end-to-end before touching code. It is the single
 source of truth for the contract; deviations are bugs.
+
+**AUM is no longer extracted from factsheets** — AMFI's quarterly AAUM
+endpoint (`src/mfs/ingest/amfi_aum.py`) is the sole AUM source and the
+`scheme_aum_monthly` table CHECK-constrains `source_amc = 'amfi_aaum'`.
+Do not add `parse_aum` to a new adapter; the base class no longer defines
+it and `ParsedAumRecord` was removed.
 
 ## What an adapter is
 
 One Python module per AMC at `src/mfs/ingest/managers/<slug>.py`. It is a
 subclass of `mfs.ingest.managers._base.ManagerAdapter` decorated with
 `@register_adapter`. It pulls the AMC's monthly combined factsheet PDF
-and yields three streams:
+and yields two streams:
 
 - `parse_ptr(pdf, ym)` → `ParsedPtrRecord(scheme_name_printed, ptr, source_amc)`
-- `parse_aum(pdf, ym)` → `ParsedAumRecord(scheme_name_printed, aum_crore, source_amc)`
 - `parse_holdings(pdf, ym)` → `ParsedHoldingRecord(scheme_name_printed, security_name, weight_pct, isin?, instrument_type, source_amc)`
 
 The orchestrator (`mfs.ingest.managers._run.run_for_amc`) handles fuzzy
@@ -27,13 +32,12 @@ designing your regex:
 
 - `src/mfs/ingest/managers/hdfc.py` — text-extract first, then regex.
   HDFC's PTR is `Equity Turnover 9.14%` (percent → divide by 100 to get
-  fraction); AUM is `As on April 30, 2026 ₹100,479.23Cr.` Holdings use
-  pdfplumber word positions in a two-column layout.
+  fraction). Holdings use pdfplumber word positions in a two-column
+  layout.
 
 - `src/mfs/ingest/managers/sbi.py` — word-position extraction in a
-  per-page layout. PTR is `Equity Turnover : 0.31` (already a fraction);
-  AUM is `AAUM for the Month ... ₹ 52,854.99 Crores`. Scheme name comes
-  from the page footer, not the header.
+  per-page layout. PTR is `Equity Turnover : 0.31` (already a fraction).
+  Scheme name comes from the page footer, not the header.
 
 Use whichever pattern fits the target AMC's PDF.
 
@@ -83,20 +87,19 @@ data_ym forward by one.
    don't hardcode one date.
 
 2. **Inspect the PDF**: use a one-off script to dump page text and find
-   how PTR and AUM are printed. Use `pdfplumber`:
+   how PTR is printed. Use `pdfplumber`:
    ```python
    import pdfplumber
    with pdfplumber.open("data/raw/factsheets/<slug>/2026-04.pdf") as pdf:
        for i, page in enumerate(pdf.pages):
            text = page.extract_text() or ""
-           if "Turnover" in text or "AUM" in text:
+           if "Turnover" in text:
                print(f"--- page {i+1} ---")
                print(text[:2000])
    ```
    Look for: how PTR is labeled (Equity Turnover / Portfolio Turnover / PTR);
-   percent vs fraction; how AUM is labeled (Month End AUM / AAUM); units
-   (`Crore` / `Cr.` / lakhs). Find an unambiguous scheme-name anchor for
-   each page (header / footer / banner).
+   percent vs fraction. Find an unambiguous scheme-name anchor for each
+   page (header / footer / banner).
 
 3. **Write the adapter**. Skeleton:
    ```python
@@ -107,7 +110,7 @@ data_ym forward by one.
    import pdfplumber
    from mfs.ingest.managers._base import ManagerAdapter
    from mfs.ingest.managers._registry import register_adapter
-   from mfs.schemas import ParsedAumRecord, ParsedHoldingRecord, ParsedPtrRecord
+   from mfs.schemas import ParsedHoldingRecord, ParsedPtrRecord
 
    @register_adapter
    class FooAdapter(ManagerAdapter):
@@ -121,9 +124,6 @@ data_ym forward by one.
        def parse_ptr(self, pdf_path: Path, ym: str) -> Iterable[ParsedPtrRecord]:
            ...
 
-       def parse_aum(self, pdf_path: Path, ym: str) -> Iterable[ParsedAumRecord]:
-           ...
-
        def parse_holdings(self, pdf_path: Path, ym: str) -> Iterable[ParsedHoldingRecord]:
            ...
    ```
@@ -133,32 +133,25 @@ data_ym forward by one.
    (0.31), pass through. Be explicit about which in a one-line comment
    above the regex — it is the most common error.
 
-5. **AUM normalization**: storage is INR Crore. If the AMC prints in
-   lakhs, divide by 100. Prefer **Month-End AUM** over AAUM (average) when
-   both are present, since the metric set treats `aum_crore` as a point-
-   in-time value.
-
-6. **Register the adapter**: add `from mfs.ingest.managers import <slug>
+5. **Register the adapter**: add `from mfs.ingest.managers import <slug>
    # noqa: F401` to `src/mfs/ingest/managers/__init__.py`.
 
-7. **Write the test**: `tests/test_managers_<slug>.py`. Calibrate
+6. **Write the test**: `tests/test_managers_<slug>.py`. Calibrate
    against the same 2026-04 PDF. Minimum coverage:
    - `parse_ptr` yields at least one record for a known scheme.
-   - `parse_aum` yields at least one record with `aum_crore > 0` for a known scheme.
    - `build_url(ym)` produces the actual URL you downloaded from (string
      equality OK; don't HTTP-test).
    The test should NOT hit the network — read the cached PDF.
 
-8. **Run end-to-end**:
+7. **Run end-to-end**:
    ```bash
    uv run mfs ingest managers --amc <slug> --ym 2026-04
    ```
-   Confirm log shows ptr.parsed n_records>0 and aum.parsed n_records>0,
-   and rows_written_ptr / rows_written_aum > 0.
+   Confirm log shows `ptr.parsed n_records > 0` and `rows_written_ptr > 0`.
 
 ## Fail-fast invariants (from CLAUDE memory)
 
-- **No half-data**: an adapter that yields PTR with NaN, AUM=0, or a
+- **No half-data**: an adapter that yields PTR with NaN or a
   scheme-name that lost its identity (e.g. "Fund of Fund Schemes")
   should drop the row entirely. Half data is worse than no data.
 - **No manual entry**: if the PDF layout defeats your parser, REPORT
@@ -175,7 +168,5 @@ data_ym forward by one.
   - Cached PDF path used
   - URL pattern used (and whether it was guessed vs WebFetched)
   - PTR regex / approach in one line
-  - AUM regex / approach in one line
   - Number of PTR rows extracted from 2026-04 (printed at the end of the run)
-  - Number of AUM rows extracted from 2026-04
   - Anything weird about the layout future-you should know

@@ -1,11 +1,12 @@
 """AMFI quarterly Average AUM (AAUM) ingest.
 
-AMFI publishes per-scheme AAUM each quarter via the JSON endpoint behind
-https://www.amfiindia.com/aum-data/average-aum. A single GET covers every
-SEBI-registered scheme — 1,600+ DIRECT+GROWTH rows in one response —
-keyed by AMFI_Code which maps exactly to scheme_master.scheme_code. This
-makes the per-AMC factsheet adapters redundant for AUM (they remain the
-only source for PTR).
+Sole source for ``scheme_aum_monthly``. AMFI publishes per-scheme AAUM each
+quarter via the JSON endpoint behind https://www.amfiindia.com/aum-data/
+average-aum. A single GET covers every SEBI-registered scheme — 1,600+
+DIRECT+GROWTH rows in one response — keyed by AMFI_Code which maps exactly
+to scheme_master.scheme_code. The legacy per-AMC factsheet AUM path has
+been removed and the table now enforces ``source_amc = 'amfi_aaum'`` via
+CHECK constraint. Factsheet adapters remain the only source for PTR.
 
 Notes on the data:
   - Values are in INR Lakhs. We divide by 100 to store INR Crore.
@@ -15,7 +16,7 @@ Notes on the data:
     the most recent quarter ending on or before the data month.
   - Publication lag is ~30-45 days after quarter end. Q4 (Jan-Mar) typically
     surfaces in early/mid May.
-  - source_amc = 'amfi_aaum' so it's distinguishable from factsheet rows.
+  - source_amc = 'amfi_aaum' — the only value the CHECK constraint permits.
 """
 
 from __future__ import annotations

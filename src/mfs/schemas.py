@@ -155,13 +155,6 @@ class SchemeAumMonthly(BaseModel):
     computed_at: datetime
 
 
-class ParsedAumRecord(BaseModel):
-    """Adapter output for one (scheme, aum_crore) pair before scheme_code matching."""
-    scheme_name_printed: str
-    aum_crore: float
-    source_amc: str
-
-
 class ShortlistRow(BaseModel):
     as_of_date: date
     canonical_category: str

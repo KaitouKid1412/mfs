@@ -1,10 +1,12 @@
 """Adapter base class for AMC factsheet scrapers.
 
-Each AMC's monthly factsheet PDF carries three things we extract: portfolio
+Each AMC's monthly factsheet PDF carries two things we extract: portfolio
 holdings (factsheet path — no ISIN; Phase 3.C provides a parallel
-Excel-based path WITH ISIN), Portfolio Turnover Ratio (one number per
-scheme), and AUM (one number per scheme). Subclass + register one adapter
-per AMC.
+Excel-based path WITH ISIN) and Portfolio Turnover Ratio (one number per
+scheme). Subclass + register one adapter per AMC.
+
+AUM extraction is intentionally not part of this interface — AMFI's quarterly
+AAUM endpoint (``mfs.ingest.amfi_aum``) is the sole AUM source.
 
 Package name retained as ``mfs.ingest.managers`` for backward compatibility
 with existing imports — the adapter no longer extracts manager-tenure data
@@ -18,7 +20,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Iterable
 
-from mfs.schemas import ParsedAumRecord, ParsedHoldingRecord, ParsedPtrRecord
+from mfs.schemas import ParsedHoldingRecord, ParsedPtrRecord
 
 
 class ManagerAdapter(ABC):
@@ -32,12 +34,11 @@ class ManagerAdapter(ABC):
     Optional override methods:
       - parse_holdings(pdf_path, ym): yield ParsedHoldingRecord rows.
       - parse_ptr(pdf_path, ym):      yield ParsedPtrRecord rows.
-      - parse_aum(pdf_path, ym):      yield ParsedAumRecord rows.
 
-    All three parse methods receive the same local PDF path (the file already
-    downloaded by ``fetch()``), so opening the PDF up to three times is the
-    expected behavior. pdfplumber's caching of the PDF text layer makes this
-    only marginally more expensive than a single open.
+    Both parse methods receive the same local PDF path (the file already
+    downloaded by ``fetch()``), so opening the PDF twice is the expected
+    behavior. pdfplumber's caching of the PDF text layer makes this only
+    marginally more expensive than a single open.
     """
 
     amc_slug: str
@@ -72,6 +73,3 @@ class ManagerAdapter(ABC):
         """Extract one (scheme, ptr) per scheme. Default yields nothing."""
         return ()
 
-    def parse_aum(self, pdf_path: Path, ym: str) -> Iterable[ParsedAumRecord]:
-        """Extract one (scheme, AUM in Crore) per scheme. Default yields nothing."""
-        return ()

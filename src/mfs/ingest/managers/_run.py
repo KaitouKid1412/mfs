@@ -1,10 +1,11 @@
 """Top-level orchestration for the factsheet-based ingest stage.
 
 For each registered AMC, this fetches the monthly factsheet PDF once and
-extracts three signals from it: portfolio holdings (no ISIN — Phase 3.C
-provides the ISIN-tagged Excel path), PTR (one number per scheme), and AUM
-(one number per scheme). Manager-tenure extraction was removed when the
-user opted to verify manager tenure manually for Stage 2 survivors.
+extracts two signals from it: portfolio holdings (no ISIN — Phase 3.C
+provides the ISIN-tagged Excel path) and PTR (one number per scheme).
+Manager-tenure extraction was removed when the user opted to verify manager
+tenure manually for Stage 2 survivors. AUM is sourced exclusively from
+AMFI's quarterly AAUM endpoint (see ``mfs.ingest.amfi_aum``).
 
 The package path is kept at ``mfs.ingest.managers`` for backward
 compatibility with existing imports.
@@ -104,8 +105,6 @@ def run_for_amc(
     log.info("holdings.parsed", amc=amc_slug, n_records=len(holding_records))
     ptr_records = list(adapter.parse_ptr(pdf, ym))
     log.info("ptr.parsed", amc=amc_slug, n_records=len(ptr_records))
-    aum_records = list(adapter.parse_aum(pdf, ym))
-    log.info("aum.parsed", amc=amc_slug, n_records=len(aum_records))
 
     # Step 3: build candidate index from scheme_master and fuzzy-match. The
     # same index is reused across all record types.
@@ -121,67 +120,30 @@ def run_for_amc(
     # Step 4: resolve names to scheme_codes.
     matched_holdings = _resolve_holdings(holding_records, candidates, amc_slug, ym)
     matched_ptr = _resolve_ptr(ptr_records, candidates, amc_slug, ym)
-    matched_aum = _resolve_aum(aum_records, candidates, amc_slug, ym)
 
     # Step 4.5: dedupe by PK to avoid Postgres CardinalityViolation.
     matched_holdings = _dedupe_by_keys(
         matched_holdings, ("scheme_code", "security_name", "as_of_month"),
     )
     matched_ptr = _dedupe_by_keys(matched_ptr, ("scheme_code", "as_of_month"))
-    matched_aum = _dedupe_by_keys(matched_aum, ("scheme_code", "as_of_month"))
 
     # Step 5: write each table.
     n_holdings = w.upsert_holdings(pl.DataFrame(matched_holdings)) if matched_holdings else 0
     n_ptr = w.upsert_portfolio_turnover(pl.DataFrame(matched_ptr)) if matched_ptr else 0
-    n_aum = w.upsert_scheme_aum(pl.DataFrame(matched_aum)) if matched_aum else 0
 
     log.info(
         "managers.run.done",
         amc=amc_slug, ym=ym,
         rows_written_holdings=n_holdings,
         rows_written_ptr=n_ptr,
-        rows_written_aum=n_aum,
     )
     return {
         "amc_slug": amc_slug,
         "ym": ym,
         "rows_written_holdings": n_holdings,
         "rows_written_ptr": n_ptr,
-        "rows_written_aum": n_aum,
         "candidate_count": len(candidates),
     }
-
-
-def _resolve_aum(
-    records: list,
-    candidates: dict[str, dict],
-    amc_slug: str,
-    ym: str,
-) -> list[dict]:
-    if not records:
-        return []
-    from mfs.schemas import ParsedAumRecord
-    now = datetime.utcnow()
-    as_of_month = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
-    cache: dict[str, MatchResult] = {}
-    out: list[dict] = []
-    for rec in records:
-        if not isinstance(rec, ParsedAumRecord):
-            continue
-        mr = cache.get(rec.scheme_name_printed)
-        if mr is None:
-            mr = match_one(rec.scheme_name_printed, candidates)
-            cache[rec.scheme_name_printed] = mr
-        if mr.matched_scheme_code is None:
-            continue
-        out.append({
-            "scheme_code": mr.matched_scheme_code,
-            "as_of_month": as_of_month,
-            "aum_crore": float(rec.aum_crore),
-            "source_amc": amc_slug,
-            "computed_at": now,
-        })
-    return out
 
 
 def _resolve_holdings(
