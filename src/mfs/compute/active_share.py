@@ -18,6 +18,17 @@ Locked choices:
 - **Equity-only filter**: only holdings whose `instrument_type` normalizes
   to 'Equity' contribute to the fund side. Derivatives, debt, REITs, cash
   are excluded — Active Share is by convention an equity-equity comparison.
+- **Hybrid benchmarks = equity sleeve only**: for hybrid categories
+  (Aggressive Hybrid, Balanced Advantage, Equity Savings) the benchmark is the
+  NIFTY 50 equity sleeve and Active Share compares the fund's equity book
+  against it, *both renormalized to 100%* — the standard Cremers–Petajisto
+  equity-portfolio definition. The benchmark's debt sleeve is **intentionally
+  excluded**: it has no decomposable per-security weights (NIFTY Composite Debt
+  Index publishes none, and no tracker fund exists), and injecting an aggregate
+  debt row would spuriously inflate Active Share because the fund's own debt
+  holdings are already dropped by the equity-only filter (they would not
+  cancel). The benchmark's fixed equity/debt split is recorded as metadata in
+  the `composite_recipe` column of `configs/benchmarks.csv` for transparency.
 - **Normalized name match**: `_normalize_name` lowercases, strips punctuation,
   and removes Ltd./Limited variants so "HDFC Bank Ltd." matches "HDFC Bank
   Limited" across sources.

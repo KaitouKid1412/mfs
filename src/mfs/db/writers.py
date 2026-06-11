@@ -254,11 +254,17 @@ def update_computed_metrics_phase2(df: pl.DataFrame, as_of: date) -> int:
 # ---------------------------------------------------------------------------
 
 
-def upsert_holdings(df: pl.DataFrame) -> int:
+def upsert_holdings(df: pl.DataFrame, conn: psycopg.Connection | None = None) -> int:
     """Upsert holdings_monthly. Expected columns: scheme_code, security_name,
     as_of_month, weight_pct, isin (optional), instrument_type, source_amc,
     computed_at. Primary key (scheme_code, security_name, as_of_month) —
-    ISIN is nullable since factsheet PDFs don't print it."""
+    ISIN is nullable since factsheet PDFs don't print it.
+
+    When ``conn`` is supplied the upsert runs on that connection (no commit), so
+    the caller can wrap a preceding ``DELETE`` and this upsert in ONE
+    transaction — a kill between them must not leave the (source_amc, month)
+    partition empty. With ``conn=None`` it opens its own committed connection.
+    """
     if df.is_empty():
         return 0
     cols = [
@@ -269,11 +275,11 @@ def upsert_holdings(df: pl.DataFrame) -> int:
     if "isin" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("isin"))
     out = df.select(cols)
+    pk = ("scheme_code", "security_name", "as_of_month")
+    if conn is not None:
+        return _copy_upsert(conn, "holdings_monthly", cols, out.iter_rows(), pk=pk)
     with connect() as c:
-        return _copy_upsert(
-            c, "holdings_monthly", cols, out.iter_rows(),
-            pk=("scheme_code", "security_name", "as_of_month"),
-        )
+        return _copy_upsert(c, "holdings_monthly", cols, out.iter_rows(), pk=pk)
 
 
 def upsert_index_constituents(df: pl.DataFrame) -> int:
@@ -290,18 +296,23 @@ def upsert_index_constituents(df: pl.DataFrame) -> int:
         )
 
 
-def upsert_portfolio_turnover(df: pl.DataFrame) -> int:
+def upsert_portfolio_turnover(df: pl.DataFrame, conn: psycopg.Connection | None = None) -> int:
     """Upsert portfolio_turnover_monthly. Expected columns: scheme_code,
-    as_of_month, ptr (as a fraction), source_amc, computed_at."""
+    as_of_month, ptr (as a fraction), source_amc, computed_at.
+
+    When ``conn`` is supplied the upsert runs on that connection (no commit) so
+    a preceding ``DELETE`` + this upsert commit atomically — a kill between them
+    must not leave the (source_amc, month) PTR rows wiped.
+    """
     if df.is_empty():
         return 0
     cols = ["scheme_code", "as_of_month", "ptr", "source_amc", "computed_at"]
     out = df.select(cols)
+    pk = ("scheme_code", "as_of_month")
+    if conn is not None:
+        return _copy_upsert(conn, "portfolio_turnover_monthly", cols, out.iter_rows(), pk=pk)
     with connect() as c:
-        return _copy_upsert(
-            c, "portfolio_turnover_monthly", cols, out.iter_rows(),
-            pk=("scheme_code", "as_of_month"),
-        )
+        return _copy_upsert(c, "portfolio_turnover_monthly", cols, out.iter_rows(), pk=pk)
 
 
 # ---------------------------------------------------------------------------

@@ -51,4 +51,18 @@ from mfs.ingest.managers import canara_robeco  # noqa: F401
 from mfs.ingest.managers import iti  # noqa: F401
 from mfs.ingest.managers import pgim_india  # noqa: F401
 
+# Phase 5 PTR adapters (AMCs that previously had no factsheet adapter).
+from mfs.ingest.managers import bajaj_finserv  # noqa: F401
+from mfs.ingest.managers import jm_financial  # noqa: F401
+from mfs.ingest.managers import samco  # noqa: F401
+from mfs.ingest.managers import taurus  # noqa: F401
+from mfs.ingest.managers import helios  # noqa: F401
+from mfs.ingest.managers import shriram  # noqa: F401
+from mfs.ingest.managers import navi  # noqa: F401
+from mfs.ingest.managers import quantum  # noqa: F401
+from mfs.ingest.managers import ppfas  # noqa: F401
+from mfs.ingest.managers import nj  # noqa: F401
+from mfs.ingest.managers import old_bridge  # noqa: F401
+from mfs.ingest.managers import capitalmind  # noqa: F401
+
 __all__ = ["run_all", "run_for_amc", "register_adapter", "registered_adapters"]

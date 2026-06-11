@@ -307,22 +307,33 @@ def stock_adv_history(isins: list[str], window_days: int = 90) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=schema, orient="row")
 
 
-def latest_scheme_aum(scheme_code: str) -> tuple[date, float] | None:
+def latest_scheme_aum(
+    scheme_code: str, on_or_before: date | None = None
+) -> tuple[date, float] | None:
     """Return (as_of_month, aum_crore) for the most recent AUM snapshot.
 
     AUM comes exclusively from AMFI's quarterly AAUM endpoint
     (source_amc='amfi_aaum'); the per-AMC factsheet path was removed and a
     CHECK constraint enforces the single-source invariant. The latest
     `as_of_month` wins.
+
+    When ``on_or_before`` is given, only quarters whose ``as_of_month`` is on or
+    before that date are considered — this is required when attaching AUM to a
+    metric stamped at a historical ``as_of`` so a future quarter (published
+    after the metric date) cannot leak in. When None, the globally-latest
+    quarter is returned (correct for "current AUM" weighting at run time).
     """
+    sql = (
+        "SELECT as_of_month, aum_crore FROM scheme_aum_monthly "
+        "WHERE scheme_code = %s "
+    )
+    params: tuple = (scheme_code,)
+    if on_or_before is not None:
+        sql += "AND as_of_month <= %s "
+        params = (scheme_code, on_or_before)
+    sql += "ORDER BY as_of_month DESC LIMIT 1"
     with connect() as c:
-        row = c.execute(
-            "SELECT as_of_month, aum_crore FROM scheme_aum_monthly "
-            "WHERE scheme_code = %s "
-            "ORDER BY as_of_month DESC "
-            "LIMIT 1",
-            (scheme_code,),
-        ).fetchone()
+        row = c.execute(sql, params).fetchone()
     if not row:
         return None
     m, a = row
@@ -349,6 +360,36 @@ def latest_computed_metrics_date() -> date | None:
             "SELECT MAX(as_of_date) FROM computed_metrics"
         ).fetchone()
     return row[0] if row else None
+
+
+def has_factsheet_rows(amc_slug: str, as_of_month: date) -> bool:
+    """True if this AMC already has holdings OR PTR rows for the given month.
+    Used by the factsheet parse-skip: a skip is only safe when the prior ingest
+    is actually present in the DB."""
+    with connect() as c:
+        h = c.execute(
+            "SELECT 1 FROM holdings_monthly "
+            "WHERE source_amc = %s AND as_of_month = %s LIMIT 1",
+            (amc_slug, as_of_month),
+        ).fetchone()
+        if h:
+            return True
+        p = c.execute(
+            "SELECT 1 FROM portfolio_turnover_monthly "
+            "WHERE source_amc = %s AND as_of_month = %s LIMIT 1",
+            (amc_slug, as_of_month),
+        ).fetchone()
+    return bool(p)
+
+
+def benchmark_latest_by_ticker() -> dict[str, date]:
+    """Per-ticker MAX(date) in benchmark_daily — the incremental-ingest cursor.
+    A ticker absent from the result has no rows yet (needs a full backfill)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT ticker, MAX(date) FROM benchmark_daily GROUP BY ticker"
+        ).fetchall()
+    return {t: d for t, d in rows if d is not None}
 
 
 def latest_dates() -> dict[str, date | None]:

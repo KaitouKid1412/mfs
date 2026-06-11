@@ -83,8 +83,8 @@ import secrets
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
@@ -246,6 +246,22 @@ _SCHEME_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Printed-name normalization for the shared fuzzy matcher. The factsheet
+# titles the Large-and-Midcap scheme "ITI Large & Mid Cap Fund" — "Mid Cap"
+# as two words. The matcher uses token_set_ratio, which treats the token set
+# {large, cap} of "ITI Large Cap Fund" as a SUBSET of {large, mid, cap} and so
+# scores BOTH printed names 100 against the Large-Cap scheme, collapsing the
+# Large-&-Midcap PTR onto the Large-Cap scheme_code (the rows then dedupe
+# away). scheme_master spells the L&M scheme "Large & Midcap" (one token),
+# which disambiguates cleanly, so we fold the two-word factsheet spelling onto
+# it. CRITICAL: scope the fold to the FULL "Large & Mid Cap" phrase — the
+# standalone scheme "ITI Mid Cap Fund" (code 148733) is spelled with two words
+# in BOTH the factsheet and scheme_master, so a blanket "Mid Cap"→"Midcap"
+# would wrongly drag it onto the Large-&-Midcap code.
+_LARGE_MIDCAP_RE = re.compile(
+    r"\bLarge\s*&\s*Mid\s+Cap\b", re.IGNORECASE
+)
+
 # PTR: ``Portfolio Turnover Ratio 1.08``. ITI prints a fraction directly
 # (not a percent) — pass through with no /100 divide.
 _PTR_RE = re.compile(r"Portfolio\s+Turnover\s+Ratio\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
@@ -282,6 +298,10 @@ def _scheme_name_from_page(text: str) -> str | None:
         name = m.group(1).strip()
         # Defensive: collapse runs of whitespace.
         name = re.sub(r"\s+", " ", name)
+        # Fold "Large & Mid Cap" onto scheme_master's "Large & Midcap" so the
+        # fuzzy matcher disambiguates it from the Large-Cap scheme (leaving the
+        # standalone "ITI Mid Cap Fund" untouched).
+        name = _LARGE_MIDCAP_RE.sub("Large & Midcap", name)
         return name
     return None
 

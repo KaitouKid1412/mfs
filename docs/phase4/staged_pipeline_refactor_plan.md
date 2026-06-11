@@ -69,7 +69,7 @@ data/output/shortlist/<as_of>/
 
 ## What's wrong with the current implementation
 
-1. **`compute metrics`** runs once over all 682 schemes and computes every
+1. **`compute metrics`** runs once over all 664 schemes and computes every
    metric (Phase 1 + Phase 2) up front — wasteful, and conflates the two
    conceptual stages.
 2. **`composite_score`** in Stage 1's per-category ranking ALREADY includes
@@ -89,7 +89,7 @@ data/output/shortlist/<as_of>/
 ### Stage 1 — Pure Performance & Consistency ranking
 
 **Compute step** (`compute_phase1`): for every active Direct+Growth scheme
-in scheme_master (682 today), compute only:
+in scheme_master (664 today, after closed-ended/interval exclusion), compute only:
 - `ret_3y_median, ret_3y_p25, ret_5y_median, ret_5y_p25`
 - `alpha_3y_annualized, alpha_3y_tstat, beta_3y, r_squared_3y`
 - `sortino_3y`

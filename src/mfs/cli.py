@@ -54,6 +54,11 @@ def ingest_navs(
 def ingest_benchmarks(
     tickers: list[str] = typer.Option(None, help="Specific tickers to fetch; default = all"),
     since: str | None = typer.Option(None, help="Fetch from YYYY-MM-DD onwards"),
+    full: bool = typer.Option(
+        False, "--full",
+        help="Re-fetch full history (default: incremental from each ticker's "
+        "latest stored date minus a restatement tail).",
+    ),
     skip_hybrid: bool = typer.Option(
         False, help="Skip the synthetic hybrid TRI construction step."
     ),
@@ -64,9 +69,9 @@ def ingest_benchmarks(
 
     start = _parse_date(since)
     if tickers:
-        results = {t: benchmarks.ingest_ticker(t, start=start) for t in tickers}
+        results = {t: benchmarks.ingest_ticker(t, start=start, full=full) for t in tickers}
     else:
-        results = benchmarks.ingest_all_known(start=start)
+        results = benchmarks.ingest_all_known(start=start, full=full)
     typer.echo(f"Benchmarks ingested: {results}")
     if not skip_hybrid:
         try:
@@ -803,6 +808,37 @@ def db_status():
                 typer.echo(f"  {tbl:20s}: <error: {e}>")
 
 
+@app.command("coverage")
+def coverage_cmd(
+    as_of: str | None = typer.Option(None, help="YYYY-MM-DD; default = today"),
+    gate: str = typer.Option(
+        "all", help="Which gate to evaluate: 'A' (blocking), 'B' (advisory), or 'all'."
+    ),
+):
+    """Evaluate the data-coverage contracts and print the per-source report.
+
+    Answers, for every ingested source, the six coverage questions (need-from /
+    have-from / have-till / fresh-by / expected-vs-actual / gap+fix). This is the
+    same machinery the pipeline runs at Gate A / Gate B, runnable standalone for
+    diagnostics. Read-only — never ingests or computes.
+
+    Exits 2 if a BLOCKING contract fails (so it can be used as a CI/cron check).
+    """
+    configure_logging()
+    from mfs import coverage
+
+    d = date.fromisoformat(as_of) if as_of else date.today()
+    gates = ["A", "B"] if gate == "all" else [gate.upper()]
+    reports = []
+    for g in gates:
+        report = coverage.run_gate(g, as_of=d, raise_on_block=False)
+        typer.echo(coverage.render(report))
+        reports.append(report)
+    typer.echo(coverage.render_summary(reports))
+    if any(rep.blocking_failures for rep in reports):
+        raise typer.Exit(code=2)
+
+
 @app.command("missing-data")
 def missing_data_cmd(
     since: str = typer.Option(
@@ -991,6 +1027,13 @@ def pipeline_run_all(
         help="Skip factsheet / holdings / bhavcopy / constituents ingest "
         "stages. Useful for debugging Phase 1 only.",
     ),
+    full: bool = typer.Option(
+        False, "--full",
+        help="Force a from-scratch re-ingest: benchmarks re-fetch full history, "
+        "bhavcopy re-walks the full window, factsheets re-parse even if "
+        "unchanged. Default is incremental (fetch only the gap; the coverage "
+        "gate then verifies the gap closed).",
+    ),
 ):
     """Run the full pipeline end-to-end: ingest → build → compute → rank-deep.
 
@@ -1005,12 +1048,14 @@ def pipeline_run_all(
     ever reaches compute or rank-deep.
     """
     configure_logging()
+    from mfs import coverage
     from mfs.compute import orchestrator
+    from mfs.db.connection import pipeline_lock
     from mfs.errors import IngestError, PipelineError
     from mfs.freshness import check_freshness
     from mfs.ingest import (
         amfi_aum, amfi_nav, benchmarks, bhavcopy as bhavcopy_mod, constituents,
-        fbil_tbill, holdings, managers,
+        fbil_tbill, holdings, managers, synthetic_hybrid,
     )
     from mfs.master import scheme_master
     from mfs.rank import shortlist
@@ -1028,49 +1073,119 @@ def pipeline_run_all(
             typer.echo(f"[pipeline] WARN at {name} (best-effort, continuing):\n{e}", err=True)
             return None
 
-    # ----- Phase 1: required base data -----
-    _stage("ingest navs (today)", amfi_nav.ingest_today)
-    _stage("ingest benchmarks", benchmarks.ingest_all_known)
-    _stage("ingest tbill", lambda: fbil_tbill.ingest(allow_fallback=allow_fallback))
-    _stage("build scheme-master", scheme_master.build)
+    gate_reports: list = []
 
-    if not skip_phase2:
-        # ----- AMFI quarterly AAUM (per-scheme, all AMCs in one shot) -----
-        # Authoritative SEBI source covering ~98% of the ranked universe with
-        # a single GET. Replaces per-AMC factsheet AUM extraction.
-        _stage(
-            "ingest amfi aaum (latest quarter)",
-            lambda: amfi_aum.ingest_quarter(_latest_amfi_quarter_label(d)),
+    def _coverage_gate(gate: str, *, halt_on_block: bool):
+        """Run a coverage gate, print the bordered report to stdout (NOT via
+        structlog, so the table isn't flattened into one line), and halt the
+        run on a BLOCKING breach. The full report is rendered whether it passes
+        or fails — the data-quality posture is never silent."""
+        typer.echo(f"[pipeline] coverage gate {gate} ...")
+        report = coverage.run_gate(gate, as_of=d, raise_on_block=False)
+        typer.echo(coverage.render(report))
+        gate_reports.append(report)
+        if halt_on_block and report.blocking_failures:
+            typer.echo(
+                f"[pipeline] HALTING (exit 2) — Gate {gate} blocking coverage "
+                f"failure; refusing to compute metrics on incomplete inputs.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        return report
+
+    # Serialize concurrent pipeline runs with a Postgres advisory lock (released
+    # automatically if this process dies, so a killed run never strands it).
+    try:
+        _lock = pipeline_lock()
+        _lock.__enter__()
+    except PipelineError as e:
+        typer.echo(f"[pipeline] {e}", err=True)
+        raise typer.Exit(code=2) from e
+
+    try:
+        # ----- Phase 1: required base data -----
+        _stage("ingest navs (today)", amfi_nav.ingest_today)
+        _stage("ingest benchmarks", lambda: benchmarks.ingest_all_known(full=full))
+        # Synthesize the 3 hybrid TRIs (Hybrid 50:50, 65:35, Equity Savings) from
+        # the now-fresh NIFTY 50 TRI sleeve + risk-free. These are NOT on NSE's
+        # public TRI endpoint, so ingest_all_known never produces them — without
+        # this step they go stale and the freshness gate halts the run. Mirrors
+        # what the standalone `mfs ingest benchmarks` command already does.
+        def _synthesize_hybrids():
+            # synthesize_* raises RuntimeError/ValueError on missing components;
+            # convert to IngestError so a failure halts cleanly via _stage rather
+            # than escaping as an uncaught traceback.
+            try:
+                return synthetic_hybrid.synthesize_all()
+            except (RuntimeError, ValueError) as e:
+                raise IngestError(f"Hybrid TRI synthesis failed: {e}") from e
+
+        _stage("synthesize hybrid TRIs", _synthesize_hybrids)
+        _stage("ingest tbill", lambda: fbil_tbill.ingest(allow_fallback=allow_fallback))
+        _stage("build scheme-master", scheme_master.build)
+
+        # ----- Coverage Gate A (BLOCKING): NAV / benchmarks / risk-free /
+        # scheme-master. Fails fast HERE — before the expensive ~50-AMC Phase-2
+        # scrape — so broken base data costs seconds, not 15+ minutes. -----
+        _coverage_gate("A", halt_on_block=True)
+
+        if not skip_phase2:
+            # ----- AMFI quarterly AAUM (per-scheme, all AMCs in one shot) -----
+            # Authoritative SEBI source covering ~98% of the ranked universe with
+            # a single GET. Replaces per-AMC factsheet AUM extraction.
+            _stage(
+                "ingest amfi aaum (latest quarter)",
+                lambda: amfi_aum.ingest_quarter(_latest_amfi_quarter_label(d)),
+            )
+
+            # ----- Factsheet ingest: holdings + PTR (AUM now sourced from AMFI) -----
+            _stage("ingest managers (all AMCs)", lambda: managers.run_all(force=full))
+
+            # ----- Phase 2.3.B: NSE bhavcopy for stock ADV (needed by AUM Impact) -----
+            _stage(
+                "ingest bhavcopy (last 75d)",
+                lambda: bhavcopy_mod.ingest_recent(n_days=75, full=full),
+            )
+
+            # ----- Phase 2.2.B: index constituent weights (best-effort, manual CSV) -----
+            _stage(
+                "ingest constituents (manual CSVs)",
+                lambda: constituents.run_all(),
+                required=False,
+            )
+
+            # ----- Phase 3.C: per-AMC monthly portfolio Excels (HDFC + SBI + Nippon) -----
+            _stage("ingest holdings (all registered AMCs)", lambda: holdings.run_all())
+
+            # ----- Coverage Gate B (ADVISORY): holdings / PTR / AAUM /
+            # constituents / stock-ADV. This is the ONLY coverage net for these
+            # signals (their freshness gates are null in pipeline.yaml). Gaps are
+            # reported loudly and the affected funds are excluded downstream; the
+            # run continues (these are advisory signals, not base data). -----
+            _coverage_gate("B", halt_on_block=False)
+
+        # ----- freshness gate before compute -----
+        _stage("freshness check", lambda: check_freshness(as_of=d, raise_on_fail=True))
+
+        # Phase 1 compute on every eligible scheme. Phase 2 compute is deferred
+        # to rank-deep, which restricts it to the Stage 1 top-N candidate pool.
+        _stage("compute phase1", lambda: orchestrator.run_phase1(as_of=d))
+
+        # ----- rank-deep (Stage 1 + 2 + 3) — runs Phase 2 compute internally -----
+        result = _stage(
+            "rank-deep (stage 1 + 2 + 3)",
+            lambda: shortlist.rank_deep(as_of=d),
         )
-
-        # ----- Factsheet ingest: holdings + PTR (AUM now sourced from AMFI) -----
-        _stage("ingest managers (all AMCs)", lambda: managers.run_all())
-
-        # ----- Phase 2.3.B: NSE bhavcopy for stock ADV (needed by AUM Impact) -----
-        _stage("ingest bhavcopy (last 75d)", lambda: bhavcopy_mod.ingest_recent(n_days=75))
-
-        # ----- Phase 2.2.B: index constituent weights (best-effort, manual CSV) -----
-        _stage(
-            "ingest constituents (manual CSVs)",
-            lambda: constituents.run_all(),
-            required=False,
-        )
-
-        # ----- Phase 3.C: per-AMC monthly portfolio Excels (HDFC + SBI + Nippon) -----
-        _stage("ingest holdings (all registered AMCs)", lambda: holdings.run_all())
-
-    # ----- freshness gate before compute -----
-    _stage("freshness check", lambda: check_freshness(as_of=d, raise_on_fail=True))
-
-    # Phase 1 compute on every eligible scheme. Phase 2 compute is deferred
-    # to rank-deep, which restricts it to the Stage 1 top-N candidate pool.
-    _stage("compute phase1", lambda: orchestrator.run_phase1(as_of=d))
-
-    # ----- rank-deep (Stage 1 + 2 + 3) — runs Phase 2 compute internally -----
-    result = _stage(
-        "rank-deep (stage 1 + 2 + 3)",
-        lambda: shortlist.rank_deep(as_of=d),
-    )
+    finally:
+        # Print the data-quality posture on EVERY run (success, advisory gaps,
+        # or a Gate A halt) — it's never silent. Guarded so a rendering error
+        # can't mask the real pipeline exception.
+        if gate_reports:
+            try:
+                typer.echo(coverage.render_summary(gate_reports))
+            except Exception as _e:  # noqa: BLE001
+                typer.echo(f"[pipeline] (summary render failed: {_e})", err=True)
+        _lock.__exit__(None, None, None)
     if result is not None:
         typer.echo(f"pipeline done. as_of={result['as_of']}")
         typer.echo(f"  stage 1: {len(result['stage1'])} category files at {result['out_dir']}/stage1/")

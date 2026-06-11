@@ -42,8 +42,8 @@ Layout findings driving the parser:
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
@@ -75,6 +75,22 @@ _FRACTION_RE = re.compile(r"^\d+\.\d+$")
 # Trailing erstwhile/parenthetical descriptions that bleed onto line 1.
 _ERSTWHILE_RE = re.compile(r"\s*\(Erstwhile[^)]*$", re.IGNORECASE)
 _PAREN_TAIL_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _normalize_scheme_name(name: str) -> str:
+    """Disambiguate the one DSP printed name that collides under the matcher.
+
+    The factsheet prints the active midcap fund as ``'DSP Mid Cap Fund'``
+    (spaced). That token-set-ties at 100 against ``'DSP Large & Mid Cap
+    Fund'`` and loses the Levenshtein tie-break, so its PTR mis-routes to
+    Large & Mid Cap and DSP Midcap Fund silently gets no PTR. scheme_master
+    spells the fund ``'DSP Midcap Fund'`` (no space), so we collapse exactly
+    that printed name. Anchored on the full (case-insensitive) string, so
+    the ``'DSP Large & Mid Cap Fund'`` page is left untouched.
+    """
+    if name.strip().lower() == "dsp mid cap fund":
+        return "DSP Midcap Fund"
+    return name
 
 
 @register_adapter
@@ -133,7 +149,11 @@ class DspAdapter(ManagerAdapter):
         first = _ERSTWHILE_RE.sub("", first).strip()
         # Strip a fully-balanced '(Erstwhile ...)' parenthetical.
         first = _PAREN_TAIL_RE.sub("", first).strip()
-        return first or None
+        if not first:
+            return None
+        # Disambiguate 'DSP Mid Cap Fund' from 'DSP Large & Mid Cap Fund'
+        # before the fuzzy matcher sees it (see _normalize_scheme_name).
+        return _normalize_scheme_name(first)
 
     # ------------------------------------------------------------------
     # PTR

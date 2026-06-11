@@ -1,93 +1,68 @@
-"""quant Mutual Fund — factsheet adapter (Phase 3.B).
+"""quant Mutual Fund — PTR adapter (Phase 5, abridged annual report).
 
-Calibrated against the April 2026 combined factsheet PDF
-(``data/raw/factsheets/quant/2026-04.pdf``, ~11.78 MB, 80 pages, 26 equity/
-hybrid + 3 debt scheme detail pages plus cover / philosophy / glossary /
-"how to read the factsheet" / dividend history / PoS locations at the back).
+quant **deliberately omits the Portfolio Turnover Ratio from its monthly
+factsheet** (page 11 of the April-2026 issue carries an essay arguing PTR is
+"an irrelevant measure"; page 74 repeats the stance, printing Sharpe /
+Sortino / Jensen's Alpha instead). SEBI does not mandate PTR in the factsheet
+— only as a per-scheme footnote in the **abridged scheme-wise annual report**
+(Circular MFD/CIR/14/18337/2002, tied to Reg. 59A of the MF Regulations). So
+this adapter sources quant's PTR from that annual report rather than the
+factsheet. The number is the same trailing-period SEBI metric every other AMC
+prints monthly — quant just publishes it annually.
 
-URL discovery
--------------
-The AMC site (``www.quantmutual.com``) is a classic ASP.NET WebForms app.
-The factsheet downloads page at ``/downloads/factsheet`` lists per-month
-PDFs hosted under ``/Admin/Factsheet/`` with a slug-stable filename. The
-April-2026 issue uses a one-off naming quirk — a HYPHEN between
-``Factsheet`` and ``April`` — while every other month uses an underscore:
+Source document
+---------------
+The abridged annual report lives at a slug-stable URL keyed by fiscal year::
 
-    https://www.quantmutual.com/Admin/Factsheet/quant_Factsheet_May_2026.pdf
-    https://www.quantmutual.com/Admin/Factsheet/quant_Factsheet-April_2026.pdf  <- April only
-    https://www.quantmutual.com/Admin/Factsheet/quant_Factsheet_March_2026.pdf
-    https://www.quantmutual.com/Admin/Factsheet/quant_Factsheet_February_2026.pdf
+    https://quantmutual.com/Admin/disclouser/
+        Annual-Report__quant-Mutual-Fund_Financial-Year-2023-24.pdf
 
-The April underscore variant returns 404 — confirmed by HEAD probe — so
-``build_url(ym)`` emits the hyphen filename for April and the underscore
-filename for every other month. Both convention branches embed the **data
-month** (no publish-month shift like Tata / Franklin / UTI). The filename
-is otherwise deterministic and slug-stable across months.
+The site's "Annual Report of Schemes" page is an ASP.NET WebForms app that
+renders the document list via client-side postbacks (no static link / JSON
+API), so ``fetch`` probes the fiscal-year URLs newest→oldest and downloads
+the latest one that resolves (HTTP 200, ``application/pdf``). It auto-upgrades
+the moment quant posts a newer FY at the same URL pattern. As of mid-2026 the
+latest pattern-discoverable report is **FY2023-24** (period ended 31 Mar 2024);
+FY2024-25 was not reachable at any guessable URL (it sits behind the WebForms
+postback) — see ``docs/phase5/coverage_to_95.md`` for the freshness caveat and
+the half-yearly-portfolio upgrade path.
 
 Layout findings driving the parser
-----------------------------------
-* Each scheme has two consecutive pages — a narrative "manager commentary"
-  page (no AUM/PTR markers) followed by a "scheme snapshot" page that
-  prints the FUND SIZE block in the top-right corner. We anchor on the
-  FUND SIZE label and extract the value from the snapshot page only; the
-  commentary page is naturally skipped because it doesn't contain
-  ``FUND SIZE``.
+-----------------------------------
+The 74-page abridged report carries a "Perspective Historical Per Unit
+Statistics" block — 6 schemes per page across ~4 pages — laid out as one
+COLUMN PER SCHEME with two sub-columns each (current FY + previous FY)::
 
-* Scheme name lives on the first non-empty line of the snapshot page and
-  starts with the lowercase prefix ``quant `` (e.g. ``quant Small Cap
-  Fund``, ``quant ELSS Tax Saver Fund``, ``quant Multi Asset Allocation
-  Fund``). One scheme — ``quant Multi Asset Allocation Fund`` — has its
-  portfolio table spill onto a third page (page 65) whose first line is a
-  GOI bond entry (``Total MFU 0.03``). That continuation page has no
-  FUND SIZE so it's naturally skipped (and would yield a non-quant first
-  line if it did).
+    row 0  : ['', 'quant ABSOLUTE FUND', None, 'quant ESG EQUITY FUND', None, ...]
+    period : ['', 'Period ended 31 March 2024', 'Period ended 31 March 2023', ...]
+    ...
+    PTR row: ['6. Portfolio turnover ratio4', '1.44', '1 .45', '2.75', '2 .66', ...]
 
-* AUM is printed in the top-right corner of the snapshot page as two
-  stacked rows:
-      ``FUND SIZE``                       (label, x0 ~ 525, y ~ 67)
-      ``₹ 25,821 cr``                     (INR Crore value, y ~ 82)
-      ``$ 2.73 bn``                       (USD billions display, y ~ 90)
-  We prefer the INR Crore row (it's already in our storage convention).
-  pdfplumber's ``extract_text`` mangles this block on most pages because
-  the FUND SIZE label is fused into the wrap of the Investment Objective
-  paragraph in the text-flow layout (see e.g. page 14:
-  ``...long-term growth FUND SIZE``). Word-position extraction handles
-  this cleanly — the ₹ glyph is its own token at x0 ~ 525, the numeric
-  body is at x0 ~ 535, and the ``cr`` unit is at x0 ~ 550. We anchor on
-  the top-right ``FUND`` label (x0 > 470, y < 130), then take the first
-  ``cr``-terminated numeric token below it.
+``page.extract_tables()`` recovers this grid cleanly. For each scheme the
+**current-FY** value is the first (odd-indexed) sub-column and parses clean;
+only the previous-FY sub-column carries pdfplumber digit-mangling ('1 .45'),
+which we never read. The PTR is printed in "times" (e.g. 1.44 = 144 %), which
+is already our storage convention (fraction), so no /100 normalization. Debt
+schemes (Liquid / Gilt / Overnight) print '-' and are skipped. ``as_of_month``
+is read from the table's "Period ended 31 March YYYY" header so the value is
+stamped at its true FY-end regardless of which FY file was fetched — see the
+``as_of_month`` override on ``ParsedPtrRecord``.
 
-* **PTR is NOT printed in the factsheet** — quant deliberately omits the
-  Portfolio Turnover Ratio per scheme and instead prints Sharpe / Sortino
-  / Jensen's Alpha. Page 11 of the factsheet contains an essay arguing
-  that PTR is "an irrelevant measure", and page 74 ("How to read the
-  factsheet") repeats the stance. The "RISK ADJUSTED MEASURES" snapshot
-  block on each equity scheme page shows Sharpe / Sortino / Jensen's
-  Alpha / R-Squared / Downside / Upside Deviation / Capture ratios —
-  no turnover figure anywhere. Manual entry / cross-source fabrication
-  is forbidden by the project's fail-fast invariants ("No manual entry,
-  no nullable strict fields"), so ``parse_ptr`` deliberately yields
-  nothing for quant. PTR ingestion for quant is deferred to a parallel
-  data source (AMFI portal monthly portfolio statement) if/when such a
-  source is integrated in a future phase.
-
-Calibration counts on 2026-04
------------------------------
-* 29 scheme snapshot pages detected (26 equity/hybrid + 3 debt:
-  Liquid / Gilt / Overnight)
-* 29 AUM rows extracted (every snapshot page yields a clean
-  ``₹ <value> cr`` token)
-* 0 PTR rows extracted (intentional — see "PTR is NOT printed" above)
+Holdings stay on the parallel ISIN-tagged Excel path (``ingest/holdings``);
+``parse_holdings`` here yields nothing.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
+import httpx
 import pdfplumber
 
+from mfs.errors import IngestError
 from mfs.ingest.managers._base import ManagerAdapter
 from mfs.ingest.managers._registry import register_adapter
 from mfs.schemas import ParsedHoldingRecord, ParsedPtrRecord
@@ -96,117 +71,233 @@ from mfs.utils.logging import get_logger
 log = get_logger(__name__)
 
 
-_MONTH_NAMES = (
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
+_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        (
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ),
+        1,
+    )
+}
+
+_SCHEME_RE = re.compile(r"^\s*quant\b.*\b(?:fund|fof)\b", re.IGNORECASE)
+_PERIOD_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})")
+
+_AR_URL = (
+    "https://quantmutual.com/Admin/disclouser/"
+    "Annual-Report__quant-Mutual-Fund_Financial-Year-{fy}.pdf"
 )
 
+# The FY2023-24 report prints some legacy / abbreviated scheme names. Map the
+# genuine renames to their current scheme_master spelling so the fuzzy matcher
+# resolves them at full score, and skip report-only schemes that no longer
+# exist in scheme_master — they would otherwise fuzzy-poach a live sibling
+# (e.g. the discontinued "quant Absolute Fund" scores 86 against "quant Value
+# Fund" and would overwrite Value's true PTR). Keys are lowercased printed names.
+_NAME_FIXUPS = {
+    "quant flexicap fund": "quant Flexi Cap Fund",
+    "quant esg equity fund": "quant ESG Integration Strategy Fund",
+}
+_SKIP_NAMES = {
+    "quant absolute fund",
+    "quant active fund",
+}
 
-def _scheme_name_from_page(text: str) -> str | None:
-    """Return the printed scheme name from the first non-empty line, or
-    ``None`` if this page is not a scheme snapshot.
 
-    The factsheet detail pages start with the scheme title on line 1
-    (e.g. ``quant Small Cap Fund``). Cover / philosophy / TOC / glossary /
-    "How to read the factsheet" pages either start with something else or
-    are blank-text (full-page images). We require the leading token to be
-    the literal lowercase ``quant`` to filter aggressively — the AMC's
-    own branding rule is that the company name is always lowercase, and
-    the only place ``Quant`` (title-case) appears in the PDF is in the
-    page-title metadata for legacy scheme footers, which we don't read.
-    """
-    if not text:
+def _collapse(s: object) -> str:
+    """Collapse internal whitespace/newlines in a table cell to single spaces."""
+    if s is None:
+        return ""
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def _clean_scheme_name(cell: object) -> str:
+    """Return a collapsed scheme name if the cell is a quant scheme header,
+    else ''. 'quant BUSINESS\\nCYCLE FUND' -> 'quant BUSINESS CYCLE FUND'."""
+    name = _collapse(cell)
+    return name if _SCHEME_RE.match(name) else ""
+
+
+def _clean_ptr(cell: object) -> float | None:
+    """Parse a PTR 'times' value. '-' / blank / non-numeric -> None. The
+    current-FY sub-column is clean; we never read the mangled previous-FY one."""
+    s = _collapse(cell).replace(" ", "")
+    if s in ("", "-", "–", "NA", "N.A.", "N.A"):
         return None
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
+    try:
+        return float(s)
+    except ValueError:
         return None
-    first = lines[0]
-    # Must start with the lowercase brand prefix. We do NOT accept
-    # title-case ``Quant `` here — the cover page banner uses that and
-    # is not a scheme page.
-    if not first.startswith("quant "):
-        return None
-    # Reject prose / TOC entries — a real scheme title is short and
-    # ends with ``Fund`` (or ``Fund of Fund`` / ``FOF``). The continuation
-    # pages don't have FUND SIZE markers anyway so the AUM gate later
-    # would drop them.
-    if not re.search(r"\b(?:Fund|FOF|Fund\s+of\s+Fund)\b", first, re.IGNORECASE):
-        return None
-    # Collapse whitespace defensively.
-    return re.sub(r"\s+", " ", first).strip()
+
+
+def _scheme_cell_count(row: list) -> int:
+    return sum(1 for c in row if _clean_scheme_name(c))
+
+
+def _period_end(period_row: list | None, page_text: str) -> date | None:
+    """Resolve the table's current-FY period-end (month-floored). Prefer the
+    'Period ended 31 March YYYY' header cells; fall back to scanning page text."""
+    candidates: list[str] = []
+    if period_row:
+        candidates.extend(_collapse(c) for c in period_row if c and "ended" in str(c).lower())
+    candidates.append(page_text)
+    best: date | None = None
+    for text in candidates:
+        for m in _PERIOD_RE.finditer(text):
+            mon = _MONTHS.get(m.group(2).title())
+            if not mon:
+                continue
+            d = date(int(m.group(3)), mon, 1)
+            # The header lists current FY then previous FY; take the latest.
+            if best is None or d > best:
+                best = d
+        if best is not None:
+            return best
+    return best
 
 
 @register_adapter
 class QuantAdapter(ManagerAdapter):
-    """quant Mutual Fund factsheet adapter.
+    """quant Mutual Fund PTR adapter, sourced from the abridged annual report.
 
-    ``amc_slug = 'quant'`` matches ``scheme_master.amc_code`` exactly
-    (verified against the 130 quant schemes in the master table), so no
-    alias entry in ``_scheme_match.py`` is required. Note the lowercase
-    branding — that is the AMC's actual name, not a typo.
+    ``amc_slug = 'quant'`` matches ``scheme_master.amc_code`` exactly, so no
+    alias entry in ``_scheme_match.py`` is required. The lowercase branding is
+    the AMC's actual name, not a typo.
     """
 
     amc_slug = "quant"
     source_label = "quant Mutual Fund"
 
-    def build_url(self, ym: str) -> str:
-        """Return the canonical quant combined-factsheet PDF URL for data
-        month ym='YYYY-MM'.
+    # ------------------------------------------------------------------
+    # Fiscal-year URL resolution
+    # ------------------------------------------------------------------
 
-        quant publishes the factsheet under ``/Admin/Factsheet/`` with a
-        slug-stable filename embedding the data month name and four-digit
-        year. There is no publish-month shift (unlike Tata / Franklin /
-        UTI). One naming quirk on the CMS — the April-2026 issue uses a
-        HYPHEN between ``Factsheet`` and ``April`` (``quant_Factsheet-
-        April_2026.pdf``) while every other month uses an underscore
-        (``quant_Factsheet_May_2026.pdf``). The underscore variant for
-        April returns 404 — confirmed by HEAD probe — so we branch on
-        the month here.
+    @staticmethod
+    def _candidate_fy_labels(ym: str) -> list[str]:
+        """Fiscal-year labels (e.g. '2023-24') to probe, newest first.
+
+        Indian FY runs Apr–Mar; FY 'YYYY-YY' ends 31 March of the later year.
+        For a run month ``ym`` we start at the FY ending in the most recent
+        March on/before that month and walk back six years.
         """
         y, m = map(int, ym.split("-"))
-        month_name = _MONTH_NAMES[m - 1]
-        separator = "-" if m == 4 else "_"
-        return (
-            "https://www.quantmutual.com/Admin/Factsheet/"
-            f"quant_Factsheet{separator}{month_name}_{y}.pdf"
+        end_year = y if m >= 4 else y - 1
+        return [f"{ey - 1}-{ey % 100:02d}" for ey in range(end_year, end_year - 6, -1)]
+
+    @classmethod
+    def _ar_url(cls, fy_label: str) -> str:
+        return _AR_URL.format(fy=fy_label)
+
+    def build_url(self, ym: str) -> str:
+        """Deterministic newest-candidate annual-report URL (fetch() probes
+        older years as a fallback)."""
+        return self._ar_url(self._candidate_fy_labels(ym)[0])
+
+    def fetch(self, ym: str) -> Path:
+        """Return the local path to quant's latest available abridged annual
+        report, probing fiscal-year URLs newest→oldest.
+
+        Reuses a cached PDF if one exists for any candidate FY. If no report is
+        reachable, raises ``IngestError`` — we never fabricate a PTR (fail-fast,
+        no manual entry).
+        """
+        from mfs import paths
+        from mfs.config import get_settings
+        from mfs.io.http import download_to
+
+        labels = self._candidate_fy_labels(ym)
+        for fy in labels:
+            cached = paths.annual_report_raw(self.amc_slug, fy)
+            if cached.exists():
+                return cached
+
+        s = get_settings()
+        with httpx.Client(
+            timeout=s.http_timeout,
+            headers={"User-Agent": s.user_agent},
+            follow_redirects=True,
+        ) as c:
+            for fy in labels:
+                url = self._ar_url(fy)
+                try:
+                    r = c.head(url)
+                except httpx.HTTPError:
+                    continue
+                if r.status_code == 200 and "pdf" in r.headers.get("content-type", "").lower():
+                    out = paths.annual_report_raw(self.amc_slug, fy)
+                    log.info("quant.annual_report.selected", fy=fy, url=url)
+                    return download_to(url, out)
+
+        raise IngestError(
+            "quant: no abridged annual report reachable at the known URL "
+            f"pattern for FYs {labels[0]}..{labels[-1]}. quant omits PTR from "
+            "its factsheet, so PTR cannot be sourced without the annual report."
         )
 
     # ------------------------------------------------------------------
-    # PTR / AUM
+    # PTR — from the annual report's per-scheme key-statistics table
     # ------------------------------------------------------------------
 
     def parse_ptr(self, pdf_path: Path, ym: str) -> Iterable[ParsedPtrRecord]:
-        """Yield nothing — quant Mutual Fund deliberately omits the
-        Portfolio Turnover Ratio from its factsheet.
+        """Yield one ParsedPtrRecord per scheme that prints a current-FY PTR.
 
-        Page 11 of the April-2026 factsheet contains an essay arguing
-        PTR is "an irrelevant measure"; page 74 ("How to read the
-        factsheet") repeats the stance. The scheme snapshot blocks
-        publish Sharpe / Sortino / Jensen's Alpha / R-Squared /
-        Downside / Upside Deviation / Capture ratios instead. PTR
-        ingestion for quant is therefore deferred — the project's
-        fail-fast invariant forbids manual entry or cross-source
-        fabrication, so we return an empty iterable rather than
-        invent values.
+        Each record is stamped with the report's true FY-end (read from the
+        table header), not the run month, via ``as_of_month``.
         """
-        return ()
+        records: list[ParsedPtrRecord] = []
+        seen: set[str] = set()
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                for tbl in page.extract_tables():
+                    if not tbl or len(tbl) < 3:
+                        continue
+                    ptr_row = next(
+                        (r for r in tbl if r and r[0] and "portfolio turnover" in str(r[0]).lower()),
+                        None,
+                    )
+                    if ptr_row is None:
+                        continue
+                    header_row = max(tbl, key=_scheme_cell_count)
+                    if _scheme_cell_count(header_row) == 0:
+                        continue
+                    period_row = next(
+                        (r for r in tbl if r and any(c and "ended" in str(c).lower() for c in r)),
+                        None,
+                    )
+                    period = _period_end(period_row, page_text)
+                    if period is None:
+                        continue
+                    # Current-FY values sit in the odd (first-of-pair) columns.
+                    for j in range(1, len(header_row), 2):
+                        name = _clean_scheme_name(header_row[j])
+                        if not name:
+                            continue
+                        key = name.lower()
+                        if key in _SKIP_NAMES:
+                            continue
+                        name = _NAME_FIXUPS.get(key, name)
+                        if name in seen:
+                            continue
+                        ptr = _clean_ptr(ptr_row[j]) if j < len(ptr_row) else None
+                        if ptr is None or not (0.0 < ptr < 20.0):
+                            continue
+                        seen.add(name)
+                        records.append(
+                            ParsedPtrRecord(
+                                scheme_name_printed=name,
+                                ptr=ptr,
+                                source_amc=self.amc_slug,
+                                as_of_month=period,
+                            )
+                        )
+        log.info("quant.ptr.parsed", n_records=len(records))
+        return records
 
     # ------------------------------------------------------------------
-    # Holdings — deferred. The quant snapshot pages print the top-10
-    # holdings inline as a two-column ``<Company Name> <% to NAV>``
-    # block but without ISINs; Phase 3.A's parallel ISIN-tagged Excel
-    # path covers quant for the portfolio overlap metric, so we return
-    # () here.
+    # Holdings — covered by the parallel ISIN-tagged Excel path.
     # ------------------------------------------------------------------
 
     def parse_holdings(self, pdf_path: Path, ym: str) -> Iterable[ParsedHoldingRecord]:

@@ -76,6 +76,9 @@ def test_required_metrics_excludes_removed_columns():
     req = required_metrics_for_category("Mid Cap")
     assert "stress_test_days_50pct" not in req
     assert "manager_tenure_years" not in req
+    # active_share is a soft signal, not a survival gate (needs >=3 monthly
+    # snapshots we don't yet have); it must NOT be required.
+    assert "active_share_median_1y" not in req
 
 
 # ---------------------------------------------------------------------------
@@ -98,30 +101,41 @@ def test_apply_stage2_pool_caps_at_top_n():
     assert dropped.height == 0
 
 
-def test_apply_stage2_drops_fund_with_null_phase2_metric():
+def test_apply_stage2_drops_fund_with_null_required_metric():
     rows = [
         _scored_row("S_good", composite_score=0.9),
+        # active_share is optional → a fund missing only it must SURVIVE.
         _scored_row("S_no_active_share", active_share_median_1y=None, composite_score=0.8),
+        # aum_impact is still required → this fund is dropped.
         _scored_row("S_no_aum_impact", aum_impact_cost_days=None, composite_score=0.7),
     ]
     survivors, dropped, _ = apply_stage2(_df(rows), aum_map={}, final_size=5)
-    assert survivors["scheme_code"].to_list() == ["S_good"]
-    assert set(dropped["scheme_code"].to_list()) == {"S_no_active_share", "S_no_aum_impact"}
+    assert set(survivors["scheme_code"].to_list()) == {"S_good", "S_no_active_share"}
+    assert set(dropped["scheme_code"].to_list()) == {"S_no_aum_impact"}
 
 
 def test_apply_stage2_missing_metrics_column_lists_every_null():
     rows = [
         _scored_row(
             "S_two_missing",
-            active_share_median_1y=None,
             ptr_latest=None,
+            aum_impact_cost_days=None,
         ),
     ]
     survivors, dropped, _ = apply_stage2(_df(rows), aum_map={}, final_size=5)
     assert survivors.is_empty() or survivors.height == 0
     miss = dropped.row(0, named=True)["missing_metrics"]
-    assert "active_share_median_1y" in miss
     assert "ptr_latest" in miss
+    assert "aum_impact_cost_days" in miss
+
+
+def test_apply_stage2_active_share_null_does_not_drop():
+    """A fund with every required metric present but a NULL active_share
+    (the current universe-wide state) must survive Stage 2."""
+    rows = [_scored_row("S_only_as_null", active_share_median_1y=None)]
+    survivors, dropped, _ = apply_stage2(_df(rows), aum_map={}, final_size=5)
+    assert survivors.height == 1
+    assert dropped.is_empty() or dropped.height == 0
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +193,13 @@ def test_partial_coverage_flag_when_survivors_below_final_size():
     rows = [
         _scored_row("S1", composite_score=0.9),
         _scored_row("S2", composite_score=0.8),
+        # active_share is optional → S3 survives despite a null active_share.
         _scored_row("S3", composite_score=0.7, active_share_median_1y=None),
         _scored_row("S4", composite_score=0.6, ptr_latest=None),
         _scored_row("S5", composite_score=0.5, style_drift_3y=None),
     ]
     survivors, _, _ = apply_stage2(_df(rows), aum_map={}, final_size=5)
-    assert survivors.height == 2
+    assert survivors.height == 3  # S1, S2, S3 (S4/S5 dropped on required metrics)
     assert all(survivors["partial_coverage_flag"].to_list())
 
 
@@ -213,7 +228,7 @@ def test_coverage_row_per_category():
     rows = [
         _scored_row("S_LC_1", category="Large Cap", composite_score=0.9),
         _scored_row("S_LC_2", category="Large Cap", composite_score=0.8,
-                    active_share_median_1y=None),
+                    ptr_latest=None),
         _scored_row("S_FC_1", category="Flexi Cap", composite_score=0.7),
     ]
     _, _, coverage = apply_stage2(_df(rows), aum_map={})
@@ -229,7 +244,7 @@ def test_coverage_row_per_category():
 def test_coverage_aum_rollup_correct():
     rows = [
         _scored_row("S_pass", composite_score=0.9),
-        _scored_row("S_drop", composite_score=0.8, active_share_median_1y=None),
+        _scored_row("S_drop", composite_score=0.8, ptr_latest=None),
     ]
     aum_map = {"S_pass": 100.0, "S_drop": 200.0}
     _, _, coverage = apply_stage2(_df(rows), aum_map=aum_map)
@@ -241,7 +256,7 @@ def test_coverage_aum_rollup_correct():
 
 def test_coverage_top_dropped_amc():
     rows = [
-        _scored_row("S1", source_amc="amc_a", active_share_median_1y=None, composite_score=0.9),
+        _scored_row("S1", source_amc="amc_a", style_drift_3y=None, composite_score=0.9),
         _scored_row("S2", source_amc="amc_a", ptr_latest=None, composite_score=0.8),
         _scored_row("S3", source_amc="amc_b", aum_impact_cost_days=None, composite_score=0.7),
     ]
@@ -258,7 +273,7 @@ def test_run_writes_artifacts(tmp_path):
     rows = [
         _scored_row("S1", category="Large Cap", composite_score=0.9),
         _scored_row("S2", category="Large Cap", composite_score=0.8,
-                    active_share_median_1y=None),
+                    ptr_latest=None),
         _scored_row("S3", category="Flexi Cap", composite_score=0.7),
     ]
     result = run(_df(rows), aum_map={"S1": 100.0}, output_dir=tmp_path)

@@ -30,6 +30,11 @@ class AmfiNavIngestConfig(BaseModel):
 
 class BenchmarksIngestConfig(BaseModel):
     history_start: date
+    # Incremental ingest: per-ticker, fetch from MAX(date)-incremental_tail_days
+    # forward instead of re-pulling the full ~13y history every run. The tail is
+    # a generous overlap so NSE TRI restatements within the window self-correct
+    # (upsert overwrites). A `--full` run ignores this and re-fetches everything.
+    incremental_tail_days: int = 90
 
 
 class IngestConfig(BaseModel):

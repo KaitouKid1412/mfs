@@ -2,8 +2,10 @@
 
 Stage 1 (``mfs.rank.shortlist``) ranks every scheme on Phase 1 metrics
 alone and emits one CSV per category. Stage 2 takes the top-N (default
-20) from each category, drops funds with any NULL Phase 2 metric, and
-**re-ranks** the survivors using the Stage 2 weight vector (Phase 1
+20) from each category, drops funds missing any *required* Phase 2 metric
+(see ``REQUIRED_METRICS_ALL`` — active_share is an optional soft signal, not
+a survival gate), and **re-ranks** the survivors using the Stage 2 weight
+vector (Phase 1
 metrics with weights downshifted to make room for active_share +
 style_drift + soft penalties from PTR and AUM Impact Cost).
 
@@ -12,7 +14,7 @@ Outputs:
      ordered by ``composite_score_v2``, with ``stage2_rank`` and
      ``partial_coverage_flag`` columns.
   2. ``stage2/dropped.csv`` — every fund from a Stage 1 top-N pool that
-     was dropped because of a NULL Phase 2 metric.
+     was dropped because of a NULL *required* Phase 2 metric.
   3. ``stage2/coverage.csv`` — per-category counts + AUM rollup.
   4. ``stage2/mf_report.csv`` — top-3 per category consolidated view.
 """
@@ -31,9 +33,17 @@ log = get_logger(__name__)
 
 # Required Phase 2 metrics. A scheme survives Stage 2 only if every metric
 # below is non-null.
+#
+# active_share_median_1y is intentionally NOT required. It needs >=3 monthly
+# snapshots of BOTH fund holdings and benchmark constituents (see
+# compute/active_share.py: MIN_SNAPSHOTS_FOR_MEDIAN), and as of mid-2026 we have
+# only ~1 month of constituent weights, so it is null universe-wide. Requiring
+# it would drop every fund from Stage 2. It remains a *soft* signal — weighted
+# into the Stage 2 composite when present (composite_score_stage2) and
+# contributing 0 when null — and folds back in automatically once >=3 months of
+# holdings/constituent history accumulate.
 REQUIRED_METRICS_ALL = (
     "style_drift_3y",
-    "active_share_median_1y",
     "ptr_latest",
     "aum_impact_cost_days",
 )

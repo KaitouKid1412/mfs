@@ -236,7 +236,9 @@ def compute_phase2_for_scheme(
         latest = scheme_ptr.sort("as_of_month").row(-1, named=True)
         row["ptr_latest"] = float(latest["ptr"])
 
-    aum_info = q.latest_scheme_aum(scheme_code)
+    # on_or_before=as_of so a quarter published after the metric date can't leak
+    # future AUM into a historical metric (no-op today: only one quarter loaded).
+    aum_info = q.latest_scheme_aum(scheme_code, on_or_before=as_of)
     if not scheme_holdings.is_empty() and aum_info is not None:
         _, aum_crore = aum_info
         last_month = scheme_holdings["as_of_month"].max()

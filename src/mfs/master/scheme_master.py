@@ -77,10 +77,30 @@ SECTOR_RULES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+def _strip_amc_name(scheme_name: str, amc_name: str | None) -> str:
+    """Remove the AMC's house name from a scheme name so sector classification
+    keys off the fund's MANDATE, not the house name.
+
+    Without this, an AMC whose name contains a sector token mis-classifies its
+    own sector/thematic funds — e.g. "BANK OF INDIA Manufacturing &
+    Infrastructure Fund" matches the Banking rule via "BANK", and "Bajaj Finserv
+    Healthcare Fund" matches it via "Finserv". Stripping the leading AMC name
+    leaves "Manufacturing & Infrastructure Fund" / "Healthcare Fund" to classify.
+    """
+    if not amc_name:
+        return scheme_name
+    amc = re.sub(r"\bmutual fund\b", "", amc_name, flags=re.IGNORECASE).strip()
+    if not amc:
+        return scheme_name
+    return re.sub(r"^\s*" + re.escape(amc) + r"\b", "", scheme_name, flags=re.IGNORECASE).strip()
+
+
 def _classify_sector(scheme_name: str) -> str:
     """Map a Sectoral/Thematic scheme to a specific sector bucket using its name.
 
-    Returns one of the 12 sector buckets, or 'Thematic' as the residual.
+    Returns one of the 12 sector buckets, or 'Thematic' as the residual. Pass an
+    AMC-name-stripped scheme name (see ``_strip_amc_name``) so the house name
+    can't trigger a sector rule.
     """
     if not scheme_name:
         return "Thematic"
@@ -114,8 +134,19 @@ def _classify_plan_option(scheme_name: str) -> tuple[str, str]:
     return plan, option
 
 
+# Closed-ended and interval schemes are excluded from the equity universe: they
+# are not open for purchase and their NAV history is finite. AMFI prefixes every
+# category with the scheme type, e.g. "Close Ended Schemes(ELSS)" or
+# "Interval Fund Schemes(...)". Without this guard, closed-ended tax-saver series
+# (SBI/UTI/Sundaram/Bank of India "Long Term Advantage" etc.) leak into the
+# ranked universe via the "ELSS"/"Tax Saver" substring rules below.
+_CLOSED_OR_INTERVAL_RE = re.compile(r"closed?[\s-]*end(?:ed)?|interval", re.IGNORECASE)
+
+
 def _canonical_category(raw: str | None) -> str | None:
     if not raw:
+        return None
+    if _CLOSED_OR_INTERVAL_RE.search(raw):
         return None
     for needle, canon in CATEGORY_RULES:
         if needle.lower() in raw.lower():
@@ -150,9 +181,11 @@ def build() -> pl.DataFrame:
         amc_name = r["amc_name"] or "Unknown"
         plan, option = _classify_plan_option(scheme_name)
         canon = _canonical_category(r["amfi_category"])
-        # Sub-classify sectoral/thematic funds based on scheme name.
+        # Sub-classify sectoral/thematic funds based on scheme name — with the
+        # AMC house name stripped so it can't trigger a sector rule (e.g.
+        # "BANK OF INDIA ..." / "Bajaj Finserv ...").
         if canon == "Sectoral/Thematic":
-            canon = _classify_sector(scheme_name)
+            canon = _classify_sector(_strip_amc_name(scheme_name, amc_name))
         amc_code = _amc_slug(amc_name)
         rows.append(
             {

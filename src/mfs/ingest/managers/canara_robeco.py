@@ -96,8 +96,8 @@ Calibration counts on 2026-04
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
@@ -210,6 +210,16 @@ def _resolve_factsheet_url(ym: str) -> str:
 # ``*`` footnote marker (Large and Mid Cap, Consumption fund use it).
 _CANARA_PREFIX = "CANARA ROBECO"
 
+# The Flexicap page prints its name as "CANARA ROBECO FLEXI CAP FUND" (the AMC
+# spaces "FLEXI CAP"), but scheme_master writes it solid ("FLEXICAP"). The
+# spaced form fuzzy-matches the WRONG sibling — "FLEXI CAP" → Mid Cap @91.7 —
+# so the Flexicap PTR was being misrouted onto Mid Cap's scheme_code and then
+# dropped by the (scheme_code, as_of_month) dedupe against Mid Cap's own PTR.
+# Collapsing "FLEXI CAP" → "FLEXICAP" (a pure spacing variant of the same word)
+# lifts the match to 100 and routes the PTR to the correct scheme. Keyed as a
+# whole-phrase substitution so other "... CAP FUND" names are untouched.
+_FLEXI_CAP_RE = re.compile(r"\bFLEXI\s+CAP\b", re.IGNORECASE)
+
 
 def _scheme_name_from_page(text: str) -> str | None:
     """Return the printed scheme name from the first non-empty line, or
@@ -228,6 +238,9 @@ def _scheme_name_from_page(text: str) -> str | None:
     name = re.sub(r"[\*\#†]+\s*$", "", first).strip()
     # Collapse internal whitespace runs.
     name = re.sub(r"\s+", " ", name)
+    # Canonicalise the spaced "FLEXI CAP" marketing form to the scheme_master
+    # spelling "FLEXICAP" so the shared matcher binds it correctly (see above).
+    name = _FLEXI_CAP_RE.sub("FLEXICAP", name)
     return name or None
 
 

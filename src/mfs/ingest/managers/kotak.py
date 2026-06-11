@@ -49,8 +49,8 @@ month/year mismatch will surface there rather than at network time.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
@@ -96,10 +96,40 @@ _HEADER_MAX_Y = 60.0
 
 
 # PTR: "Portfolio Turnover 22.65%"  → percent. Store as fraction.
+# Hybrid pages (Balanced Advantage, Equity Savings, Aggressive Hybrid) print the
+# label with a trailing footnote marker BEFORE the value, with no separating
+# space: "Portfolio Turnover$$ 18.59%". The "$$" keys a disclosure footnote
+# (the ratio's computation basis) and is not part of the number. Pure-equity
+# pages omit the marker ("Portfolio Turnover 22.65%"). We allow an optional run
+# of non-alphanumeric footnote characters ($ * # † etc.) between the label and
+# the value so the three hybrids' real, printed PTR is captured (previously the
+# required "\s+" after "Turnover" failed on "Turnover$$ ", silently dropping
+# them — a factsheet-omits-PTR misclassification we are correcting, not
+# fabricated data: the value is printed on the page).
 _PTR_RE = re.compile(
-    r"Portfolio\s+Turnover\s+(\d+(?:\.\d+)?)\s*%",
+    r"Portfolio\s+Turnover[^0-9A-Za-z\n]*\s*(\d+(?:\.\d+)?)\s*%",
     re.IGNORECASE,
 )
+
+# Factsheet header → emitted printed name rewrites for the one ranked equity
+# fund whose Kotak-printed name the shared scheme_match matcher (which we must
+# not edit) resolves to the WRONG scheme_master sibling. "Kotak Services Fund"
+# (header "KOTAK SERVICES FUND") canonicalises to a token set that ties at
+# token_set_ratio 100 against several "... FINANCIAL SERVICES ..." index funds;
+# the Levenshtein tie-break then mis-fires onto "Kotak Nifty Financial Services
+# Ex-Bank Index Fund" (151911). The true master row "Kotak Services Fund -
+# Direct - Growth" canonicalises to "KOTAK SERVICES FUND DIRECT" (the
+# "- Direct - Growth" suffix lacks the "Plan" keyword the shared canonicaliser
+# requires to strip it, leaving a trailing DIRECT token). Appending "Direct"
+# to the emitted name restores that token for an exact-length match (154149).
+# Keyed on the normalised header so it cannot touch the Banking & Financial
+# Services fund or the Nifty/CRISIL Financial Services index funds. The PTR
+# value itself is read verbatim from the page — this only fixes which scheme
+# the printed name resolves to.
+_PTR_NAME_REWRITES = {
+    "KOTAK SERVICES FUND": "Kotak Services Fund Direct",
+}
+
 
 @register_adapter
 class KotakAdapter(ManagerAdapter):
@@ -191,8 +221,12 @@ class KotakAdapter(ManagerAdapter):
                 # Drop nonsense values rather than ship NaN-equivalent data.
                 if pct <= 0:
                     continue
+                # Nudge the one mis-matching ranked equity name toward its true
+                # scheme_master canonical form (see _PTR_NAME_REWRITES). Keyed on
+                # the normalised header; only "Kotak Services Fund" is affected.
+                printed = _PTR_NAME_REWRITES.get(scheme.upper(), scheme)
                 yield ParsedPtrRecord(
-                    scheme_name_printed=scheme,
+                    scheme_name_printed=printed,
                     ptr=pct / 100.0,  # percent → fraction
                     source_amc=self.amc_slug,
                 )

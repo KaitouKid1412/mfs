@@ -5,7 +5,8 @@ Downloads `sec_bhavdata_full_DDMMYYYY.csv` from
 SERIES='EQ' (cash-market equity), writes one (isin, date, close,
 total_traded_value) row to `stock_adv_daily`.
 
-Symbol→ISIN mapping comes from NSE's EQUITY_L.csv (re-cached on every run).
+Symbol→ISIN mapping comes from NSE's EQUITY_L.csv, cached on disk and refreshed
+weekly (a stale map silently drops symbols renamed by M&A / corporate actions).
 
 The endpoint sometimes 403s without warning; per the brittleness audit
 (Tier 2.6), we retry transient HTTP errors via the existing io/http layer
@@ -16,15 +17,17 @@ from __future__ import annotations
 
 import csv
 import io
-import re
-from datetime import date, datetime, timedelta
+import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 import polars as pl
 
 from mfs import paths
+from mfs.db import queries as q
 from mfs.db import writers as w
+from mfs.io.atomic import atomic_write_bytes
 from mfs.io.http import TransientHttpError
 from mfs.utils.logging import get_logger
 
@@ -66,18 +69,43 @@ def _fetch_with_retry(url: str) -> bytes | None:
     return r.content
 
 
-def fetch_equity_list() -> dict[str, str]:
-    """Return {symbol: isin} from NSE EQUITY_L.csv. Caches on disk."""
+# Refresh the symbol→ISIN cache when it is older than this. NSE renames tickers
+# after M&A / corporate actions; a stale map silently drops the renamed symbol's
+# rows in _parse_bhavcopy, so we re-pull weekly to let those rows self-heal.
+_EQUITY_LIST_MAX_AGE_DAYS = 7
+
+
+def _equity_list_cache_fresh(path: Path, max_age_days: int) -> bool:
+    if not path.exists():
+        return False
+    return (time.time() - path.stat().st_mtime) <= max_age_days * 86400
+
+
+def fetch_equity_list(max_age_days: int = _EQUITY_LIST_MAX_AGE_DAYS) -> dict[str, str]:
+    """Return {symbol: isin} from NSE EQUITY_L.csv.
+
+    Cached on disk and refreshed weekly: if the cache is missing or older than
+    ``max_age_days``, re-pull it. A failed refresh falls back to the existing
+    (stale) cache rather than aborting the run; only a missing cache that also
+    can't be fetched is fatal.
+    """
     out_path = paths.nse_equity_list_raw()
-    if out_path.exists():
+    if _equity_list_cache_fresh(out_path, max_age_days):
         data = out_path.read_bytes()
     else:
-        log.info("bhavcopy.equity_list.fetch")
-        data = _fetch_with_retry(_EQUITY_LIST_URL)
-        if data is None:
+        log.info("bhavcopy.equity_list.fetch", stale=out_path.exists())
+        try:
+            data = _fetch_with_retry(_EQUITY_LIST_URL)
+        except TransientHttpError as e:
+            data = None
+            log.warning("bhavcopy.equity_list.refresh_failed", err=str(e))
+        if data is not None:
+            atomic_write_bytes(out_path, data)
+        elif out_path.exists():
+            log.warning("bhavcopy.equity_list.using_stale_cache", path=str(out_path))
+            data = out_path.read_bytes()
+        else:
             raise RuntimeError("NSE EQUITY_L.csv unavailable (404)")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(data)
     reader = csv.reader(io.StringIO(data.decode("utf-8")))
     header = next(reader)
     sym_idx = next(i for i, h in enumerate(header) if h.strip() == "SYMBOL")
@@ -112,8 +140,9 @@ def fetch_one(d: date, symbol_to_isin: dict[str, str] | None = None) -> int:
         if data is None:
             log.info("bhavcopy.non_trading_day", date=d.isoformat())
             return 0
-        cached.parent.mkdir(parents=True, exist_ok=True)
-        cached.write_bytes(data)
+        # Atomic write: the cache-hit check above is bare `cached.exists()`, so a
+        # truncated partial download must never land at the final path.
+        atomic_write_bytes(cached, data)
 
     rows = _parse_bhavcopy(data, d, symbol_to_isin)
     if not rows:
@@ -151,7 +180,7 @@ def _parse_bhavcopy(
         symbol = raw[idx["SYMBOL"]].strip()
         isin = symbol_to_isin.get(symbol)
         if not isin:
-            continue  # unknown symbol — skip, equity list will refresh weekly
+            continue  # unknown symbol — skip; recovered on the weekly EQUITY_L refresh
         try:
             close = float(raw[idx["CLOSE_PRICE"]])
         except ValueError:
@@ -170,13 +199,26 @@ def _parse_bhavcopy(
     return rows
 
 
-def ingest_recent(n_days: int = 75) -> dict:
+def ingest_recent(n_days: int = 75, *, full: bool = False) -> dict:
     """Walk the most recent n_days calendar days, ingesting each trading day.
 
     Default 75 days covers the 60-day median window with slack for holidays.
     Already-cached files are reused.
+
+    Incremental by default: if stock_adv_daily already has data, only the days
+    after its latest date (plus a small re-check overlap) are walked, rather than
+    re-parsing all 75 cached files every run. The full history is preserved in
+    the DB, so the trailing ADV window stays intact. ``full=True`` (or a cold,
+    empty table) walks the entire n_days window. The day loop is idempotent
+    (upsert), so the overlap is safe.
     """
     today = date.today()
+    if not full:
+        latest = q.latest_stock_adv_date()
+        if latest is not None:
+            # +3-day overlap re-checks the most recent days (cheap, idempotent).
+            n_days = min(n_days, (today - latest).days + 3)
+            log.info("bhavcopy.recent.incremental", latest=latest.isoformat(), n_days=n_days)
     symbol_to_isin = fetch_equity_list()
     fetched = 0
     rows = 0

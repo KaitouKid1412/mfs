@@ -84,8 +84,8 @@ Calibration counts on 2026-04
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
@@ -101,6 +101,30 @@ log = get_logger(__name__)
 # Sundaram first-line prefix on every active scheme page. The FoF scheme
 # (Sundaram Global Brand Theme - Equity Active FoF) uses the same prefix.
 _SCHEME_PREFIX = "Sundaram "
+
+# Sundaram's factsheet spells two flagship funds differently from AMFI's
+# scheme_master recorded name, and the divergence breaks the shared fuzzy
+# matcher (token_set_ratio + Levenshtein tie-break):
+#   - "Sundaram Flexi Cap Fund"          -> mis-matched to "Sundaram Mid Cap
+#     Fund" (the split "Flexi Cap" loses the single-token "FLEXICAP" signal).
+#   - "Sundaram Large and Mid Cap Fund"  -> mis-matched to "Sundaram Large Cap
+#     Fund" at a perfect token_set_ratio of 100 ("Large Cap" is a pure token
+#     subset, and "MID CAP" != master's single-token "MIDCAP").
+# We can't touch the shared matcher; instead we rewrite the printed name we
+# emit so it lands on the master's spelling. Pure rename, no value change.
+_NAME_NORMALIZE = {
+    "sundaram flexi cap fund": "Sundaram Flexicap Fund",
+    "sundaram large and mid cap fund": "Sundaram Large and Midcap Fund",
+}
+
+
+def _normalize_scheme_name(name: str) -> str:
+    """Map a factsheet scheme header to the AMFI-spelled name when the two
+    diverge in a way that breaks the shared fuzzy matcher; otherwise return
+    the name unchanged."""
+    key = re.sub(r"\s+", " ", name).strip().lower()
+    return _NAME_NORMALIZE.get(key, name)
+
 
 # PTR (text-extract path). Matches ``Turnover Ratio 31.4`` — Sundaram
 # stores PTR as a percent (i.e. 31.4 means 31.4%, not 3140%). The regex
@@ -284,7 +308,7 @@ class SundaramAdapter(ManagerAdapter):
                 # Sundaram prints PTR as a percent; storage convention
                 # is fraction (31.4% -> 0.314).
                 yield ParsedPtrRecord(
-                    scheme_name_printed=scheme,
+                    scheme_name_printed=_normalize_scheme_name(scheme),
                     ptr=pct / 100.0,
                     source_amc=self.amc_slug,
                 )

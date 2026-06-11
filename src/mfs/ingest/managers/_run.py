@@ -21,6 +21,7 @@ import polars as pl
 from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.errors import IngestError
+from mfs.ingest import _parse_cache
 from mfs.ingest.managers._registry import get_adapter, registered_adapters
 from mfs.ingest.managers._scheme_match import (
     DEFAULT_THRESHOLD,
@@ -73,6 +74,7 @@ def run_for_amc(
     ym: str | None = None,
     pdf_path: Path | None = None,
     match_threshold: int = DEFAULT_THRESHOLD,
+    force: bool = False,
 ) -> dict:
     """Run one AMC's factsheet adapter end-to-end.
 
@@ -91,6 +93,7 @@ def run_for_amc(
     adapter = get_adapter(amc_slug)
     ym = ym or _default_data_month()
     log.info("managers.run.start", amc=amc_slug, ym=ym)
+    as_of_month = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
 
     # Step 1: fetch (or use override).
     if pdf_path is None:
@@ -100,14 +103,9 @@ def run_for_amc(
         if not pdf.exists():
             raise IngestError(f"Local PDF not found: {pdf}")
 
-    # Step 2: parse each optional signal. Adapters that don't override return ().
-    holding_records = list(adapter.parse_holdings(pdf, ym))
-    log.info("holdings.parsed", amc=amc_slug, n_records=len(holding_records))
-    ptr_records = list(adapter.parse_ptr(pdf, ym))
-    log.info("ptr.parsed", amc=amc_slug, n_records=len(ptr_records))
-
-    # Step 3: build candidate index from scheme_master and fuzzy-match. The
-    # same index is reused across all record types.
+    # Step 2: build candidate index from scheme_master (drives all matching).
+    # Built before parsing so it can also fingerprint the match universe for the
+    # parse-skip check below.
     sm = q.scheme_master()
     candidates = build_candidate_index(sm, amc_slug)
     if not candidates:
@@ -116,6 +114,36 @@ def run_for_amc(
             f"amc_code={amc_slug!r}. Run `mfs build scheme-master` first or "
             "verify the adapter's amc_slug matches the scheme_master code."
         )
+
+    # Step 2.5: incremental parse-skip. If the factsheet bytes AND the match
+    # universe are byte-identical to the last successful ingest, and the DB
+    # already holds those rows, re-parsing + DELETE-reinsert is a provable no-op
+    # — skip the expensive pdfplumber parse. `force` (a --full run) always
+    # re-parses; an explicit pdf_path override never skips (caller wants it
+    # parsed). The universe fingerprint closes the scheme_master-coupling hole:
+    # if matching would re-route, the fingerprint differs and we re-parse.
+    universe_fp = _parse_cache.fingerprint(
+        f"{name}={info['scheme_code']}" for name, info in candidates.items()
+    )
+    if (
+        not force and pdf_path is None
+        and _parse_cache.should_skip_parse(
+            pdf, universe_fp,
+            db_has_rows=q.has_factsheet_rows(amc_slug, as_of_month),
+        )
+    ):
+        log.info("managers.run.skip_unchanged", amc=amc_slug, ym=ym)
+        return {
+            "amc_slug": amc_slug, "ym": ym,
+            "rows_written_holdings": 0, "rows_written_ptr": 0,
+            "candidate_count": len(candidates), "skipped": True,
+        }
+
+    # Step 3: parse each optional signal. Adapters that don't override return ().
+    holding_records = list(adapter.parse_holdings(pdf, ym))
+    log.info("holdings.parsed", amc=amc_slug, n_records=len(holding_records))
+    ptr_records = list(adapter.parse_ptr(pdf, ym))
+    log.info("ptr.parsed", amc=amc_slug, n_records=len(ptr_records))
 
     # Step 4: resolve names to scheme_codes.
     matched_holdings = _resolve_holdings(holding_records, candidates, amc_slug, ym)
@@ -127,9 +155,38 @@ def run_for_amc(
     )
     matched_ptr = _dedupe_by_keys(matched_ptr, ("scheme_code", "as_of_month"))
 
-    # Step 5: write each table.
+    # Step 4.6 / Step 5: write each table. Holdings (factsheet path) is a plain
+    # idempotent upsert. PTR is authoritative per (source_amc, as_of_month): we
+    # DELETE the existing rows then upsert the fresh batch — in ONE transaction,
+    # so a kill between the delete and the insert can't leave this AMC's PTR for
+    # the month wiped. The delete also evicts stale rows the PK-upsert can't
+    # (e.g. a prior mis-match that assigned a PTR to the wrong sibling
+    # scheme_code). Guarded by ``if matched_ptr`` so an empty parse never wipes
+    # good data.
     n_holdings = w.upsert_holdings(pl.DataFrame(matched_holdings)) if matched_holdings else 0
-    n_ptr = w.upsert_portfolio_turnover(pl.DataFrame(matched_ptr)) if matched_ptr else 0
+    if matched_ptr:
+        from mfs.db.connection import connect
+        ptr_months = sorted({r["as_of_month"] for r in matched_ptr})
+        with connect() as conn:
+            for m in ptr_months:
+                conn.execute(
+                    "DELETE FROM portfolio_turnover_monthly "
+                    "WHERE as_of_month = %s AND source_amc = %s",
+                    (m, amc_slug),
+                )
+            n_ptr = w.upsert_portfolio_turnover(pl.DataFrame(matched_ptr), conn=conn)
+    else:
+        n_ptr = 0
+
+    # Step 5.5: record this successful ingest so a byte-identical re-run (same
+    # factsheet + same match universe) can skip the re-parse next time. Written
+    # only after the rows are committed; a crash before here leaves no marker, so
+    # the next run re-parses. Skipped for the pdf_path override path.
+    if pdf_path is None and (n_holdings or n_ptr):
+        _parse_cache.write_marker(
+            pdf, universe_fp,
+            {"ym": ym, "n_holdings": n_holdings, "n_ptr": n_ptr},
+        )
 
     log.info(
         "managers.run.done",
@@ -196,7 +253,7 @@ def _resolve_ptr(
         return []
     from mfs.schemas import ParsedPtrRecord
     now = datetime.utcnow()
-    as_of_month = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
+    as_of_default = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
     cache: dict[str, MatchResult] = {}
     out: list[dict] = []
     for rec in records:
@@ -208,9 +265,12 @@ def _resolve_ptr(
             cache[rec.scheme_name_printed] = mr
         if mr.matched_scheme_code is None:
             continue
+        # Adapters sourcing PTR from a less-frequent document (e.g. quant's
+        # abridged annual report) stamp the record's true period-end; everything
+        # else falls back to the run's data month.
         out.append({
             "scheme_code": mr.matched_scheme_code,
-            "as_of_month": as_of_month,
+            "as_of_month": rec.as_of_month or as_of_default,
             "ptr": float(rec.ptr),
             "source_amc": amc_slug,
             "computed_at": now,
@@ -221,15 +281,52 @@ def _resolve_ptr(
 def run_all(
     ym: str | None = None,
     match_threshold: int = DEFAULT_THRESHOLD,
+    force: bool = False,
 ) -> dict[str, dict]:
-    """Run every registered factsheet adapter. Halt-on-first-failure semantics:
-    any adapter raising IngestError aborts the stage (consistent with the
-    fail-fast invariant). Returns per-AMC summary dicts.
+    """Run every registered factsheet adapter with per-AMC fault isolation.
+
+    ``force=True`` (a ``--full`` pipeline run) re-parses every factsheet even if
+    unchanged; the default skips re-parsing factsheets whose bytes and match
+    universe are identical to the last successful ingest (see ``run_for_amc``).
+
+    Holdings/PTR are advisory signals, so one AMC's failure (a 404 on the
+    factsheet URL, a parse error, a layout change) must NOT crash the pipeline —
+    it is caught, recorded as that AMC's error, and the run continues. This also
+    contains an uncaught ``httpx.HTTPStatusError`` (e.g. a 4xx, which is neither
+    a TransientHttpError nor a PipelineError, so it would otherwise escape the
+    pipeline's ``_stage`` catch and abort the whole process).
+
+    Fail-fast is preserved for SYSTEMIC failure: if *every* adapter fails, that
+    is a network/config problem rather than a per-AMC hiccup, so we raise
+    IngestError instead of proceeding silently. The Phase-2 coverage gate
+    surfaces the per-AMC gaps recorded here.
     """
     slugs = registered_adapters()
     if not slugs:
         raise IngestError("No factsheet adapters registered.")
     results: dict[str, dict] = {}
+    failed: list[str] = []
     for slug in slugs:
-        results[slug] = run_for_amc(slug, ym=ym, match_threshold=match_threshold)
+        try:
+            results[slug] = run_for_amc(
+                slug, ym=ym, match_threshold=match_threshold, force=force,
+            )
+        except Exception as e:  # noqa: BLE001 — isolate one AMC; never crash the stage
+            failed.append(slug)
+            results[slug] = {
+                "amc_slug": slug, "ym": ym,
+                "error": str(e), "error_type": type(e).__name__,
+                "rows_written_holdings": 0, "rows_written_ptr": 0,
+            }
+            log.error("managers.amc_failed", amc=slug,
+                      err=str(e), err_type=type(e).__name__)
+    if failed:
+        log.warning("managers.run_all.partial",
+                    n_failed=len(failed), n_total=len(slugs), failed=failed)
+    if len(failed) == len(slugs):
+        raise IngestError(
+            f"All {len(slugs)} factsheet adapters failed — systemic network/config "
+            f"issue, not per-AMC. Refusing to proceed silently. "
+            f"First error: {results[slugs[0]].get('error')}"
+        )
     return results

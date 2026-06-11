@@ -56,6 +56,10 @@ def resolve_scheme_master_amc_code(adapter_slug: str) -> str:
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
 
+# "(erstwhile ...)" / "(formerly ...)" rename parenthetical — descriptive noise
+# AMFI appends to a renamed scheme's name. Stripped before matching.
+_RENAME_PARENS_RE = re.compile(r"\s*\((?:erstwhile|formerly)\b[^)]*\)", re.IGNORECASE)
+
 # Strip the plan/option suffix only when it is unambiguously a SUFFIX -- i.e.
 # attached to the fund-name body by a hyphen / em-dash / en-dash separator.
 # This guards against fund names whose body contains the words "Growth",
@@ -109,7 +113,15 @@ def canonicalize(name: str) -> str:
     """
     if not name:
         return ""
-    s = _PLAN_OPTION_SUFFIX_RE.sub("", name)
+    # Strip "(erstwhile/formerly X)" rename parentheticals. AMFI keeps the old
+    # name as a parenthetical on renamed schemes (e.g. "ICICI Prudential Large
+    # Cap Fund (erstwhile Bluechip Fund)"); the AMC factsheet prints only the
+    # new name. Left in, the extra tokens lengthen the canonical key so the
+    # Levenshtein tie-break picks a wrong shorter sibling (e.g. "Large & Mid
+    # Cap Fund") over the true target. Both candidates tie at token_set_ratio
+    # 100, so the tie-break decides — and the parenthetical flips it.
+    s = _RENAME_PARENS_RE.sub(" ", name)
+    s = _PLAN_OPTION_SUFFIX_RE.sub("", s)
     s = _TRAILING_PLAN_OPTION_RE.sub("", s)
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip().upper()

@@ -1,125 +1,107 @@
-"""Tests for the quant Mutual Fund factsheet adapter.
+"""Tests for the quant Mutual Fund PTR adapter (abridged annual report).
 
-Calibrated against the cached April 2026 combined factsheet at
-``data/raw/factsheets/quant/2026-04.pdf``. Tests run entirely offline —
-they read the bundled PDF and exercise AUM extraction plus URL
-construction.
-
-PTR is intentionally NOT tested for values — the quant factsheet does not
-print Portfolio Turnover Ratio per scheme (their stated policy on pages
-11 and 74 of the April 2026 publish). ``parse_ptr`` deliberately yields
-nothing; the test asserts that contract.
+quant omits Portfolio Turnover Ratio from its monthly factsheet, so the
+adapter sources PTR from quant's SEBI-mandated abridged annual report. Tests
+run entirely offline against the cached report at
+``data/raw/annual_reports/quant/2023-24.pdf`` plus pure-unit tests for the
+fiscal-year URL logic and the table-cell parsers.
 """
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pytest
 
-from mfs.ingest.managers.quant import QuantAdapter
+from mfs.ingest.managers.quant import (
+    QuantAdapter,
+    _clean_ptr,
+    _clean_scheme_name,
+    _period_end,
+)
 
-PDF = Path(__file__).parent.parent / "data" / "raw" / "factsheets" / "quant" / "2026-04.pdf"
+REPORT = (
+    Path(__file__).parent.parent
+    / "data"
+    / "raw"
+    / "annual_reports"
+    / "quant"
+    / "2023-24.pdf"
+)
 
 
 # ---------------------------------------------------------------------------
-# build_url
+# Fiscal-year URL resolution (pure unit tests)
 # ---------------------------------------------------------------------------
 
 
-def test_build_url_april_2026_uses_hyphen():
-    """quant's CMS uses a one-off hyphen between 'Factsheet' and 'April'
-    only for the April issue — confirmed by HEAD probe (the underscore
-    variant returns 404). The 2026-04 URL therefore differs from every
-    other month's naming."""
+def test_candidate_fy_labels_april():
+    """An April run starts at the FY ending the most recent March (FY ending
+    Mar 2026 = '2025-26') and walks back six years, newest first."""
+    a = QuantAdapter()
+    labels = a._candidate_fy_labels("2026-04")
+    assert labels[:4] == ["2025-26", "2024-25", "2023-24", "2022-23"]
+    assert len(labels) == 6
+
+
+def test_candidate_fy_labels_pre_april():
+    """A Jan–Mar run hasn't crossed the FY boundary yet, so the most recent
+    completed FY-end is the previous March (FY ending Mar 2025 = '2024-25')."""
+    a = QuantAdapter()
+    assert a._candidate_fy_labels("2026-02")[0] == "2024-25"
+
+
+def test_build_url_pattern():
+    """build_url emits the slug-stable annual-report URL for the newest
+    candidate FY (fetch() probes older years as a fallback)."""
     a = QuantAdapter()
     assert a.build_url("2026-04") == (
-        "https://www.quantmutual.com/Admin/Factsheet/"
-        "quant_Factsheet-April_2026.pdf"
-    )
-
-
-def test_build_url_may_uses_underscore():
-    """Every non-April month uses the underscore separator."""
-    a = QuantAdapter()
-    assert a.build_url("2026-05") == (
-        "https://www.quantmutual.com/Admin/Factsheet/"
-        "quant_Factsheet_May_2026.pdf"
-    )
-
-
-def test_build_url_march_uses_underscore():
-    a = QuantAdapter()
-    assert a.build_url("2026-03") == (
-        "https://www.quantmutual.com/Admin/Factsheet/"
-        "quant_Factsheet_March_2026.pdf"
-    )
-
-
-def test_build_url_december():
-    a = QuantAdapter()
-    assert a.build_url("2026-12") == (
-        "https://www.quantmutual.com/Admin/Factsheet/"
-        "quant_Factsheet_December_2026.pdf"
+        "https://quantmutual.com/Admin/disclouser/"
+        "Annual-Report__quant-Mutual-Fund_Financial-Year-2025-26.pdf"
     )
 
 
 # ---------------------------------------------------------------------------
-# Scheme-name detection (pure unit tests)
+# Table-cell parsers (pure unit tests)
 # ---------------------------------------------------------------------------
 
 
-def test_scheme_name_lowercase_quant_prefix():
-    """The AMC brand is always lowercase; first non-empty line is the
-    scheme title."""
-    from mfs.ingest.managers.quant import _scheme_name_from_page
-
-    text = "quant Small Cap Fund\nInvestment Objective: ...\n"
-    assert _scheme_name_from_page(text) == "quant Small Cap Fund"
+def test_clean_ptr_clean_value():
+    assert _clean_ptr("1.44") == pytest.approx(1.44)
 
 
-def test_scheme_name_rejects_capitalized_quant():
-    """A title-case ``Quant ...`` line is rejected — the only place
-    title-case appears in the factsheet is on cover/metadata pages, not
-    on scheme snapshot pages."""
-    from mfs.ingest.managers.quant import _scheme_name_from_page
-
-    assert _scheme_name_from_page("Quant Active Equity Fund\n...") is None
+def test_clean_ptr_strips_mangled_space():
+    """pdfplumber mangles the previous-FY sub-column ('1 .45'); the parser
+    strips the stray space so even a mangled cell parses (we read the clean
+    current-FY column, but be robust)."""
+    assert _clean_ptr("1 .45") == pytest.approx(1.45)
 
 
-def test_scheme_name_rejects_continuation_page():
-    """quant Multi Asset Allocation Fund's portfolio spills onto page 65
-    whose first line is a GOI bond entry. The Fund/FOF word gate must
-    reject this so it doesn't produce a phantom AUM row."""
-    from mfs.ingest.managers.quant import _scheme_name_from_page
-
-    text = "Total MFU 0.03\n6.92% GOI 18-Nov-2039 1.33\n..."
-    assert _scheme_name_from_page(text) is None
+def test_clean_ptr_dash_and_blank_are_none():
+    assert _clean_ptr("-") is None
+    assert _clean_ptr("") is None
+    assert _clean_ptr(None) is None
 
 
-def test_scheme_name_rejects_blank():
-    from mfs.ingest.managers.quant import _scheme_name_from_page
-
-    assert _scheme_name_from_page("") is None
-    assert _scheme_name_from_page("\n\n") is None
+def test_clean_scheme_name_collapses_newlines():
+    assert _clean_scheme_name("quant BUSINESS\nCYCLE FUND") == "quant BUSINESS CYCLE FUND"
 
 
-def test_scheme_name_multi_asset():
-    """The longer-titled schemes still match — ``quant Multi Asset
-    Allocation Fund`` has Fund as the last token."""
-    from mfs.ingest.managers.quant import _scheme_name_from_page
+def test_clean_scheme_name_rejects_non_scheme_cells():
+    assert _clean_scheme_name("Period ended 31 March 2024") == ""
+    assert _clean_scheme_name(None) == ""
+    assert _clean_scheme_name("6. Portfolio turnover ratio4") == ""
 
-    text = (
-        "quant Multi Asset Allocation Fund\n"
-        "Investment Objective: ...\n"
-    )
-    assert (
-        _scheme_name_from_page(text) == "quant Multi Asset Allocation Fund"
-    )
+
+def test_period_end_reads_latest_fy_from_header():
+    """The header lists current FY then previous FY; we stamp the latest."""
+    row = ["", "Period\nended 31 March 2024", "Period\nended 31 March 2023"]
+    assert _period_end(row, "") == date(2024, 3, 1)
 
 
 # ---------------------------------------------------------------------------
-# AUM / PTR against cached PDF
+# PTR against the cached abridged annual report
 # ---------------------------------------------------------------------------
 
 
@@ -131,22 +113,46 @@ def adapter() -> QuantAdapter:
 @pytest.fixture(scope="module")
 def ptr_records(adapter: QuantAdapter):
     pytest.importorskip("pdfplumber")
-    if not PDF.exists():
-        pytest.skip(f"Cached quant PDF not found at {PDF}")
-    return list(adapter.parse_ptr(PDF, "2026-04"))
+    if not REPORT.exists():
+        pytest.skip(f"Cached quant annual report not found at {REPORT}")
+    return list(adapter.parse_ptr(REPORT, "2026-04"))
 
 
-# ----- PTR contract: empty, by design --------------------------------------
+def test_parse_ptr_yields_equity_schemes(ptr_records):
+    """The FY2023-24 abridged report carries ~19 equity/hybrid schemes with a
+    Portfolio Turnover Ratio (the 3 debt schemes print '-' and are skipped)."""
+    assert len(ptr_records) >= 15
 
 
-def test_parse_ptr_yields_nothing(ptr_records):
-    """quant deliberately omits PTR from the factsheet (pages 11/74 in
-    the April-2026 issue make this explicit). The adapter must NOT
-    fabricate values; ``parse_ptr`` returns an empty iterable.
-    """
-    assert ptr_records == []
+def test_parse_ptr_known_values(ptr_records):
+    """Spot-check current-FY PTR values printed in 'times' (= our fraction
+    convention; no /100). Calibrated against the FY2023-24 report."""
+    by_name = {r.scheme_name_printed: r for r in ptr_records}
+    assert by_name["quant SMALL CAP FUND"].ptr == pytest.approx(0.68, abs=1e-6)
+    # Legacy/abbreviated report names are normalized to current scheme_master
+    # spelling so the fuzzy matcher resolves them at full score.
+    assert by_name["quant Flexi Cap Fund"].ptr == pytest.approx(1.16, abs=1e-6)
+    assert by_name["quant ESG Integration Strategy Fund"].ptr == pytest.approx(2.75, abs=1e-6)
 
 
-# ----- AUM extraction -------------------------------------------------------
+def test_parse_ptr_skips_discontinued_schemes(ptr_records):
+    """Report-only schemes with no current scheme_master counterpart are
+    skipped — they would otherwise fuzzy-poach a live sibling (e.g. the
+    discontinued 'quant Absolute Fund' scores 86 against 'quant Value Fund')."""
+    names = {r.scheme_name_printed for r in ptr_records}
+    assert "quant ABSOLUTE FUND" not in names
+    assert "quant ACTIVE FUND" not in names
 
 
+def test_parse_ptr_stamps_fy_end(ptr_records):
+    """Every record is stamped at the report's true FY-end (31 Mar 2024),
+    read from the table header — not the run's data month."""
+    assert ptr_records
+    assert all(r.as_of_month == date(2024, 3, 1) for r in ptr_records)
+
+
+def test_parse_ptr_values_sane(ptr_records):
+    """Fail-fast: PTR must be a positive fraction; debt-fund '-' rows dropped."""
+    for r in ptr_records:
+        assert 0.0 < r.ptr < 20.0, r
+        assert r.source_amc == "quant"

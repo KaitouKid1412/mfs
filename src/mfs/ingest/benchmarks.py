@@ -327,15 +327,46 @@ def _ingest_from_manual_csv(ticker: str) -> pl.DataFrame:
     return out
 
 
-def ingest_ticker(ticker: str, start: date | None = None, end: date | None = None) -> int:
+def _resolve_start(
+    ticker: str, cfg, *, full: bool, latest_map: dict[str, date] | None
+) -> date:
+    """Compute the per-ticker fetch start for an incremental run.
+
+    - ``full=True`` → full history (the periodic deep re-fetch / ``--full``).
+    - ticker has no rows yet → full history (cold start; can't tail from nothing).
+    - otherwise → ``MAX(date) - incremental_tail_days`` so only the recent window
+      is re-fetched. The tail overlaps existing data; the upsert overwrites it,
+      so any NSE restatement inside the tail self-corrects. Data older than the
+      tail is assumed immutable (re-fetch it with ``--full`` if ever needed).
+    """
+    history_start = cfg.ingest.benchmarks.history_start
+    if full:
+        return history_start
+    latest = (
+        latest_map.get(ticker) if latest_map is not None
+        else q.benchmark_latest_by_ticker().get(ticker)
+    )
+    if latest is None:
+        return history_start
+    tail = cfg.ingest.benchmarks.incremental_tail_days
+    return max(history_start, latest - timedelta(days=tail))
+
+
+def ingest_ticker(
+    ticker: str, start: date | None = None, end: date | None = None,
+    *, full: bool = False,
+) -> int:
     """Fetch one TRI ticker for [start, end] and merge into the curated dataset.
 
     Uses the hard-coded NSE_TRI_MAP for (Trading_Index_Name, Index_long_name); fetches in
     360-day chunks; falls back to user CSV at data/raw/benchmarks/manual/<slug>.csv when
     the API returns empty or the ticker has no NSE mapping (hybrid indices).
+
+    When ``start`` is not given, it is resolved incrementally from the DB
+    (``MAX(date) - tail``); pass ``full=True`` to force the full history.
     """
     cfg = get_pipeline_config()
-    start = start or cfg.ingest.benchmarks.history_start
+    start = start or _resolve_start(ticker, cfg, full=full, latest_map=None)
     end = end or date.today()
     slug = ticker_slug(ticker)
     df: pl.DataFrame = pl.DataFrame()
@@ -370,8 +401,15 @@ def ingest_ticker(ticker: str, start: date | None = None, end: date | None = Non
     return df.height
 
 
-def ingest_all_known(start: date | None = None, end: date | None = None) -> dict[str, int]:
+def ingest_all_known(
+    start: date | None = None, end: date | None = None, *, full: bool = False,
+) -> dict[str, int]:
     """Ingest every TRI ticker we have a mapping for. Returns {ticker: n_rows}.
+
+    Incremental by default: each ticker is fetched from ``MAX(date) - tail``
+    forward (full history for tickers with no rows). Pass ``full=True`` for a
+    from-scratch re-fetch of the entire history. An explicit ``start`` overrides
+    incremental resolution for every ticker (e.g. the CLI ``--since`` flag).
 
     Raises IngestError if any EQUITY TRI ticker (i.e., one with a non-empty NSE
     mapping in NSE_TRI_MAP) returns 0 rows after retries. Hybrid/multi-asset
@@ -380,10 +418,14 @@ def ingest_all_known(start: date | None = None, end: date | None = None) -> dict
     """
     out: dict[str, int] = {}
     equity_failures: list[str] = []
+    # Prefetch per-ticker watermarks once so each ticker doesn't re-query.
+    latest_map = None if start is not None else q.benchmark_latest_by_ticker()
+    cfg = get_pipeline_config()
     for ticker in NSE_INDEX_NAME_MAP:
         has_nse_mapping = bool(NSE_TRI_MAP.get(ticker, ("", ""))[0])
+        t_start = start or _resolve_start(ticker, cfg, full=full, latest_map=latest_map)
         try:
-            n = ingest_ticker(ticker, start=start, end=end)
+            n = ingest_ticker(ticker, start=t_start, end=end)
         except Exception as e:  # noqa: BLE001
             log.error("benchmark.failed", ticker=ticker, err=str(e))
             out[ticker] = 0

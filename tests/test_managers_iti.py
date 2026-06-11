@@ -104,6 +104,11 @@ def test_scheme_name_scans_past_chart_banner():
     """Page 20 of the calibration PDF renders the ``ITI Large & Mid Cap
     Fund`` title AFTER a 30-line chart-axis banner. The detector must
     keep scanning until it finds an ``ITI ... Fund`` line.
+
+    The detector also folds the factsheet's two-word ``Large & Mid Cap``
+    spelling onto scheme_master's one-word ``Large & Midcap`` so the shared
+    fuzzy matcher disambiguates it from the Large-Cap scheme (whose token set
+    is otherwise a subset).
     """
     chart_banner = "\n".join(["April 2026", "Fund vs Index Overweight / Underweight"] + ["0.00"] * 27)
     body = (
@@ -112,7 +117,7 @@ def test_scheme_name_scans_past_chart_banner():
         "CATEGORY OF SCHEME LARGE & MID CAP FUND\n"
         "PORTFOLIO DETAILS\n"
     )
-    assert _scheme_name_from_page(body) == "ITI Large & Mid Cap Fund"
+    assert _scheme_name_from_page(body) == "ITI Large & Midcap Fund"
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +170,16 @@ def test_parse_ptr_known_scheme_pharma(ptr_records):
 
 def test_parse_ptr_known_scheme_large_and_mid(ptr_records):
     """ITI Large & Mid Cap Fund on page 20 has its title after a chart
-    banner — exercises the scan-past-chart logic. PTR = 1.24."""
+    banner — exercises the scan-past-chart logic. PTR = 1.24. The printed
+    name is normalized to the one-word ``Large & Midcap`` spelling so the
+    matcher resolves it to the L&M scheme rather than colliding with Large
+    Cap."""
     by_name = {r.scheme_name_printed: r for r in ptr_records}
-    assert "ITI Large & Mid Cap Fund" in by_name
-    assert by_name["ITI Large & Mid Cap Fund"].ptr == pytest.approx(1.24, abs=1e-6)
+    assert "ITI Large & Midcap Fund" in by_name
+    assert by_name["ITI Large & Midcap Fund"].ptr == pytest.approx(1.24, abs=1e-6)
+    # Sanity: the standalone Mid Cap scheme keeps its two-word spelling and is
+    # NOT folded onto the L&M name.
+    assert "ITI Mid Cap Fund" in by_name
 
 
 def test_parse_ptr_drops_newly_launched_schemes(ptr_records):

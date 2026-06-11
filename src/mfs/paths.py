@@ -56,6 +56,17 @@ def factsheet_raw(amc_slug: str, ym: str) -> Path:
     return raw_dir() / "factsheets" / amc_slug / f"{ym}.pdf"
 
 
+def annual_report_raw(amc_slug: str, fy_label: str) -> Path:
+    """Archive location for one AMC's (abridged) annual report PDF.
+
+    `fy_label` is the Indian fiscal year the report covers (e.g. '2023-24').
+    Used by AMCs whose factsheet omits a metric SEBI mandates only in the
+    annual report (e.g. quant, which deliberately omits Portfolio Turnover
+    Ratio from its monthly factsheet).
+    """
+    return raw_dir() / "annual_reports" / amc_slug / f"{fy_label}.pdf"
+
+
 def bhavcopy_raw(d: date) -> Path:
     """Archive location for a single day's NSE bhavcopy CSV."""
     return raw_dir() / "bhavcopy" / f"{d.year:04d}" / f"{d.month:02d}" / f"{d.day:02d}.csv"

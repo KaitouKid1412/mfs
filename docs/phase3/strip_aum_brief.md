@@ -8,6 +8,12 @@
 > to `as_of_month DESC`. Ranked-fund AUM coverage unchanged at 666/682.
 > See `src/mfs/ingest/amfi_aum.py` for the sole AUM ingester. This brief
 > is retained as historical record of the cleanup.
+>
+> **Update 2026-06-06:** the universe dropped 682 → 664 (closed-ended/interval
+> exclusion), so ranked-fund AUM coverage is now **653/664** (~98%). Also
+> `latest_scheme_aum()` regained an *optional* `on_or_before` bound to prevent a
+> future quarter from leaking into a historical metric; the default (no bound)
+> still ORDER BY `as_of_month DESC`.
 
 ## Why
 

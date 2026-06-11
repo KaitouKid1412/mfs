@@ -18,3 +18,8 @@ class IngestError(PipelineError):
 
 class FreshnessError(PipelineError):
     """A curated dataset is stale or missing. Compute/rank must not run."""
+
+
+class CoverageError(PipelineError):
+    """A BLOCKING data-coverage contract failed (empty / stale / short-history /
+    catastrophically low entity coverage). Compute/rank must not run."""

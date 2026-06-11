@@ -10,9 +10,9 @@ ELSS,NIFTY 500 TRI,
 Value,NIFTY 500 Value 50 TRI,
 Contra,NIFTY 500 TRI,
 Dividend Yield,NIFTY Dividend Opportunities 50 TRI,
-Aggressive Hybrid,NIFTY 50 Hybrid 65:35 TRI,
-Balanced Advantage,NIFTY 50 Hybrid 50:50 TRI,
-Equity Savings,NIFTY Equity Savings TRI,
+Aggressive Hybrid,NIFTY 50 Hybrid 65:35 TRI,NIFTY 50 TRI:65|NIFTY Composite Debt Index:35
+Balanced Advantage,NIFTY 50 Hybrid 50:50 TRI,NIFTY 50 TRI:50|NIFTY Composite Debt Index:50
+Equity Savings,NIFTY Equity Savings TRI,NIFTY 50 TRI:35|Arbitrage(hedged):30|NIFTY Short Duration Debt:30|NIFTY 1D Rate:5
 Banking & Financial Services,NIFTY Financial Services TRI,
 IT,NIFTY IT TRI,
 Pharma & Healthcare,NIFTY Healthcare TRI,

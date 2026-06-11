@@ -103,8 +103,8 @@ Calibration counts on 2026-04
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
@@ -185,6 +185,29 @@ _TOC_LINE_RE = re.compile(
     re.MULTILINE,
 )
 
+# The TOC glues the "Multi Cap" / "Mid Cap" cap-class words into one token for
+# some schemes — e.g. it prints "LIC MF MultiCap Fund" while scheme_master
+# records "LIC MF Multi Cap Fund". Canonicalized, the glued "MULTICAP" token
+# matches neither "MULTI" nor "CAP", so the orchestrator's token_set_ratio
+# scorer drops the printed name (82.9 < the 85 threshold) and the scheme's
+# published PTR ("Annual Portfolio Turnover Ratio: 0.43 times" on the detail
+# page) is silently lost. Splitting the glued token back to two words lifts
+# the match to 100. The transforms are anchored on word boundaries; LIC's
+# clean entries ("Multi Asset Allocation Fund", "Large Cap Fund") are
+# untouched.
+_TOC_GLUE_FIXES = (
+    (re.compile(r"\bMultiCap\b", re.IGNORECASE), "Multi Cap"),
+    (re.compile(r"\bMidcap\b", re.IGNORECASE), "Mid Cap"),
+)
+
+
+def _repair_toc_name(name: str) -> str:
+    """Repair the TOC's glued cap-class tokens so the orchestrator's fuzzy
+    matcher resolves the printed name to the correct scheme_master row."""
+    for pat, repl in _TOC_GLUE_FIXES:
+        name = pat.sub(repl, name)
+    return name
+
 
 def _build_toc_map(pdf: pdfplumber.PDF) -> dict[int, str]:
     """Parse the TOC on the second-or-third page and return
@@ -211,6 +234,9 @@ def _build_toc_map(pdf: pdfplumber.PDF) -> dict[int, str]:
             name = re.sub(r"\s+", " ", name)
             if not name.startswith("LIC MF"):
                 continue
+            # Repair glued cap-class tokens ("MultiCap" -> "Multi Cap") so the
+            # orchestrator's fuzzy matcher resolves the scheme correctly.
+            name = _repair_toc_name(name)
             out[page_num] = name
         # Stop after the first page that yielded entries.
         if out:

@@ -84,8 +84,8 @@ Calibration counts on 2026-04
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
@@ -302,6 +302,17 @@ def _extract_row_values(
     return col_values
 
 
+# Factsheet-vs-AMFI spelling reconciliation. The factsheet snapshot prints
+# "Groww Large Cap Fund" (two tokens) but AMFI / scheme_master records the
+# renamed scheme as "Groww Largecap Fund (formerly known as Indiabulls Blue
+# Chip Fund)" (one token, "Largecap"). The shared fuzzy matcher scores on
+# token_set_ratio, where "LARGE"+"CAP" vs "LARGECAP" drops the score to ~82
+# — below the 85 acceptance threshold — so the only ranked Groww equity fund
+# affected goes unmatched (its PTR = 0.98 would be silently dropped). We
+# emit the AMFI token spelling ("Largecap") so the match scores 100.
+_NAME_TOKEN_FIXUPS = ((re.compile(r"\bLarge\s+Cap\b", re.IGNORECASE), "Largecap"),)
+
+
 def _clean_scheme_name(raw: str) -> str | None:
     """Normalise whitespace and drop empty results."""
     if not raw:
@@ -314,6 +325,8 @@ def _clean_scheme_name(raw: str) -> str | None:
     # are anchored on ``Groww`` tokens).
     if not s.lower().startswith("groww"):
         return None
+    for pat, repl in _NAME_TOKEN_FIXUPS:
+        s = pat.sub(repl, s)
     return s
 
 

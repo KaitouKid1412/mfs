@@ -158,13 +158,15 @@ def test_parse_ptr_yields_records(ptr_records):
 
 
 def test_parse_ptr_known_scheme(ptr_records):
-    """Groww Large Cap Fund prints Portfolio Turnover = 0.98 on the
-    Equity snapshot page (p21). Groww stores PTR as a fraction
-    directly (0.98 = 98%) — NO percent-to-fraction conversion in the
-    adapter."""
+    """Groww Largecap Fund prints Portfolio Turnover = 0.98 on the Equity
+    snapshot page (p21). Groww stores PTR as a fraction directly (0.98 = 98%)
+    — NO percent-to-fraction conversion in the adapter. The adapter emits the
+    scheme_master-aligned spelling "Largecap" (one word) so the fuzzy matcher
+    resolves it to "Groww Largecap Fund (formerly Indiabulls Blue Chip Fund)";
+    the factsheet's two-word "Large Cap" wouldn't token-match that."""
     by_name = {r.scheme_name_printed: r for r in ptr_records}
-    assert "Groww Large Cap Fund" in by_name
-    rec = by_name["Groww Large Cap Fund"]
+    assert "Groww Largecap Fund" in by_name
+    rec = by_name["Groww Largecap Fund"]
     assert rec.ptr == pytest.approx(0.98, abs=1e-6)
     assert rec.source_amc == "groww"
 

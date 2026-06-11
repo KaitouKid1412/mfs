@@ -71,11 +71,39 @@ def run_for_amc(
     n_excels_parsed = 0
     n_records_total = 0
 
-    for scheme_name_printed, url in urls.items():
+    # Resolve every printed name → (scheme_code, score) FIRST. When two
+    # similarly-named sibling funds (e.g. "Nifty 50 Index" vs "Nifty Next 50
+    # Index") both fuzzy-match the SAME scheme_code, keep ONLY the
+    # highest-scoring printed name — otherwise both portfolios get written to
+    # one scheme_code and its weights sum to ~200%. A losing duplicate is NOT
+    # treated as unmatched (its real scheme just wasn't in scheme_master).
+    best_for_code: dict[str, tuple[float, str]] = {}
+    name_to_code: dict[str, str] = {}
+    collisions: list[str] = []
+    for scheme_name_printed in urls:
         mr = match_one(scheme_name_printed, candidates, threshold=match_threshold)
         if mr.matched_scheme_code is None:
             unmatched.append(scheme_name_printed)
             continue
+        name_to_code[scheme_name_printed] = mr.matched_scheme_code
+        prev = best_for_code.get(mr.matched_scheme_code)
+        if prev is None or mr.score > prev[0]:
+            if prev is not None:
+                collisions.append(prev[1])
+            best_for_code[mr.matched_scheme_code] = (mr.score, scheme_name_printed)
+        else:
+            collisions.append(scheme_name_printed)
+    winners = {printed for _, printed in best_for_code.values()}
+    if collisions:
+        log.info(
+            "holdings.match_collision_dropped",
+            amc=amc_slug, n_dropped=len(collisions), names=collisions[:10],
+        )
+
+    for scheme_name_printed, url in urls.items():
+        if scheme_name_printed not in winners:
+            continue  # unmatched, or a lower-scoring duplicate for its code
+        scheme_code = name_to_code[scheme_name_printed]
         # Download + parse Excel only for matched schemes (saves bandwidth on
         # ETFs/FoFs that aren't ranked).
         excel_filename = f"{scheme_name_printed}.xlsx"
@@ -100,7 +128,7 @@ def run_for_amc(
         n_records_total += len(records)
         for rec in records:
             matched_rows.append({
-                "scheme_code": mr.matched_scheme_code,
+                "scheme_code": scheme_code,
                 "security_name": rec.security_name,
                 "as_of_month": as_of_month,
                 "weight_pct": float(rec.weight_pct),
@@ -134,9 +162,26 @@ def run_for_amc(
         )
     matched_rows = deduped_rows
 
-    n_written = (
-        w.upsert_holdings(pl.DataFrame(matched_rows)) if matched_rows else 0
-    )
+    # Idempotency: a successful run of an AMC is authoritative for that AMC's
+    # rows in this month. Delete ALL existing (source_amc, as_of_month) rows
+    # before inserting the fresh batch — this evicts stale rows the PK-upsert
+    # can't (e.g. a security dropped from the portfolio, or a prior contaminated
+    # run that merged two funds' holdings onto one orphaned scheme_code). Only
+    # runs here AFTER discovery+parse succeed; a 0-URL discovery raises earlier,
+    # so a failed fetch can never wipe good data.
+    if matched_rows:
+        from mfs.db.connection import connect
+        # DELETE + upsert in ONE transaction so a kill between them can't leave
+        # this (source_amc, month) partition empty for the next run.
+        with connect() as conn:
+            conn.execute(
+                "DELETE FROM holdings_monthly "
+                "WHERE as_of_month = %s AND source_amc = %s",
+                (as_of_month, amc_slug),
+            )
+            n_written = w.upsert_holdings(pl.DataFrame(matched_rows), conn=conn)
+    else:
+        n_written = 0
     log.info(
         "holdings.run.done",
         amc=amc_slug, ym=ym,
@@ -158,11 +203,40 @@ def run_for_amc(
 
 
 def run_all(ym: str | None = None) -> dict[str, dict]:
-    """Run every registered holdings adapter. Halt-on-first-failure."""
+    """Run every registered holdings adapter with per-AMC fault isolation.
+
+    Holdings are an advisory signal: one AMC's failure (a 404 in disclosure
+    discovery, a changed page layout, a parse error) is caught, recorded, and
+    the run continues — it must NOT crash the pipeline. An uncaught
+    ``httpx.HTTPStatusError`` from ``discover_scheme_urls`` is the exact 4xx that
+    would otherwise escape the pipeline's ``_stage`` catch and abort the process.
+    If EVERY adapter fails we raise IngestError, since that is systemic rather
+    than per-AMC.
+    """
     slugs = registered_adapters()
     if not slugs:
         raise IngestError("No holdings adapters registered.")
     results: dict[str, dict] = {}
+    failed: list[str] = []
     for slug in slugs:
-        results[slug] = run_for_amc(slug, ym=ym)
+        try:
+            results[slug] = run_for_amc(slug, ym=ym)
+        except Exception as e:  # noqa: BLE001 — isolate one AMC; never crash the stage
+            failed.append(slug)
+            results[slug] = {
+                "amc_slug": slug, "ym": ym,
+                "error": str(e), "error_type": type(e).__name__,
+                "rows_written": 0,
+            }
+            log.error("holdings.amc_failed", amc=slug,
+                      err=str(e), err_type=type(e).__name__)
+    if failed:
+        log.warning("holdings.run_all.partial",
+                    n_failed=len(failed), n_total=len(slugs), failed=failed)
+    if len(failed) == len(slugs):
+        raise IngestError(
+            f"All {len(slugs)} holdings adapters failed — systemic network/config "
+            f"issue, not per-AMC. Refusing to proceed silently. "
+            f"First error: {results[slugs[0]].get('error')}"
+        )
     return results

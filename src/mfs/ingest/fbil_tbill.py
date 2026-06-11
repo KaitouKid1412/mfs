@@ -38,6 +38,7 @@ from mfs import paths
 from mfs.config import get_pipeline_config, get_settings
 from mfs.db import writers as w
 from mfs.errors import IngestError
+from mfs.io.atomic import atomic_write_text
 from mfs.io.http import TransientHttpError
 from mfs.utils.logging import get_logger
 
@@ -50,6 +51,13 @@ RBI_RSS_URL = "https://www.rbi.org.in/pressreleases_RSS.xml"
 
 # Approximate prid issue rate at RBI (~2500/year). Used for bounding the backwards walk.
 PRIDS_PER_YEAR = 2600
+
+# Probe-forward discovery (see discover_latest_prid). RBI prids are dense
+# (~7/day), so this many consecutive absent prids reliably marks the feed tip.
+PROBE_FORWARD_GAP = 12
+# Hard cap on how far past the anchor we probe in one run (~8 weeks of prids) so
+# a pathological feed can never loop unbounded.
+PROBE_FORWARD_MAX = 400
 
 # Title patterns for RBI T-bill auction press releases. Two PR variants both
 # contain the 91-day cut-off yield:
@@ -68,6 +76,14 @@ _TBILL_RESULT_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 _FULL_AUCTION_RESULT_RE = re.compile(r"Full\s+Auction\s+Result", re.IGNORECASE)
+# Old RBI PRs (pre-2016) publish ONE auction-result PR per tenor — e.g.
+# "91-Days Treasury Bills : Full Auction Result", "182-Days ...", "364-Days ...",
+# and occasionally odd-tenor / MSS bills ("329-Days", "317-Days MSS-..."). We
+# must accept only the 91-day one; otherwise another tenor's YTM is mislabeled as
+# the 91-day rate. New PRs combine all tenors in a single table (91-day row
+# first), titled either "91-Day, 182-Day and 364-Day ..." or the tenor-less
+# "Treasury Bills: Full Auction Result".
+_TENOR_ANY_RE = re.compile(r"(\d+)\s*-?\s*[Dd]ays?")
 # Title block lives inside <td class="tableheader" ...>; the <b> wrapper is
 # present on the Cut-off variant but absent on the Full Auction Result variant,
 # so we accept both forms.
@@ -77,14 +93,34 @@ _TITLE_BLOCK_RE = re.compile(
 )
 
 
-def _looks_like_tbill_result(html: str) -> bool:
-    """True if the page is a 91/182/364-day T-bill auction result PR (either variant)."""
+def _tbill_result_title(html: str) -> str | None:
+    """Return the auction-result title block if this page is one, else None."""
     for t in _TITLE_BLOCK_RE.findall(html):
         if _TBILL_RESULT_TITLE_RE.search(t) and (
             _TENORS_RE.search(t) or _FULL_AUCTION_RESULT_RE.search(t)
         ):
-            return True
-    return False
+            return t
+    return None
+
+
+def _is_91day_result(title: str) -> bool:
+    """True if this auction-result PR carries the 91-day cut-off.
+
+    If the title names any tenor(s), accept only when 91 is among them (covers
+    the old per-tenor "91-Days ..." PRs and the new combined "91-Day, 182-Day and
+    364-Day ..." cut-off PRs, while rejecting 182/364/odd-tenor/MSS PRs). A
+    tenor-less title ("Treasury Bills: Full Auction Result") is the combined
+    full-auction table whose first cut-off row is the 91-day, so accept it.
+    """
+    days = _TENOR_ANY_RE.findall(title)
+    if days:
+        return "91" in days
+    return True
+
+
+def _looks_like_tbill_result(html: str) -> bool:
+    """True if the page is a 91/182/364-day T-bill auction result PR (either variant)."""
+    return _tbill_result_title(html) is not None
 _DATE_RE = re.compile(
     r"Date\s*:\s*(\w+\s+\d{1,2},\s+\d{4})",
     re.IGNORECASE,
@@ -94,8 +130,11 @@ _DATE_RE = re.compile(
 # then take the FIRST YTM percentage after it — that's the 91-day cell.
 #   Cut-off variant: "Cut-off Price and Implicit Yield ... YTM: 3.5594%"
 #   Full Auction Result variant: "Cut-off price / Yield ... (YTM: 3.5594%)"
+# The separator between "YTM" and the value varies by era: new PRs use a colon
+# ("YTM : 3.5594%"), old PRs a hyphen ("YTM - 8.1022%"). Require a decimal so the
+# degenerate no-issuance case ("YTM : 0 %") stays correctly unmatched.
 _YTM_BLOCK_RE = re.compile(
-    r"Cut-?off[^<>]{0,80}(?:Price|Yield).*?YTM\s*:\s*([0-9]+\.[0-9]+)",
+    r"Cut-?off[^<>]{0,80}(?:Price|Yield).*?YTM\s*[:\-–]?\s*([0-9]+\.[0-9]+)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -189,9 +228,10 @@ def _read_state() -> dict:
 
 
 def _write_state(state: dict) -> None:
+    # Atomic write: a kill mid-write must not truncate the state JSON. (Readers
+    # already fall back to {}, but an atomic write removes the corruption window.)
     p = paths.rbi_tbill_state_file()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, indent=2, sort_keys=True))
+    atomic_write_text(p, json.dumps(state, indent=2, sort_keys=True))
 
 
 def fetch_latest_prid(default: int | None = None) -> int | None:
@@ -265,15 +305,93 @@ def _fetch_prid_html(client: httpx.Client, prid: int) -> tuple[str | None, str |
     except TransientHttpError as e:
         log.warning("fbil.rbi.fetch_failed_after_retries", prid=prid, err=str(e))
         return None, str(e)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(text, encoding="utf-8")
+    # Atomic write so a kill mid-download can't strand a truncated page that the
+    # `>200 bytes` cache check (at the top of this fn and in _walk_prid_range)
+    # would otherwise trust as a valid PR and never re-fetch.
+    atomic_write_text(cache, text)
     return text, None
+
+
+def _cache_high_water_mark() -> int:
+    """Highest prid already cached on disk (0 if none). A hard floor for
+    discovery — a stale RSS must never drag the walk below what we already have."""
+    cache_dir = paths.rbi_press_release_raw(0).parent
+    if not cache_dir.exists():
+        return 0
+    hwm = 0
+    for f in cache_dir.glob("prid_*.html"):
+        try:
+            hwm = max(hwm, int(f.stem.replace("prid_", "")))
+        except ValueError:
+            continue
+    return hwm
+
+
+def discover_latest_prid(
+    state: dict | None = None, *, rate_limit_s: float = 0.25
+) -> int | None:
+    """Resolve the true upper-bound prid for the walk.
+
+    The RSS feed is a HINT, never a ceiling: it has been observed to serve a
+    stale/truncated snapshot whose max prid is *below* prids we already cached
+    weeks earlier, which silently capped discovery and stranded newer auctions
+    (the bug that motivated this). We anchor at
+
+        max(RSS latest, last-walked state.latest_prid, on-disk cache HWM)
+
+    then probe forward one prid at a time until PROBE_FORWARD_GAP consecutive
+    prids are confirmed-absent (404 / empty body) — that run of holes is the real
+    tip. A *transient* error mid-probe is NOT read as the tip (a rate-limit burst
+    must never look like end-of-feed); we stop probing and let the walk's
+    failure-rate cap and the freshness gate judge the degraded feed instead.
+
+    Returns the highest real prid found, or None if nothing is known at all.
+    """
+    state = state if state is not None else _read_state()
+    rss = fetch_latest_prid() or 0
+    state_latest = state.get("latest_prid") or 0
+    cache_hwm = _cache_high_water_mark()
+    anchor = max(rss, state_latest, cache_hwm)
+    if anchor <= 0:
+        return None
+    if rss and rss < max(state_latest, cache_hwm):
+        log.warning(
+            "fbil.rbi.rss_behind_known",
+            rss=rss, state_latest=state_latest, cache_hwm=cache_hwm,
+            note="RSS reported a prid below known state/cache — probing forward, not trusting it.",
+        )
+    tip = anchor
+    consecutive_absent = 0
+    probed = 0
+    with _rbi_client() as c:
+        prid = anchor + 1
+        while consecutive_absent < PROBE_FORWARD_GAP and probed < PROBE_FORWARD_MAX:
+            html, failure = _fetch_prid_html(c, prid)
+            if failure is not None:
+                # Transient exhaustion — do NOT treat as the tip; abort the probe.
+                log.warning("fbil.rbi.probe_transient_abort", prid=prid, err=failure)
+                break
+            if html is None:
+                consecutive_absent += 1
+            else:
+                consecutive_absent = 0
+                tip = prid
+            prid += 1
+            probed += 1
+            time.sleep(rate_limit_s)
+    log.info(
+        "fbil.rbi.discover_latest_prid",
+        rss=rss, state_latest=state_latest, cache_hwm=cache_hwm,
+        anchor=anchor, tip=tip, probed=probed,
+    )
+    return tip
 
 
 def _parse_tbill_html(html: str, prid: int) -> dict | None:
     """If HTML is a 91-day T-bill auction-result PR (Cut-off OR Full Auction Result
     variant), return {prid, auction_date, rate_annual_pct}; otherwise None."""
-    if not _looks_like_tbill_result(html):
+    title = _tbill_result_title(html)
+    if title is None or not _is_91day_result(title):
         return None
     m_date = _DATE_RE.search(html)
     m_ytm = _YTM_BLOCK_RE.search(html)
@@ -384,7 +502,11 @@ def _save_scraped_csv(rates: dict[date, float]) -> None:
         )
         .sort("date")
     )
-    df.write_csv(p)
+    # Atomic replace (write tmp sibling, then rename) so a kill mid-write can't
+    # leave a truncated CSV.
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    df.write_csv(tmp)
+    tmp.replace(p)
 
 
 def reparse_cache() -> dict[date, float]:
@@ -450,9 +572,10 @@ def ingest_from_rbi_press_releases(
     # new prids are walked.
     existing = reparse_cache() or _load_scraped_csv()
 
-    # Determine end_prid (upper bound to walk).
+    # Determine end_prid (upper bound to walk). Use probe-forward discovery, not
+    # the raw RSS max — a stale RSS must never cap the walk below the true tip.
     if end_prid is None:
-        end_prid = fetch_latest_prid(default=state.get("latest_prid"))
+        end_prid = discover_latest_prid(state)
         if end_prid is None:
             log.error("fbil.rbi.no_latest_prid")
             return existing

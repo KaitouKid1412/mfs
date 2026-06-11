@@ -16,3 +16,6 @@ data/staging/
 .env
 .envrc
 notebooks/.ipynb_checkpoints/
+data/_parquet_archive*/
+data/_archive/
+.claude/worktrees/

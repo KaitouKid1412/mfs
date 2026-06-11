@@ -132,6 +132,11 @@ class ParsedPtrRecord(BaseModel):
     scheme_name_printed: str
     ptr: float
     source_amc: str
+    # Optional period stamp. Monthly-factsheet adapters leave this None and the
+    # orchestrator stamps the run's data month. Adapters that source PTR from a
+    # less-frequent document (e.g. quant's abridged annual report) set it to the
+    # document's true period-end so the value isn't mislabeled as the run month.
+    as_of_month: Optional[date] = None
 
 
 # Phase 2.3 ---------------------------------------------------------------
