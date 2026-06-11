@@ -22,6 +22,7 @@ holding is 1.2% would be misread as a fraction by a max-based rule).
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -30,6 +31,7 @@ from urllib.parse import unquote, urljoin
 import openpyxl
 
 from mfs import paths
+from mfs.errors import StatementDateMismatchError
 from mfs.ingest.holdings._base import HoldingsAdapter
 from mfs.io.http import download_to, fetch_bytes
 from mfs.schemas import ParsedHoldingRecord
@@ -120,6 +122,100 @@ def classify_section(label: str) -> str | None:
     return None
 
 
+# --- Statement-date ("AS ON <date>") banner detection -----------------------
+#
+# SEBI portfolio workbooks print the statement date in a pre-header banner
+# row ("MONTHLY PORTFOLIO STATEMENT AS ON 30 Apr 2026"). We parse it to
+# validate the artifact's INTERNAL month against the month it was requested
+# as — an endpoint serving last month's file for this month's id (quant,
+# 2026-05) must be rejected, not cached.
+
+_MONTH_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+    "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+}
+
+_AS_ON_RE = re.compile(r"\bas\s+on\b", re.IGNORECASE)
+
+# Date snippet following an 'as on' phrase. Two shapes:
+#   day-first:   '30 Apr 2026', '30-Apr-2026', '30-APR-2026', '30th April 2026'
+#   month-first: 'April 30, 2026', 'April 30,2026'
+# Separators are spaces / hyphens / commas; the day may carry an ordinal
+# suffix; trailing footnote markers ('29 May 2026*') are simply not consumed.
+_STMT_DATE_RE = re.compile(
+    r"""
+    (?:
+        (?P<d1>\d{1,2})(?:st|nd|rd|th)?[\s\-,]+(?P<m1>[A-Za-z]{3,9})[\s\-,]+(?P<y1>\d{4})
+      |
+        (?P<m2>[A-Za-z]{3,9})[\s\-,]+(?P<d2>\d{1,2})(?:st|nd|rd|th)?[\s\-,]*(?P<y2>\d{4})
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _month_token_num(token: str) -> int | None:
+    """'Apr' / 'APRIL' / 'Sept' → 4 / 4 / 9; non-month words → None."""
+    t = token.lower()
+    for name, num in _MONTH_NUM.items():
+        if name.startswith(t):
+            return num
+    return None
+
+
+def _ym_from_text(text: str) -> str | None:
+    """First parseable 'AS ON'-style date in ``text`` as 'YYYY-MM', or None."""
+    for m in _STMT_DATE_RE.finditer(text):
+        month = _month_token_num(m.group("m1") or m.group("m2"))
+        if month is None:
+            continue  # regex shape matched but the word isn't a month
+        return f"{int(m.group('y1') or m.group('y2')):04d}-{month:02d}"
+    return None
+
+
+def _ym_from_cell(cell: object) -> str | None:
+    """'YYYY-MM' from a date-bearing cell: a datetime/date value (openpyxl
+    parses typed date cells) or a string carrying a parseable date."""
+    if isinstance(cell, _dt.date):  # covers datetime too
+        return f"{cell.year:04d}-{cell.month:02d}"
+    if isinstance(cell, str):
+        return _ym_from_text(cell)
+    return None
+
+
+def find_statement_months(rows: list[tuple]) -> set[str]:
+    """Scan banner rows for 'as on <date>' phrases; return months as 'YYYY-MM'.
+
+    Callers pass the PRE-HEADER rows only (``rows[:header_idx]``) so table
+    data is never scanned. Handles the in-cell formats verified across the
+    live cache ('30 Apr 2026', 'April 30, 2026', 'April 30,2026',
+    '30-Apr-2026', '30th April 2026', '29 May 2026*') and the split-cell
+    variant where the cell is just 'AS ON :' and the date — a string or a
+    typed datetime cell — sits in a later cell of the same row. An 'as on'
+    with no parseable date nearby (e.g. 'NAV As on Record Date') yields
+    nothing.
+    """
+    found: set[str] = set()
+    for row in rows:
+        for j, cell in enumerate(row):
+            if not isinstance(cell, str):
+                continue
+            m = _AS_ON_RE.search(cell)
+            if not m:
+                continue
+            ym = _ym_from_text(cell[m.end():])
+            if ym is None:
+                # Split-cell: date lives in a later cell of the same row.
+                for later in row[j + 1:]:
+                    ym = _ym_from_cell(later)
+                    if ym is not None:
+                        break
+            if ym is not None:
+                found.add(ym)
+    return found
+
+
 def _detect_header(rows: list[tuple], max_scan: int = 40) -> tuple[int, dict] | None:
     """Find the header row + column map. Returns (header_row_idx, colmap) or
     None. colmap keys: isin, name, weight, industry (industry optional)."""
@@ -148,10 +244,26 @@ def _detect_header(rows: list[tuple], max_scan: int = 40) -> tuple[int, dict] | 
     return None
 
 
-def _parse_one_sheet(ws) -> list[ParsedHoldingRecord] | None:
+def _parse_one_sheet(
+    ws,
+    *,
+    expect_ym: str | None = None,
+    require_statement_date: bool = False,
+    artifact_path: Path | None = None,
+) -> list[ParsedHoldingRecord] | None:
     """Parse a single worksheet in the generic SEBI layout. Returns the
     holding records (unscaled-then-scaled) or None if no header was found
-    (i.e. this sheet is not a portfolio table)."""
+    (i.e. this sheet is not a portfolio table).
+
+    When ``expect_ym`` ('YYYY-MM') is given, the pre-header banner rows are
+    scanned for 'AS ON <date>' statement dates; any banner month matching
+    ``expect_ym`` passes (tolerates e.g. a lagging riskometer date alongside
+    the true portfolio banner), but banners that ALL disagree raise
+    ``StatementDateMismatchError`` — a wrong-month artifact must never be
+    parsed into the requested month. With ``require_statement_date`` a
+    missing banner also raises (for AMCs whose banner is verified always
+    present, absence itself is suspicious).
+    """
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return None
@@ -159,6 +271,12 @@ def _parse_one_sheet(ws) -> list[ParsedHoldingRecord] | None:
     if detected is None:
         return None
     header_idx, cm = detected
+    if expect_ym:
+        found = find_statement_months(rows[:header_idx])
+        if (found and expect_ym not in found) or (
+            not found and require_statement_date
+        ):
+            raise StatementDateMismatchError(artifact_path, expect_ym, found)
     isin_c, name_c, weight_c = cm["isin"], cm["name"], cm["weight"]
 
     current_section = "Equity"
@@ -229,6 +347,9 @@ def parse_sebi_excel(
     scheme_name_printed: str,
     source_amc: str,
     sheet_index: int | None = 0,
+    *,
+    expect_ym: str | None = None,
+    require_statement_date: bool = False,
 ) -> Iterable[ParsedHoldingRecord]:
     """Parse a single-scheme SEBI monthly-portfolio Excel generically.
 
@@ -241,6 +362,11 @@ def parse_sebi_excel(
     yields a recognizable SEBI header (useful when the equity table isn't on
     sheet 0). Multi-scheme consolidated workbooks need a bespoke adapter —
     this helper assumes one scheme per file.
+
+    ``expect_ym`` ('YYYY-MM'): validate the workbook's printed 'AS ON' banner
+    month against the requested data month; raise
+    ``StatementDateMismatchError`` on disagreement (validate-when-present —
+    a workbook with no banner passes unless ``require_statement_date``).
     """
     wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
     try:
@@ -249,7 +375,12 @@ def parse_sebi_excel(
         else:
             sheets = [wb.worksheets[sheet_index]] if sheet_index < len(wb.worksheets) else []
         for ws in sheets:
-            recs = _parse_one_sheet(ws)
+            recs = _parse_one_sheet(
+                ws,
+                expect_ym=expect_ym,
+                require_statement_date=require_statement_date,
+                artifact_path=excel_path,
+            )
             if recs:
                 for r in recs:
                     yield ParsedHoldingRecord(
@@ -314,10 +445,14 @@ class GenericHoldingsAdapter(HoldingsAdapter):
     ``parse_excel`` and ``fetch_excel`` are inherited — the shared
     ``parse_sebi_excel`` auto-detects columns + weight unit, and fetch uses
     the standard cached download. Override ``sheet_index = None`` when the
-    portfolio table is not on the first sheet.
+    portfolio table is not on the first sheet. Set
+    ``require_statement_date = True`` when the AMC's 'AS ON' banner is
+    verified always present, so a banner-less workbook is rejected rather
+    than trusted.
     """
 
     sheet_index: int | None = 0
+    require_statement_date: bool = False
 
     def fetch_excel(self, url: str, scheme_filename: str, ym: str) -> Path:
         out = paths.holdings_excel_raw(self.amc_slug, ym, scheme_filename)
@@ -331,4 +466,6 @@ class GenericHoldingsAdapter(HoldingsAdapter):
         return parse_sebi_excel(
             excel_path, scheme_name_printed, self.amc_slug,
             sheet_index=self.sheet_index,
+            expect_ym=ym,
+            require_statement_date=self.require_statement_date,
         )

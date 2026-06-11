@@ -68,3 +68,22 @@ def test_transient_mid_probe_not_treated_as_tip(monkeypatch):
 def test_cold_start_nothing_known_returns_none(monkeypatch):
     _patch(monkeypatch, rss=None, state={}, cache_hwm=0, real_max=0)
     assert fbil.discover_latest_prid() is None
+
+
+def test_shell_at_tip_aborts_probe(monkeypatch):
+    # RBI now serves 200-OK shell pages (not 404s) for prids past the tip;
+    # detection turns them into transient failures. The probe must abort at the
+    # first shell — a shell neither advances the tip nor counts toward the
+    # absent gap (same contract as a transient mid-probe error above).
+    real_max = 62891
+    _patch(monkeypatch, rss=62669, state={"latest_prid": 62885},
+           cache_hwm=62885, real_max=real_max)
+
+    def _fake(client, prid):
+        if prid <= real_max:
+            return f"<html>prid {prid}</html>", None  # real page
+        return None, "shell page"  # 200-OK WAF shell -> transient failure
+    monkeypatch.setattr(fbil, "_fetch_prid_html", _fake)
+
+    # probes 62886..62891 (real, tip advances), 62892 (shell -> abort)
+    assert fbil.discover_latest_prid() == real_max

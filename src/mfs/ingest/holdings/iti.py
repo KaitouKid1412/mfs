@@ -350,7 +350,7 @@ class ItiHoldingsAdapter(GenericHoldingsAdapter):
             return iter(())
         return parse_sebi_excel(
             excel_path, scheme_name_printed, self.amc_slug,
-            sheet_index=sheet_index,
+            sheet_index=sheet_index, expect_ym=ym,
         )
 
     @staticmethod

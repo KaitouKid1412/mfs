@@ -96,6 +96,11 @@ class QuantHoldingsAdapter(GenericHoldingsAdapter):
     source_label = "quant Mutual Fund"
     # Per-scheme files put the portfolio on sheet 0 in standard SEBI layout.
     sheet_index = 0
+    # The 'MONTHLY PORTFOLIO STATEMENT AS ON <date>' banner is verified
+    # always present (sheet-0 row 3), and quant's WebForms endpoint has
+    # served the prior month's files for a requested month id — so a
+    # missing/mismatched statement date must abort, never be trusted.
+    require_statement_date = True
 
     def discover_scheme_urls(self, ym: str) -> dict[str, str]:
         """POST the fund-wise PageMethod for the data month and parse the

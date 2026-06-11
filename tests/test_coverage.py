@@ -217,6 +217,92 @@ def test_run_gate_advisory_never_raises(monkeypatch):
     assert len(report.advisory_gaps) == len(report.results)
 
 
+# --- interior-gap contract (nav_daily only) ---------------------------------
+
+class _NavCfg:
+    max_nav_lag_bdays = 5
+    max_nav_interior_gap_days = 2
+
+
+def _patch_healthy_nav(monkeypatch):
+    """Patch the DB boundary so the nav_daily contract evaluates to OK before
+    the interior-gap check; returns the nav contract."""
+    fresh = date(2026, 6, 7)
+    entities = {f"S{i}" for i in range(10)}
+    _patch_db(monkeypatch, bounds=(date(2013, 1, 1), fresh, 1000),
+              latest={e: fresh for e in entities}, entities=entities)
+    return next(c for c in cov.CONTRACTS if c.table == "nav_daily")
+
+
+def test_only_nav_contract_declares_interior_gap():
+    nav = next(c for c in cov.CONTRACTS if c.table == "nav_daily")
+    assert nav.interior_gap is True
+    assert all(not c.interior_gap for c in cov.CONTRACTS if c.table != "nav_daily")
+
+
+def test_interior_gap_over_threshold_blocks(monkeypatch):
+    """3 sub-floor days > threshold 2 → INTERIOR_GAP, ok=False (blocking)."""
+    c = _patch_healthy_nav(monkeypatch)
+    gaps = [date(2026, 5, 25), date(2026, 5, 26), date(2026, 5, 27)]
+    monkeypatch.setattr(cov, "_nav_interior_gap_days", lambda end, **kw: gaps)
+    r = cov.evaluate(c, date(2026, 6, 8), _NavCfg())
+    assert r.status == cov.INTERIOR_GAP
+    assert r.ok is False
+    assert "2026-05-25" in r.detail and "2026-05-27" in r.detail
+    # remediation points at the FIRST missing date (inclusive re-fetch heals it)
+    assert r.remediation == "mfs ingest navs --since 2026-05-25"
+
+
+def test_interior_gap_at_threshold_passes(monkeypatch):
+    """2 sub-floor days == threshold 2 (special-session allowance) → OK."""
+    c = _patch_healthy_nav(monkeypatch)
+    gaps = [date(2026, 5, 25), date(2026, 5, 26)]
+    monkeypatch.setattr(cov, "_nav_interior_gap_days", lambda end, **kw: gaps)
+    r = cov.evaluate(c, date(2026, 6, 8), _NavCfg())
+    assert r.status == cov.OK
+    assert r.ok is True
+
+
+def test_interior_gap_skipped_when_threshold_null(monkeypatch):
+    """max_nav_interior_gap_days=None disables the check entirely (the
+    rollback switch): the helper must never be called."""
+    c = _patch_healthy_nav(monkeypatch)
+
+    def _boom(end, **kw):
+        pytest.fail("_nav_interior_gap_days called despite threshold=None")
+
+    monkeypatch.setattr(cov, "_nav_interior_gap_days", _boom)
+
+    class NullCfg:
+        max_nav_lag_bdays = 5
+        max_nav_interior_gap_days = None
+
+    r = cov.evaluate(c, date(2026, 6, 8), NullCfg())
+    assert r.status == cov.OK
+    assert r.ok is True
+
+
+def test_interior_gap_helper_not_called_for_other_contracts(monkeypatch):
+    """Contracts with interior_gap=False (everything but nav_daily) never run
+    the NAV gap query."""
+    c = next(c for c in cov.CONTRACTS if c.table == "benchmark_daily")
+    fresh = date(2026, 6, 7)
+    _patch_db(monkeypatch, bounds=(date(2013, 1, 1), fresh, 1000),
+              latest={"NIFTY 50 TRI": fresh}, entities={"NIFTY 50 TRI"})
+
+    def _boom(end, **kw):
+        pytest.fail("_nav_interior_gap_days called for a non-interior_gap contract")
+
+    monkeypatch.setattr(cov, "_nav_interior_gap_days", _boom)
+
+    class Cfg:
+        max_bench_lag_bdays = 5
+        max_nav_interior_gap_days = 2
+
+    r = cov.evaluate(c, date(2026, 6, 8), Cfg())
+    assert r.status == cov.OK
+
+
 # --- registry completeness (the "for all metrics" guarantee) ---------------
 
 def test_every_schema_table_is_contracted_or_out_of_contract():

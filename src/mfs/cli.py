@@ -1104,7 +1104,7 @@ def pipeline_run_all(
 
     try:
         # ----- Phase 1: required base data -----
-        _stage("ingest navs (today)", amfi_nav.ingest_today)
+        _stage("ingest navs (incremental)", amfi_nav.ingest_incremental)
         _stage("ingest benchmarks", lambda: benchmarks.ingest_all_known(full=full))
         # Synthesize the 3 hybrid TRIs (Hybrid 50:50, 65:35, Equity Savings) from
         # the now-fresh NIFTY 50 TRI sleeve + risk-free. These are NOT on NSE's

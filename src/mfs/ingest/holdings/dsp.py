@@ -395,4 +395,5 @@ class DspHoldingsAdapter(GenericHoldingsAdapter):
             return iter(())
         return parse_sebi_excel(
             excel_path, scheme_name_printed, self.amc_slug, sheet_index=idx,
+            expect_ym=ym,
         )

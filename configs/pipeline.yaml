@@ -30,6 +30,16 @@ freshness:
   max_rf_lag_days: 14              # 91-day T-bill auction (weekly; allow holiday slip)
   max_scheme_master_lag_days: 1    # scheme master rebuilt within last day
   max_tbill_scrape_failure_rate: 0.05  # halt T-bill walk if >5% of prids fail their retries
+  # Interior-gap gate (coverage Gate A, nav_daily only): max trading days among
+  # the last 30 (NIFTY 50 TRI calendar) whose nav_daily row count is below
+  # 0.5x the trailing-3y median daily count (~8,600 → floor ~4,300). null
+  # disables the check (rollback switch). Threshold rationale:
+  # quality.max_missing_pct_in_window (0.05) is the PER-SCHEME 3y tolerance
+  # (~37 days) and can never catch a fresh systemic hole (the 2026-05/06 hole
+  # was 1.2% of 3y); this gate instead allows 2 sub-floor days per 30 trading
+  # days (~6.7%), one above the special-session (Muhurat / budget Saturday)
+  # base rate of ≤1 per any 30-trading-day span.
+  max_nav_interior_gap_days: 2
   # Phase 2.2+: holdings, benchmark constituents, and PTR. All monthly cadence
   # (AMFI mandate: publish by 10th of next month) — 45-day lag is one full
   # cycle plus slack. Set to null while the corresponding tables are empty.

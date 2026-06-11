@@ -320,5 +320,5 @@ class SundaramHoldingsAdapter(GenericHoldingsAdapter):
         # fraction weight unit on this single sheet.
         yield from parse_sebi_excel(
             excel_path, scheme_name_printed, self.amc_slug,
-            sheet_index=sheet_idx,
+            sheet_index=sheet_idx, expect_ym=ym,
         )

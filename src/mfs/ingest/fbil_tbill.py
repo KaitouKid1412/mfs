@@ -91,6 +91,14 @@ _TITLE_BLOCK_RE = re.compile(
     r'class="tableheader"[^>]*>(?:\s*<b>)?\s*([^<]{1,300})',
     re.IGNORECASE,
 )
+# Real PR pages (T-bill or not) always carry the title block's
+# class="tableheader" attribute. RBI's ~120KB 200-OK "shell" pages for
+# nonexistent prids do NOT — but they DO contain the bare string 'tableheader'
+# inside JavaScript ($('.tableheader b') and a commented
+# getElementsByClassName), and they DO match _DATE_RE via a lowercase
+# 'date: Jun 08, 2026' chrome element. So shell detection MUST anchor on the
+# attribute form, not a bare substring and not the Date marker.
+_REAL_PR_MARKER_RE = re.compile(r'class="tableheader"', re.IGNORECASE)
 
 
 def _tbill_result_title(html: str) -> str | None:
@@ -121,6 +129,18 @@ def _is_91day_result(title: str) -> bool:
 def _looks_like_tbill_result(html: str) -> bool:
     """True if the page is a 91/182/364-day T-bill auction result PR (either variant)."""
     return _tbill_result_title(html) is not None
+
+
+def _is_real_pr_page(html: str) -> bool:
+    """True if the HTML is a real press-release page (any PR, not just T-bill).
+
+    False for RBI's full-chrome WAF/shell pages served with 200 OK for
+    nonexistent prids — those must be treated as transient fetch failures,
+    never cached and never read as "prid absent".
+    """
+    return _REAL_PR_MARKER_RE.search(html) is not None
+
+
 _DATE_RE = re.compile(
     r"Date\s*:\s*(\w+\s+\d{1,2},\s+\d{4})",
     re.IGNORECASE,
@@ -284,7 +304,38 @@ def _fetch_prid_with_retry(client: httpx.Client, prid: int) -> str:
         raise TransientHttpError(
             f"prid {prid}: 200 OK but body_len={len(r.text)} (likely rate-limited)"
         )
+    # RBI serves ~120KB 200-OK full-chrome shell pages for nonexistent prids.
+    # A shell is a transient fetch failure: it must never be cached (the
+    # atomic_write_text in _fetch_prid_html is only reached on success) and
+    # never read as "prid absent" — discovery would otherwise treat shells as
+    # real pages and probe PROBE_FORWARD_MAX fresh shells every run.
+    if not _is_real_pr_page(r.text):
+        raise TransientHttpError(
+            f"prid {prid}: 200 OK but WAF/shell page "
+            f"(no tableheader title block, body_len={len(r.text)})"
+        )
     return r.text
+
+
+def _read_valid_cache(prid: int) -> str | None:
+    """Return the cached PR HTML for `prid` only if it is a valid real page.
+
+    Valid = file exists, size > 200 bytes, reads OK, and _is_real_pr_page()
+    (has the class="tableheader" title block). Anything else returns None so
+    the caller falls through to the network fetch, which overwrites the bad
+    file on success — self-healing if a shell page ever lands in the cache.
+    """
+    cache = paths.rbi_press_release_raw(prid)
+    if not (cache.exists() and cache.stat().st_size > 200):
+        return None
+    try:
+        html = cache.read_text(encoding="utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001
+        return None
+    if not _is_real_pr_page(html):
+        log.warning("fbil.rbi.cached_shell_invalidated", prid=prid, path=str(cache))
+        return None
+    return html
 
 
 def _fetch_prid_html(client: httpx.Client, prid: int) -> tuple[str | None, str | None]:
@@ -295,9 +346,9 @@ def _fetch_prid_html(client: httpx.Client, prid: int) -> tuple[str | None, str |
       - (None, None)  → permanent absence (404 / empty body) — not a failure
       - (None, "..."  → transient failure after retries — counted toward the cap
     """
-    cache = paths.rbi_press_release_raw(prid)
-    if cache.exists() and cache.stat().st_size > 200:
-        return cache.read_text(encoding="utf-8", errors="ignore"), None
+    cached = _read_valid_cache(prid)
+    if cached is not None:
+        return cached, None
     try:
         text = _fetch_prid_with_retry(client, prid)
     except _PermanentFetchError:
@@ -306,9 +357,9 @@ def _fetch_prid_html(client: httpx.Client, prid: int) -> tuple[str | None, str |
         log.warning("fbil.rbi.fetch_failed_after_retries", prid=prid, err=str(e))
         return None, str(e)
     # Atomic write so a kill mid-download can't strand a truncated page that the
-    # `>200 bytes` cache check (at the top of this fn and in _walk_prid_range)
+    # cache validity check (_read_valid_cache, here and in _walk_prid_range)
     # would otherwise trust as a valid PR and never re-fetch.
-    atomic_write_text(cache, text)
+    atomic_write_text(paths.rbi_press_release_raw(prid), text)
     return text, None
 
 
@@ -428,15 +479,11 @@ def _walk_prid_range(
 
     def _do(prid: int) -> tuple[dict | None, str | None]:
         # Cache hits skip the rate-limit sleep entirely so gap-fill walks over a
-        # mostly-cached range stay fast.
-        cache = paths.rbi_press_release_raw(prid)
-        if cache.exists() and cache.stat().st_size > 200:
-            try:
-                html = cache.read_text(encoding="utf-8", errors="ignore")
-            except Exception:  # noqa: BLE001
-                html = None
-            if html is not None:
-                return _parse_tbill_html(html, prid), None
+        # mostly-cached range stay fast. An invalid/shell cached file falls
+        # through to the fetch path, which overwrites it on success.
+        html = _read_valid_cache(prid)
+        if html is not None:
+            return _parse_tbill_html(html, prid), None
         time.sleep(rate_limit_s)
         with _rbi_client() as c:
             html, failure = _fetch_prid_html(c, prid)

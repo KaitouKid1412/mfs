@@ -55,6 +55,10 @@ class FreshnessConfig(BaseModel):
     max_rf_lag_days: int = 14  # T-bills auction weekly; allow holiday slip
     max_scheme_master_lag_days: int = 1
     max_tbill_scrape_failure_rate: float = 0.05
+    # Interior-gap gate (coverage Gate A, nav_daily only): max sub-floor trading
+    # days allowed in the last 30 NIFTY 50 TRI trading days. None disables the
+    # check (the rollback switch, mirroring the other nullable freshness keys).
+    max_nav_interior_gap_days: Optional[int] = 2
     # Phase 2.1+ ingestion staleness windows. None = freshness check skipped
     # (used when an ingestion stage hasn't shipped yet, so the table is empty).
     max_holdings_lag_days: Optional[int] = 45        # monthly disclosures (AMFI mandate: by 10th)

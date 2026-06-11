@@ -12,7 +12,22 @@ must not have its YTM mislabeled as the 91-day rate.
 
 from __future__ import annotations
 
+import contextlib
+from datetime import date
+from pathlib import Path
+
+import httpx
+import pytest
+
+from mfs.ingest import fbil_tbill as fbil
 from mfs.ingest.fbil_tbill import _parse_tbill_html
+from mfs.io.http import TransientHttpError
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "rbi"
+
+
+def _fixture(name: str) -> str:
+    return (_FIXTURES / name).read_text(encoding="utf-8", errors="ignore")
 
 
 def _pr(title: str, body: str, d: str = "Jan 02, 2013") -> str:
@@ -77,3 +92,88 @@ def test_degenerate_zero_ytm_unmatched():
 def test_non_tbill_page_rejected():
     assert _rate("India's External Debt as at the end of June 2020",
                  "some unrelated content") is None
+
+
+# ---------------------------------------------------------------------------
+# Shell-page detection (Urgent-1): RBI serves ~120KB 200-OK full-chrome shell
+# pages for nonexistent prids. A shell must be treated as a transient fetch
+# failure — never cached, never read as "prid absent" — and a shell already in
+# the cache must be invalidated on read.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _fake_client():
+    yield object()
+
+
+def _patch_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        fbil.paths,
+        "rbi_press_release_raw",
+        lambda prid: tmp_path / f"prid_{prid}.html",
+    )
+
+
+def test_shell_page_not_real_pr():
+    html = _fixture("shell_page.html")
+    # The two false-positive traps the fixture preserves: shell chrome matches
+    # _DATE_RE (lowercase 'date: Jun 08, 2026' + IGNORECASE) and contains the
+    # bare string 'tableheader' inside JavaScript. Detection must therefore
+    # anchor on the attribute form class="tableheader", which shells lack.
+    assert fbil._DATE_RE.search(html) is not None
+    assert "tableheader" in html
+    assert fbil._is_real_pr_page(html) is False
+    assert fbil._parse_tbill_html(html, 63000) is None
+
+
+def test_real_cutoff_fixture_parses():
+    html = _fixture("cutoff_91d_2026-06-03.html")
+    assert fbil._is_real_pr_page(html) is True
+    assert fbil._parse_tbill_html(html, 62855) == {
+        "prid": 62855,
+        "auction_date": date(2026, 6, 3),
+        "rate_annual_pct": 5.5586,
+    }
+
+
+def test_fetch_shell_raises_transient():
+    # Undecorated path (__wrapped__) so tenacity's 1-8s backoff is skipped.
+    shell_html = _fixture("shell_page.html")
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=shell_html))
+    )
+    with pytest.raises(TransientHttpError, match="WAF/shell page"):
+        fbil._fetch_prid_with_retry.__wrapped__(client, 99999)
+
+
+def test_shell_not_cached_and_counted_failed(monkeypatch, tmp_path):
+    _patch_cache_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(fbil, "_rbi_client", _fake_client)
+    monkeypatch.setattr(fbil.time, "sleep", lambda *a, **k: None)
+
+    def _raise_shell(client, prid):
+        raise TransientHttpError("shell")
+
+    monkeypatch.setattr(fbil, "_fetch_prid_with_retry", _raise_shell)
+
+    # Transient failure surfaces as (None, reason) and the cache write is
+    # never reached — no shell file may land on disk.
+    assert fbil._fetch_prid_html(object(), 5) == (None, "shell")
+    assert not (tmp_path / "prid_5.html").exists()
+    # The walk counts the shell toward the failure cap, not as a hit/absence.
+    assert fbil._walk_prid_range(5, 5) == ([], 1)
+    assert not (tmp_path / "prid_5.html").exists()
+
+
+def test_cached_shell_invalidated(monkeypatch, tmp_path):
+    _patch_cache_dir(monkeypatch, tmp_path)
+    cache = tmp_path / "prid_5.html"
+    cache.write_text(_fixture("shell_page.html"), encoding="utf-8")
+    real_html = _fixture("cutoff_91d_2026-06-03.html")
+    monkeypatch.setattr(fbil, "_fetch_prid_with_retry", lambda client, prid: real_html)
+
+    # A cached shell must be ignored (re-fetched) and overwritten on success.
+    html, failure = fbil._fetch_prid_html(object(), 5)
+    assert (html, failure) == (real_html, None)
+    assert 'class="tableheader"' in cache.read_text(encoding="utf-8")

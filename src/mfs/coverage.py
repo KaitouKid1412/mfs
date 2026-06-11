@@ -13,9 +13,10 @@ table we declare a *contract* and, before compute, answer six questions:
 Two gates run the contracts:
 
   * Gate A (BLOCKING) — NAV, benchmarks, risk-free, scheme_master. A breach
-    (empty / stale / too-short-history / catastrophically low entity coverage)
-    raises ``CoverageError`` and halts the pipeline before compute. Runs right
-    after scheme_master is built, before the expensive Phase-2 ingest.
+    (empty / stale / too-short-history / catastrophically low entity coverage /
+    interior gap in the NAV calendar) raises ``CoverageError`` and halts the
+    pipeline before compute. Runs right after scheme_master is built, before
+    the expensive Phase-2 ingest.
   * Gate B (ADVISORY) — holdings, PTR, AAUM, constituents, stock-ADV. A breach
     is reported loudly and the affected funds are excluded downstream, but the
     run continues. Runs after Phase-2 ingest, before compute. This is the ONLY
@@ -64,6 +65,7 @@ EMPTY = "EMPTY"
 STALE = "STALE"
 SHORT_HISTORY = "SHORT_HISTORY"
 GAP = "GAP"
+INTERIOR_GAP = "INTERIOR_GAP"
 
 # Catastrophic entity-coverage floor for BLOCKING sources: below this fraction
 # the ingest is considered broken (wrote almost nothing) rather than merely
@@ -96,6 +98,10 @@ class Contract:
     entity_set: str | None = None   # 'rankable' | 'benchmark_tickers' | None
     accepted_missing: frozenset[str] = field(default_factory=frozenset)
     remediation: str = ""
+    # Daily series with a known-density calendar can also be checked for holes
+    # BETWEEN have-from and have-till (the STALE check only sees end-recency).
+    # Currently nav_daily only; gated by freshness.max_nav_interior_gap_days.
+    interior_gap: bool = False
 
 
 CONTRACTS: list[Contract] = [
@@ -106,6 +112,7 @@ CONTRACTS: list[Contract] = [
         need_back=("years", 5), lag_attr="max_nav_lag_bdays", lag_unit="bdays",
         entity_col="scheme_code", entity_set="rankable",
         remediation="mfs ingest navs --backfill  (or --since YYYY-MM-DD)",
+        interior_gap=True,
     ),
     Contract(
         table="benchmark_daily", date_col="date", cadence=TRADING_DAY,
@@ -292,6 +299,57 @@ def _bounds(table: str, date_col: str) -> tuple[date | None, date | None, int]:
     return _coerce_date(mn), _coerce_date(mx), int(n or 0)
 
 
+def _nav_interior_gap_days(
+    end: date, n_days: int = 30, floor_frac: float = 0.5
+) -> list[date]:
+    """Trading days (NIFTY 50 TRI calendar) among the last `n_days` ending at
+    `end` whose nav_daily row count falls below ``floor_frac`` × the median
+    daily count over the trailing 3 years (median ~8,600 → floor ~4,300).
+
+    This is the interior-hole detector the end-recency STALE check is blind to;
+    pass ``end = have_till`` so end-staleness stays the STALE check's job.
+    Legitimate special sessions (Muhurat / budget Saturdays, ~600–1,100 rows)
+    also trip the floor, at a base rate of ≤1 per any 30-trading-day span —
+    the configured ``max_nav_interior_gap_days`` threshold allows for that.
+    """
+    sql = """
+        WITH cal AS (
+            SELECT DISTINCT date AS d
+            FROM benchmark_daily
+            WHERE ticker = 'NIFTY 50 TRI' AND date <= %s
+            ORDER BY d DESC
+            LIMIT %s
+        ),
+        daily AS (
+            SELECT nav_date, COUNT(*) AS cnt
+            FROM nav_daily
+            WHERE nav_date >= (SELECT MIN(d) FROM cal)
+            GROUP BY nav_date
+        ),
+        floor_calc AS (
+            SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cnt) AS median_cnt
+            FROM (
+                SELECT COUNT(*) AS cnt
+                FROM nav_daily
+                WHERE nav_date > %s - INTERVAL '3 years'
+                  AND nav_date <= %s
+                  AND nav_date IN (
+                      SELECT date FROM benchmark_daily WHERE ticker = 'NIFTY 50 TRI'
+                  )
+                GROUP BY nav_date
+            ) t
+        )
+        SELECT cal.d
+        FROM cal
+        LEFT JOIN daily ON daily.nav_date = cal.d
+        WHERE COALESCE(daily.cnt, 0) < %s * (SELECT median_cnt FROM floor_calc)
+        ORDER BY cal.d
+    """
+    with connect() as c:
+        rows = c.execute(sql, (end, n_days, end, end, floor_frac)).fetchall()
+    return [_coerce_date(r[0]) for r in rows]
+
+
 def _entity_latest(table: str, entity_col: str, date_col: str) -> dict[str, date]:
     with connect() as c:
         rows = c.execute(
@@ -354,12 +412,32 @@ def evaluate(contract: Contract, as_of: date, cfg) -> CoverageResult:
     )
     detail = _detail(status, have_from, have_till, stale_cutoff, need_from,
                      n_present, n_expected, n_rows)
+    remediation = contract.remediation
+
+    # Interior-gap check: holes BETWEEN have-from and have-till that every
+    # end-recency check (STALE) and per-entity-latest check (GAP counts) is
+    # blind to. Only runs when the contract opts in (nav_daily), the series
+    # already passed the harder checks (OK/GAP), and the threshold is set
+    # (None disables — the rollback switch).
+    max_gap_days = getattr(cfg, "max_nav_interior_gap_days", None)
+    if contract.interior_gap and max_gap_days is not None and status in (OK, GAP):
+        gap_days = _nav_interior_gap_days(have_till)
+        if len(gap_days) > max_gap_days:
+            status = INTERIOR_GAP
+            ok = contract.severity != BLOCKING
+            detail = (
+                f"{len(gap_days)} sub-floor trading day(s) in the last 30 "
+                f"(max allowed {max_gap_days}): "
+                + ", ".join(d.isoformat() for d in gap_days)
+            )
+            remediation = f"mfs ingest navs --since {gap_days[0].isoformat()}"
+
     return CoverageResult(
         source=contract.table, label=contract.label, cadence=contract.cadence,
         severity=contract.severity, need_from=need_from, have_from=have_from,
         have_till=have_till, fresh_by=stale_cutoff, n_rows=n_rows,
         n_expected=n_expected, n_present=n_present, status=status, ok=ok,
-        remediation=contract.remediation, detail=detail,
+        remediation=remediation, detail=detail,
     )
 
 

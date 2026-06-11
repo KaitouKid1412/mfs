@@ -7,6 +7,8 @@ to run when these are unresolved upstream.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 
 class PipelineError(RuntimeError):
     """Base class for all errors that should halt the pipeline."""
@@ -14,6 +16,26 @@ class PipelineError(RuntimeError):
 
 class IngestError(PipelineError):
     """An ingest stage failed (network exhausted, parse empty, etc.)."""
+
+
+class StatementDateMismatchError(IngestError):
+    """A month-keyed artifact's printed 'AS ON <date>' statement month does
+    not match the month it was requested as. Caching or ingesting it would
+    poison the month-keyed cache and the DB partition (e.g. quant serving
+    April files for a May request). The artifact must be evicted, never
+    written."""
+
+    def __init__(
+        self, artifact_path: Path, expected_ym: str, found_yms: set[str],
+    ) -> None:
+        self.artifact_path = artifact_path
+        self.expected_ym = expected_ym
+        self.found_yms = found_yms
+        found = ", ".join(sorted(found_yms)) if found_yms else "none"
+        super().__init__(
+            f"{artifact_path}: statement-date mismatch — expected month "
+            f"{expected_ym}, found {found}"
+        )
 
 
 class FreshnessError(PipelineError):

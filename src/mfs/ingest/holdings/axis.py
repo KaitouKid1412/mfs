@@ -363,6 +363,7 @@ class AxisHoldingsAdapter(GenericHoldingsAdapter):
         if head.startswith(_ZIP_MAGIC):
             yield from parse_sebi_excel(
                 excel_path, scheme_name_printed, self.amc_slug, sheet_index=0,
+                expect_ym=ym,
             )
             return
         if head.startswith(_OLE2_MAGIC):

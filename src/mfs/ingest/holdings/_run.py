@@ -19,7 +19,7 @@ import polars as pl
 
 from mfs.db import queries as q
 from mfs.db import writers as w
-from mfs.errors import IngestError
+from mfs.errors import IngestError, StatementDateMismatchError
 from mfs.ingest.holdings._registry import get_adapter, registered_adapters
 from mfs.ingest.managers._scheme_match import (
     DEFAULT_THRESHOLD,
@@ -118,6 +118,21 @@ def run_for_amc(
         n_excels_parsed += 1
         try:
             records = list(adapter.parse_excel(excel_path, scheme_name_printed, ym))
+        except StatementDateMismatchError as e:
+            # Wrong-month artifact (e.g. the endpoint served last month's
+            # file for this month's id). Evict it from the month-keyed cache
+            # — fetch_excel's exists() check would otherwise pin the wrong
+            # file forever — and re-raise so the whole AMC aborts BEFORE its
+            # DB transaction (fail-fast: absence over wrongness). run_all's
+            # per-AMC isolation keeps the other AMCs running.
+            excel_path.unlink(missing_ok=True)
+            log.error(
+                "holdings.month_mismatch",
+                amc=amc_slug, scheme=scheme_name_printed,
+                expected=e.expected_ym, found=sorted(e.found_yms),
+                path=str(excel_path),
+            )
+            raise
         except Exception as e:  # noqa: BLE001
             log.error(
                 "holdings.parse_failed",

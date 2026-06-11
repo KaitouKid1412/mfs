@@ -22,6 +22,7 @@ import polars as pl
 
 from mfs import paths
 from mfs.config import get_pipeline_config
+from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.errors import IngestError
 from mfs.io import http
@@ -244,7 +245,11 @@ def ingest_backfill(
     for from_d, to_d in iter_windows(start, end, cfg.ingest.amfi_nav.bulk_window_days):
         window_id = f"{from_d.isoformat()}_{to_d.isoformat()}"
         raw_path = paths.amfi_history_raw(from_d.isoformat(), to_d.isoformat())
-        if raw_path.exists():
+        # Only trust the cache for windows that ended BEFORE today: a window
+        # ending today is always re-fetched, so a same-day retry after a sparse
+        # AMFI response doesn't replay stale bytes. Historical windows are
+        # immutable and stay cached.
+        if raw_path.exists() and to_d < date.today():
             content = raw_path.read_bytes()
             log.info("amfi_nav.backfill.cached", from_=from_d.isoformat(), to=to_d.isoformat())
         else:
@@ -293,6 +298,25 @@ def ingest_backfill(
 def ingest_since(since: date) -> tuple[int, list[int]]:
     """Incremental fetch from `since` to today using bulk-history windows."""
     return ingest_backfill(start=since, end=date.today())
+
+
+def ingest_incremental() -> tuple[int, list[int]]:
+    """Self-healing pipeline NAV stage: heal any gap since the last run, then today.
+
+    Reads the DB watermark MAX(nav_date) and bulk-fetches from it — INCLUSIVE,
+    so a partial last day (e.g. a snapshot taken before that evening's NAVAll)
+    is re-fetched and repaired — then layers today's NAVAll snapshot on top
+    (the bulk endpoint may not yet include today's NAVs at run time).
+
+    Raises IngestError on an empty nav_daily: incremental has no watermark to
+    heal from, so a cold DB needs the explicit full backfill.
+    """
+    latest = q.latest_dates()["nav_latest"]
+    if latest is None:
+        raise IngestError("nav_daily empty - run mfs ingest navs --backfill")
+    n1, y1 = ingest_since(latest)
+    n2, y2 = ingest_today()
+    return n1 + n2, sorted(set(y1) | set(y2))
 
 
 def ingest_yesterday_and_today() -> tuple[int, list[int]]:
