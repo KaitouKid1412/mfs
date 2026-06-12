@@ -425,3 +425,56 @@ def test_sync_mass_deactivation_halts_before_any_write(fake_db):
         writers.sync_scheme_master(_snapshot_df(["1", "2"]))
     assert fake_db.upserts == []
     assert fake_db.updates() == []
+
+
+# ---------------------------------------------------------------------------
+# D5: benchmarks.csv loading + the 2026-06 Value/Energy remap
+# ---------------------------------------------------------------------------
+
+
+def test_benchmark_map_loads_with_comment_rows():
+    """load_benchmark_map must skip '#' comment rows (D5 keeps a dated remap
+    audit trail in configs/benchmarks.csv) and parse every mapping row."""
+    from mfs.master.benchmark_map import load_benchmark_map
+
+    load_benchmark_map.cache_clear()
+    bm = load_benchmark_map()
+    assert bm.columns[:2] == ["canonical_category", "benchmark_ticker"]
+    assert not bm["canonical_category"].str.starts_with("#").any()
+    assert bm.height >= 27  # one row per rankable category
+
+
+def test_benchmark_map_d5_remap():
+    """D5 (evidence: docs/audit/benchmark_refit_2026-06.md): Value regresses
+    against NIFTY 500 TRI (refit median R-sq 0.897 vs 0.739 on the old factor
+    index); Energy against NIFTY Infrastructure TRI (0.812 vs 0.648)."""
+    from mfs.master.benchmark_map import benchmark_for, load_benchmark_map
+
+    load_benchmark_map.cache_clear()
+    assert benchmark_for("Value") == "NIFTY 500 TRI"
+    assert benchmark_for("Energy") == "NIFTY Infrastructure TRI"
+
+
+def test_benchmark_map_tickers_all_ingestable():
+    """Every mapped ticker must be fetchable: either an NSE equity TRI in
+    NSE_TRI_MAP or a synthesized hybrid — a remap to an unknown ticker would
+    silently produce an empty benchmark series."""
+    from mfs.ingest.benchmarks import NSE_TRI_MAP
+    from mfs.ingest.synthetic_hybrid import SYNTHETIC_BENCHMARK_TICKERS
+    from mfs.master.benchmark_map import load_benchmark_map
+
+    load_benchmark_map.cache_clear()
+    bm = load_benchmark_map()
+    known = set(NSE_TRI_MAP) | set(SYNTHETIC_BENCHMARK_TICKERS)
+    unknown = set(bm["benchmark_ticker"].to_list()) - known
+    assert unknown == set()
+
+
+def test_nifty_commodities_in_ingest_map():
+    """D5: NIFTY Commodities TRI joins the NSE ingest map so the Energy refit
+    can be re-run against it once the operator's network ingest lands."""
+    from mfs.ingest.benchmarks import NSE_TRI_MAP
+
+    assert NSE_TRI_MAP["NIFTY Commodities TRI"] == (
+        "NIFTY COMMODITIES", "Nifty Commodities",
+    )

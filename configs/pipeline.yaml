@@ -103,6 +103,15 @@ filters:
   r_squared_band: [0.40, 1.00]   # upper bound 1.00 keeps index-hugging funds visible
   beta_band: [0.30, 1.70]        # generic band (replaced the per-category bands)
 
+# D10 — ret_median/ret_p25 redundancy (deliberately ACCEPTED for now):
+# ret_median/ret_p25 within-category corr ~0.92-0.97 (audit 2026-06-10), so
+# the four return weights below act as two ~0.25 blocks (3y block = median
+# 0.15 + p25 0.10; 5y block likewise) and the total trailing-performance
+# load is ~0.75 (returns 0.50 + alpha 0.25). The nominal 0.15/0.10 splits
+# are false precision, but collapsing them would reorder every category
+# without validation — the collapse decision is deferred to the
+# tools/backtest_ic.py sensitivity variant p25_collapsed
+# (ret_3y_median 0.25 / ret_5y_median 0.25 / p25 weights 0).
 composite_weights_stage1:
   # Stage 1 — Performance & Consistency only. Positive weights sum to 1.00.
   # No Phase 2 metrics; no pro-rata redistribution — the D2 core-metric gate

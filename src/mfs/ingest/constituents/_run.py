@@ -141,6 +141,9 @@ def discover_tickers() -> list[str]:
         with open(bench_csv, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                # D5: benchmarks.csv carries '#'-prefixed comment rows.
+                if (row.get("canonical_category") or "").lstrip().startswith("#"):
+                    continue
                 t = (row.get("benchmark_ticker") or "").strip()
                 if t and t not in seen:
                     seen.add(t)

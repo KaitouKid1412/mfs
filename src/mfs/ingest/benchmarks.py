@@ -69,6 +69,12 @@ NSE_TRI_MAP: dict[str, tuple[str, str]] = {
     "NIFTY FMCG TRI":                ("NIFTY FMCG", "Nifty FMCG"),
     "NIFTY Auto TRI":                ("NIFTY AUTO", "Nifty Auto"),
     "NIFTY Energy TRI":              ("NIFTY ENERGY", "Nifty Energy"),
+    # D5 (2026-06-13): candidate benchmark for the Energy category — ingested
+    # so tools/benchmark_fit.py can evaluate it against the adopted NIFTY
+    # Infrastructure TRI mapping (refit could not score it pre-ingest).
+    # Names follow IndexMapping.json conventions; verify on first ingest via
+    # _resolve_names('Nifty Commodities') if the fetch returns 0 rows.
+    "NIFTY Commodities TRI":         ("NIFTY COMMODITIES", "Nifty Commodities"),
     "NIFTY Infrastructure TRI":      ("NIFTY INFRA", "Nifty Infrastructure"),
     "NIFTY PSE TRI":                 ("NIFTY PSE", "Nifty PSE"),
     "NIFTY India Consumption TRI":   ("NIFTY CONSUMPTION", "Nifty India Consumption"),

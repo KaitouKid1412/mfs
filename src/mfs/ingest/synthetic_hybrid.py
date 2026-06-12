@@ -23,6 +23,28 @@ the daily rebalancing drag. Expected tracking error: ~50-100 bp/year vs the
 official NSE-published series. We persist these as standard benchmark_daily
 partitions and tag them with `is_synthetic=True` so consumers can disclose the
 methodology if needed.
+
+ONE-SIDED BIAS — HYBRID ALPHA IS OVERSTATED (D6, PATH B decision 2026-06-13,
+see docs/audit/hybrid_debt_sleeve_spike.md):
+
+The debt sleeve here compounds the 91-day T-BILL rate, not a real bond index.
+The official NSE hybrids use the NIFTY Composite Debt Index (long-duration
+credit + G-sec), which has historically returned ~1-2%/yr MORE than T-bills
+(term + credit premium). Substituting T-bills therefore makes the synthetic
+benchmark systematically EASIER to beat — a one-sided, not symmetric, error:
+
+  * ~35-140 bp/yr benchmark-too-easy at the 35-70% debt weights used above
+    (35% sleeve × 1-2% premium ≈ 35-70 bp; 70% sleeve ≈ 70-140 bp).
+  * Measured beat rates for hybrid categories (Balanced Advantage 100%,
+    Aggressive Hybrid 96.7%, Equity Savings 82.6%) are inflated by this bias;
+    hybrid fund alpha/IR vs these tickers reads correspondingly high.
+
+NIFTY's fixed-income index values are not exposed via the public equity TRI
+endpoint (Backpage.aspx/getTotalReturnIndexString) — until a scrapeable
+fixed-income source passes the no-manual-entry invariant, this bias stands
+and is DISCLOSED downstream: rank stage2/stage3 report rows and the D7
+passive-alternative table carry `benchmark_is_synthetic=true` for these
+tickers (see SYNTHETIC_BENCHMARK_TICKERS).
 """
 
 from __future__ import annotations
@@ -44,6 +66,14 @@ SYNTHETIC_HYBRID_SPECS: list[tuple[str, float, float]] = [
     ("NIFTY 50 Hybrid 50:50 TRI", 0.50, 0.50),
     ("NIFTY Equity Savings TRI", 0.30, 0.70),
 ]
+
+# D6: every benchmark ticker synthesized here (vs fetched from NSE). The rank
+# layer joins `benchmark_is_synthetic` onto stage2/stage3 report rows and the
+# passive-alternative table from this set, so the T-bill-sleeve bias above is
+# disclosed wherever hybrid alpha is shown.
+SYNTHETIC_BENCHMARK_TICKERS: frozenset[str] = frozenset(
+    t for t, _, _ in SYNTHETIC_HYBRID_SPECS
+)
 
 BASE_INDEX_VALUE = 1000.0
 

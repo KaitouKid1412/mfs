@@ -1,4 +1,5 @@
 canonical_category,benchmark_ticker,composite_recipe
+# 2026-06-13 D5 remap — Value: NIFTY 500 Value 50 TRI -> NIFTY 500 TRI (refit median R² 0.897 vs 0.739; beta 0.95 vs 0.58). Energy: NIFTY Energy TRI -> NIFTY Infrastructure TRI (0.812 vs 0.648; re-run refit vs NIFTY Commodities TRI once ingested). Alpha/IR history for these two categories has a discontinuity at the first post-remap run. Evidence: docs/audit/benchmark_refit_2026-06.md
 Large Cap,NIFTY 100 TRI,
 Large & Mid Cap,NIFTY LargeMidcap 250 TRI,
 Mid Cap,NIFTY Midcap 150 TRI,
@@ -7,7 +8,7 @@ Multi Cap,NIFTY 500 Multicap 50:25:25 TRI,
 Flexi Cap,NIFTY 500 TRI,
 Focused,NIFTY 500 TRI,
 ELSS,NIFTY 500 TRI,
-Value,NIFTY 500 Value 50 TRI,
+Value,NIFTY 500 TRI,
 Contra,NIFTY 500 TRI,
 Dividend Yield,NIFTY Dividend Opportunities 50 TRI,
 Aggressive Hybrid,NIFTY 50 Hybrid 65:35 TRI,NIFTY 50 TRI:65|NIFTY Composite Debt Index:35
@@ -18,7 +19,7 @@ IT,NIFTY IT TRI,
 Pharma & Healthcare,NIFTY Healthcare TRI,
 FMCG,NIFTY FMCG TRI,
 Auto,NIFTY Auto TRI,
-Energy,NIFTY Energy TRI,
+Energy,NIFTY Infrastructure TRI,
 Infrastructure,NIFTY Infrastructure TRI,
 PSU,NIFTY PSE TRI,
 Consumption,NIFTY India Consumption TRI,

@@ -14,6 +14,7 @@ import polars as pl
 from mfs import paths
 from mfs.db import queries as q
 from mfs.db import writers as w
+from mfs.ingest.synthetic_hybrid import SYNTHETIC_BENCHMARK_TICKERS
 from mfs.rank.filters import apply_hard_filters, split_core_complete
 from mfs.rank.score import STAGE1_WEIGHT_TO_COL, composite_score_stage1
 from mfs.rank.zscore import zscore_within_category
@@ -77,6 +78,65 @@ EXCLUDED_OUTPUT_COLS = [
     "exclusion_reason",
     "missing_core_metrics",
 ]
+
+# D4: a category whose median rolling-3y R² vs its mapped benchmark falls
+# below this is a benchmark MISFIT — its funds' alpha is mostly unexplained
+# residual, not skill. Flagged (never filtered) so alpha in those categories
+# reads as low-confidence. Single source of truth: tools/benchmark_fit.py
+# imports this for its report classification.
+LOW_CONFIDENCE_R2_THRESHOLD = 0.80
+
+
+def category_benchmark_fit_flags(
+    metrics: pl.DataFrame, threshold: float = LOW_CONFIDENCE_R2_THRESHOLD,
+) -> pl.DataFrame:
+    """Per-category ``benchmark_fit_low_confidence`` flag (D4).
+
+    True when the category's median ``r_squared_3y`` across the passed
+    metrics frame (the full computed_metrics partition at the run's as_of)
+    is below ``threshold``. Null when the median itself is null (no
+    regressable funds). Returns columns ``canonical_category``,
+    ``benchmark_fit_low_confidence``.
+    """
+    schema = {
+        "canonical_category": pl.Utf8,
+        "benchmark_fit_low_confidence": pl.Boolean,
+    }
+    if (
+        metrics.is_empty()
+        or "r_squared_3y" not in metrics.columns
+        or "canonical_category" not in metrics.columns
+    ):
+        return pl.DataFrame(schema=schema)
+    return (
+        metrics.filter(pl.col("canonical_category").is_not_null())
+        .group_by("canonical_category")
+        .agg(pl.col("r_squared_3y").median().alias("_median_r2"))
+        .with_columns(
+            (pl.col("_median_r2") < threshold).alias("benchmark_fit_low_confidence")
+        )
+        .select(["canonical_category", "benchmark_fit_low_confidence"])
+    )
+
+
+def with_benchmark_is_synthetic(df: pl.DataFrame) -> pl.DataFrame:
+    """D6 (PATH B) disclosure column: ``benchmark_is_synthetic`` is True when
+    the row's ``benchmark_ticker`` is one of the synthesized hybrid TRIs.
+
+    Those benchmarks compound the 91-day T-bill as their debt sleeve, which
+    is systematically easier to beat than the real NIFTY Composite Debt
+    Index the official hybrids use (~35-140bp/yr one-sided bias at 35-70%
+    debt weight) — hybrid alpha/beat-rates are overstated, so every report
+    row carries the disclosure (see ingest/synthetic_hybrid.py docstring).
+    """
+    if df.is_empty() or "benchmark_ticker" not in df.columns:
+        return df
+    return df.with_columns(
+        pl.col("benchmark_ticker")
+        .is_in(list(SYNTHETIC_BENCHMARK_TICKERS))
+        .alias("benchmark_is_synthetic")
+    )
+
 
 # D2 run history: flat z-score columns mirrored from the stage CSVs into the
 # rank_history table. The first eight are Stage 1's full-universe z-scores
@@ -647,6 +707,7 @@ def rank_deep(
     (see ``writers.persist_rank_history``).
     """
     from mfs.compute import orchestrator
+    from mfs.rank import passive
     from mfs.rank import stage2 as stage2_mod
     from mfs.rank import stage3 as stage3_mod
 
@@ -683,6 +744,19 @@ def rank_deep(
         }
     else:
         candidates_with_phase2 = _join_scheme_master(candidates_with_phase2)
+        # D4: per-category benchmark-fit confidence, computed over the FULL
+        # computed_metrics partition (same statistic tools/benchmark_fit.py
+        # reports) — alpha in a misfit category (median R² < 0.80) must read
+        # as low-confidence in every stage2/stage3 report row.
+        fit_flags = category_benchmark_fit_flags(q.computed_metrics_at(as_of))
+        if not fit_flags.is_empty():
+            candidates_with_phase2 = candidates_with_phase2.join(
+                fit_flags, on="canonical_category", how="left",
+            )
+        # D6 (PATH B disclosure): hybrid categories are ranked against
+        # SYNTHESIZED benchmarks (T-bill debt sleeve — alpha overstated);
+        # carry the disclosure into every stage2/stage3 report row.
+        candidates_with_phase2 = with_benchmark_is_synthetic(candidates_with_phase2)
         # Carry source_amc from holdings if present in the original Stage 1
         # scored frame (Stage 2's coverage report uses it).
         if "source_amc" in scored_stage1.columns:
@@ -721,13 +795,35 @@ def rank_deep(
     except Exception as e:  # noqa: BLE001
         log.warning("rank.active_share_banner_failed", err=str(e))
 
+    # D7: passive-alternative verdict per category — benchmark TRI rolling
+    # 3y/5y median CAGR vs the category median fund, with the 'index wins'
+    # marker. Built before Stage 3 so every pick's margin vs the investable
+    # index (pick_minus_benchmark_3y) rides into the stage-3 outputs and
+    # mf_report. Best-effort: a passive-table failure must not break ranking.
+    passive_table = pl.DataFrame()
+    try:
+        passive_table = passive.build_table(as_of)
+    except Exception as e:  # noqa: BLE001
+        log.warning("rank.passive_alternative_failed", err=str(e))
+    survivors_stage3 = stage2_result["survivors"]
+    if not passive_table.is_empty() and not survivors_stage3.is_empty():
+        survivors_stage3 = passive.attach_pick_excess(
+            survivors_stage3, passive_table,
+        )
+
     # Stage 3.
     stage3_result = stage3_mod.run(
-        stage2_result["survivors"],
+        survivors_stage3,
         _latest_holdings_loader(),
         out_dir,
         threshold_pct=overlap_threshold_pct,
     )
+
+    passive_file = ""
+    if not passive_table.is_empty():
+        passive_file = str(
+            passive.write_csv(passive_table, out_dir / "passive_alternative.csv")
+        )
 
     # D2 point-in-time history: persist this run's stage 1/2/3 outcomes in
     # one batch; same-as_of re-runs replace the partition.
@@ -757,6 +853,7 @@ def rank_deep(
         "out_dir": str(out_dir),
         "n_excluded": excluded_stage1.height,
         "excluded_file": str(excluded_file),
+        "passive_alternative_file": passive_file,
         "stage1": {cat: str(p) for cat, p in stage1_paths.items()},
         "stage2": {
             "dir": stage2_result["stage2_dir"],
