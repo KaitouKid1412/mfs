@@ -272,7 +272,12 @@ def run(
             )
 
             # ----- Phase 3.C: per-AMC monthly portfolio Excels (HDFC + SBI + Nippon) -----
-            _stage("ingest holdings (all registered AMCs)", lambda: holdings.run_all())
+            # force=full (B9): --full re-downloads the current data month's
+            # ~640 Excels, re-parses, and re-writes (shrinkage guard overridden).
+            _stage(
+                "ingest holdings (all registered AMCs)",
+                lambda: holdings.run_all(ym=None, force=full),
+            )
 
             # ----- Coverage Gate B (ADVISORY): holdings / PTR / AAUM /
             # constituents / stock-ADV. This is the ONLY coverage net for these

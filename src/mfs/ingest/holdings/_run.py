@@ -19,6 +19,7 @@ from pathlib import Path
 
 import polars as pl
 
+from mfs import paths
 from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.errors import IngestError, StatementDateMismatchError
@@ -153,11 +154,16 @@ def run_for_amc(
 ) -> dict:
     """Run one AMC's holdings adapter end-to-end.
 
-    ``force=True`` (a ``--full`` pipeline run) overrides the
+    ``force=True`` (a ``--full`` pipeline run) carries the unified force
+    semantics (B9): re-download AND re-parse AND re-write. It deletes this
+    data month's cached per-scheme Excels before ``fetch_excel`` (which
+    otherwise returns a cached file by mere existence, making a corrected/
+    re-published artifact unreachable), and overrides the
     partition-shrinkage guard (B13): a fresh parse yielding fewer distinct
     schemes than the DB already holds for (source_amc, month) is normally
     refused so a partial re-run can't silently delete previously-good
-    schemes; force replaces the partition anyway, loudly.
+    schemes; force replaces the partition anyway, loudly. Deletion is
+    scoped to ``ym`` only — historical months are never re-fetched.
     """
     adapter = get_adapter(amc_slug)
     ym = ym or _default_data_month()
@@ -235,6 +241,14 @@ def run_for_amc(
         # Download + parse Excel only for matched schemes (saves bandwidth on
         # ETFs/FoFs that aren't ranked).
         excel_filename = f"{scheme_name_printed}.xlsx"
+        if force:
+            # B9: --full re-downloads this data month's artifacts — evict the
+            # canonical cached Excel so fetch_excel's exists() check can't
+            # serve stale bytes. unlink is a no-op for adapters whose bespoke
+            # fetch_excel caches elsewhere.
+            paths.holdings_excel_raw(amc_slug, ym, excel_filename).unlink(
+                missing_ok=True
+            )
         try:
             excel_path = adapter.fetch_excel(url, excel_filename, ym)
         except Exception as e:  # noqa: BLE001
@@ -410,10 +424,12 @@ def run_for_amc(
 def run_all(ym: str | None = None, force: bool = False) -> dict[str, dict]:
     """Run every registered holdings adapter with per-AMC fault isolation.
 
-    ``force`` is forwarded to each AMC's run and overrides the
-    partition-shrinkage guard (see ``run_for_amc``); wiring it to the
-    pipeline's ``--full`` flag is an orchestrator (cli.py) change owned by
-    the C-series force-semantics task.
+    ``force`` (wired to the pipeline's ``--full`` flag) is forwarded to each
+    AMC's run: re-download this data month's Excels, re-parse, and re-write
+    overriding the partition-shrinkage guard (see ``run_for_amc``). Cost of
+    force: ~640 holdings Excels re-fetched (~minutes serially; hours if an
+    AMC's month probe is pathological — kotak's negative cache, B11, bounds
+    that).
 
     Holdings are an advisory signal: one AMC's failure (a 404 in disclosure
     discovery, a changed page layout, a parse error) is caught, recorded, and

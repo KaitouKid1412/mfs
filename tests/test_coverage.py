@@ -217,6 +217,53 @@ def test_run_gate_advisory_never_raises(monkeypatch):
     assert len(report.advisory_gaps) == len(report.results)
 
 
+# --- B15: contract-query failure → status=ERROR, never silent EMPTY ok=True --
+
+def _patch_evaluate_raises(monkeypatch):
+    def _boom(contract, as_of, cfg):
+        raise RuntimeError("relation does not exist (broken gate SQL)")
+
+    monkeypatch.setattr(cov, "evaluate", _boom)
+    monkeypatch.setattr(
+        cov, "get_pipeline_config",
+        lambda: type("P", (), {"freshness": object()})(),
+    )
+
+
+def test_run_gate_query_error_blocking_is_error_and_fails_gate(monkeypatch):
+    """An evaluation exception on a BLOCKING source is status=ERROR with
+    ok=False — the gate fails instead of swallowing the broken query."""
+    _patch_evaluate_raises(monkeypatch)
+    report = cov.run_gate("A", as_of=date(2026, 6, 8), raise_on_block=False)
+    assert report.results, "gate A must still produce one row per contract"
+    assert all(r.status == cov.ERROR for r in report.results)
+    assert all(not r.ok for r in report.results)
+    assert len(report.blocking_failures) == len(report.results)
+    with pytest.raises(CoverageError):
+        report.raise_if_blocking()
+    rendered = cov.render(report)
+    assert "[ERROR]" in rendered
+    assert "[EMPTY]" not in rendered
+    assert "coverage query failed" in rendered
+
+
+def test_run_gate_query_error_advisory_is_loud_but_never_halts(monkeypatch):
+    """Advisory sources stay ok=True (advisory never halts) but the ERROR is
+    rendered loudly — never a silent EMPTY that reads as a data gap."""
+    _patch_evaluate_raises(monkeypatch)
+    report = cov.run_gate("B", as_of=date(2026, 6, 8), raise_on_block=True)
+    assert report.blocking_failures == []          # never halts the run
+    assert all(r.status == cov.ERROR for r in report.results)
+    assert all(r.ok for r in report.results)
+    # ERROR rows surface as advisory gaps (status != OK), so the end-of-run
+    # summary lists them too.
+    assert len(report.advisory_gaps) == len(report.results)
+    rendered = cov.render(report)
+    assert "[ERROR]" in rendered
+    assert "GATE EVALUATION ERROR" in rendered
+    assert "NOT a data gap" in rendered
+
+
 # --- interior-gap contract (nav_daily only) ---------------------------------
 
 class _NavCfg:

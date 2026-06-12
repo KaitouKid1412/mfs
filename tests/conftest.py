@@ -53,3 +53,19 @@ def pytest_collection_modifyitems(config, items):
             cache[name] = _module_uses_local_data(module)
         if cache[name]:
             item.add_marker(pytest.mark.local_data)
+
+
+# ---------------------------------------------------------------------------
+# C7: mfs.compute.alignment lru-caches the invariant series (calendar /
+# benchmark / risk-free) for the life of the process. Tests monkeypatch the
+# underlying mfs.db.queries functions, so a cached frame from one test would
+# leak into the next. Clear before every test; cheap no-op when the module
+# was never imported.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_alignment_caches():
+    mod = sys.modules.get("mfs.compute.alignment")
+    if mod is not None:
+        mod.clear_caches()
+    yield

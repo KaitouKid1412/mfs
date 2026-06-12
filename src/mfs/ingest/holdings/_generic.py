@@ -568,6 +568,13 @@ class GenericHoldingsAdapter(HoldingsAdapter):
     require_statement_date: bool = False
 
     def fetch_excel(self, url: str, scheme_filename: str, ym: str) -> Path:
+        """Download one scheme's portfolio Excel; return the local Path.
+
+        Re-uses an existing cached file by mere existence; a forced run
+        (``--full`` pipeline / ``--force`` CLI) deletes the data month's
+        cached file in ``holdings._run.run_for_amc`` BEFORE calling this,
+        so force re-downloads (B9).
+        """
         out = paths.holdings_excel_raw(self.amc_slug, ym, scheme_filename)
         if out.exists():
             return out

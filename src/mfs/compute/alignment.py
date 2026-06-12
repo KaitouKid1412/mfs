@@ -23,9 +23,23 @@ row too. Downstream `drop_nulls()` calls (sortino, capture, info_ratio, alpha)
 do NOT drop NaN/inf, so a single poisoned row would NaN every rolling metric.
 `align_scheme` therefore nulls out non-finite log-return values — counted and
 logged — so they fall out with the existing null-dropping instead.
+
+Invariant-series caching (C7): the master calendar, each benchmark's close
+series, and the risk-free series are identical for every scheme within one
+compute run, yet were re-queried per scheme (~665×3 ≈ 2,000 redundant
+Postgres queries per Phase-1 run). They are now ``lru_cache``d for the life
+of the process; ``clear_caches()`` is called at the top of
+``orchestrator.run_phase1`` / ``run_phase2`` so a pipeline process that
+ingested fresh data earlier in the same run never serves pre-ingest frames.
+Callers must NOT mutate the returned frames (``align_scheme`` only filters/
+joins, which return new frames). Anything calling ``align_scheme`` outside
+those entry points (notebooks, audit-scheme CLI) may see cached series until
+``clear_caches()`` is invoked.
 """
 
 from __future__ import annotations
+
+from functools import lru_cache
 
 import polars as pl
 
@@ -35,18 +49,33 @@ from mfs.utils.logging import get_logger
 log = get_logger(__name__)
 
 
+@lru_cache(maxsize=None)
 def master_calendar() -> pl.DataFrame:
     """Return the canonical trading-date series (sorted dates from NIFTY 50 TRI)."""
     return q.master_calendar()
 
 
+@lru_cache(maxsize=None)
 def _benchmark_series(ticker: str) -> pl.DataFrame:
     """Return columns: date, close for one ticker."""
     return q.benchmark_series(ticker)
 
 
+@lru_cache(maxsize=None)
 def _risk_free_series() -> pl.DataFrame:
     return q.risk_free_series()
+
+
+def clear_caches() -> None:
+    """Drop the cached invariant series (calendar / benchmark / risk-free).
+
+    Called at the top of every compute run (``orchestrator.run_phase1`` /
+    ``run_phase2``) so frames queried before an ingest in the same process
+    can never leak into a post-ingest compute.
+    """
+    master_calendar.cache_clear()
+    _benchmark_series.cache_clear()
+    _risk_free_series.cache_clear()
 
 
 def _nav_series(scheme_code: str) -> pl.DataFrame:

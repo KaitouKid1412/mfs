@@ -225,6 +225,12 @@ def ingest_managers(
     list_adapters: bool = typer.Option(
         False, "--list", help="List registered AMC adapters and exit."
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Unified force semantics (the pipeline's --full): delete the data "
+        "month's cached factsheet and re-download, re-parse even if unchanged, "
+        "and re-write (overrides the partition-shrinkage guard, loudly).",
+    ),
 ):
     """Ingest holdings + PTR signals from AMC factsheet PDFs.
 
@@ -251,13 +257,14 @@ def ingest_managers(
     if amc:
         result = managers.run_for_amc(
             amc, ym=ym, pdf_path=Path(pdf_path) if pdf_path else None,
+            force=force,
         )
         typer.echo(
             f"{amc}: holdings={result['rows_written_holdings']} "
             f"ptr={result['rows_written_ptr']}"
         )
     else:
-        results = managers.run_all(ym=ym)
+        results = managers.run_all(ym=ym, force=force)
         for slug, r in results.items():
             typer.echo(
                 f"{slug}: holdings={r['rows_written_holdings']} "
@@ -271,6 +278,12 @@ def ingest_holdings(
     ym: str | None = typer.Option(None, help="Data month YYYY-MM; default = last month."),
     list_adapters: bool = typer.Option(
         False, "--list", help="List registered holdings adapters and exit."
+    ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Unified force semantics (the pipeline's --full): delete the data "
+        "month's cached per-scheme Excels and re-download, re-parse, and "
+        "re-write (overrides the partition-shrinkage guard, loudly).",
     ),
 ):
     """Ingest per-scheme monthly portfolio Excels with ISINs (Phase 3.C).
@@ -289,7 +302,7 @@ def ingest_holdings(
         return
 
     if amc:
-        result = holdings.run_for_amc(amc, ym=ym)
+        result = holdings.run_for_amc(amc, ym=ym, force=force)
         typer.echo(
             f"{amc}: rows_written={result['rows_written']} "
             f"schemes_discovered={result['n_schemes_discovered']} "
@@ -302,7 +315,7 @@ def ingest_holdings(
             for name in result["unmatched_schemes"]:
                 typer.echo(f"  - {name!r}")
     else:
-        results = holdings.run_all(ym=ym)
+        results = holdings.run_all(ym=ym, force=force)
         for slug, r in results.items():
             typer.echo(
                 f"{slug}: rows_written={r['rows_written']} "
@@ -875,9 +888,13 @@ def pipeline_run_all(
     full: bool = typer.Option(
         False, "--full",
         help="Force a from-scratch re-ingest: benchmarks re-fetch full history, "
-        "bhavcopy re-walks the full window, factsheets re-parse even if "
-        "unchanged. Default is incremental (fetch only the gap; the coverage "
-        "gate then verifies the gap closed).",
+        "bhavcopy re-walks the full window, and the current data month's "
+        "factsheets + per-scheme holdings Excels are RE-DOWNLOADED (cached "
+        "copies deleted first), re-parsed even if unchanged, and re-written "
+        "(partition-shrinkage guard overridden, loudly). Historical months "
+        "are never re-fetched. Cost: ~640 holdings Excels + ~41 factsheets "
+        "(~minutes serially) — run --full off-peak. Default is incremental "
+        "(fetch only the gap; the coverage gate then verifies the gap closed).",
     ),
 ):
     """Run the full pipeline end-to-end: ingest → build → compute → rank-deep.

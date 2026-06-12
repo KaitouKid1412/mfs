@@ -195,3 +195,196 @@ def test_window_ending_before_today_uses_cache(monkeypatch, tmp_path):
     fetched = _patch_nav_window(monkeypatch, tmp_path, "unused")
     amfi_nav.ingest_backfill(start=start, end=end)
     assert fetched == []                 # historical window served from cache
+
+
+# ---------------------------------------------------------------------------
+# B9: --full force semantics — re-download the current data month's artifacts.
+#
+# fetch()/fetch_excel() return cached files by mere existence, so a corrected
+# or re-published artifact was unreachable without manual deletion. With
+# force=True the orchestrators delete the data month's canonical cached path
+# BEFORE fetch, so the (monkeypatched) downloader runs and the NEW bytes are
+# parsed; force=False must never call the downloader for a cached artifact.
+# ---------------------------------------------------------------------------
+
+from contextlib import contextmanager  # noqa: E402
+
+import openpyxl  # noqa: E402
+import polars as pl  # noqa: E402
+
+import mfs.db.connection as dbconn  # noqa: E402
+import mfs.io.http as mfs_http  # noqa: E402
+import mfs.paths as mfs_paths  # noqa: E402
+from mfs.ingest.holdings import _generic as holdings_generic  # noqa: E402
+from mfs.ingest.holdings import _run as holdings_run  # noqa: E402
+from mfs.ingest.holdings._generic import GenericHoldingsAdapter  # noqa: E402
+from mfs.ingest.managers import _run as managers_run  # noqa: E402
+from mfs.ingest.managers._base import ManagerAdapter  # noqa: E402
+from mfs.schemas import ParsedPtrRecord  # noqa: E402
+
+_YM = "2026-05"
+
+
+class _ForceFakeConn:
+    """Minimal connection: scripts every scalar query as 'nothing prior'."""
+
+    def execute(self, sql, params=None):
+        class _Cur:
+            def fetchone(self):
+                return (0,) if "count(distinct" in " ".join(sql.split()).lower() else None
+
+        return _Cur()
+
+
+@contextmanager
+def _force_fake_connect(autocommit=False):
+    yield _ForceFakeConn()
+
+
+def _force_sm(amc: str) -> pl.DataFrame:
+    return pl.DataFrame({
+        "scheme_code": ["X01"],
+        "scheme_name": ["Force Alpha Fund"],
+        "amc_code": [amc],
+        "plan_type": ["DIRECT"],
+        "option_type": ["GROWTH"],
+        "is_active": [True],
+        "canonical_category": ["Flexi Cap"],
+    })
+
+
+# --- managers (factsheet PDF) path ------------------------------------------
+
+
+class _ForceMgrAdapter(ManagerAdapter):
+    """Uses the INHERITED fetch() — the cached-by-existence path under test."""
+
+    amc_slug = "forceamc"
+    source_label = "Force AMC"
+
+    def build_url(self, ym):
+        return f"http://x.test/{ym}.pdf"
+
+    def parse_ptr(self, pdf_path, ym):
+        # "Parsed content reflects the bytes on disk": the artifact body IS
+        # the PTR value, so the assertion sees exactly which bytes won.
+        val = float(pdf_path.read_text().split("=")[1])
+        return [ParsedPtrRecord(
+            scheme_name_printed="Force Alpha Fund", ptr=val,
+            source_amc=self.amc_slug,
+        )]
+
+
+def _setup_managers_force(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        mfs_paths, "factsheet_raw",
+        lambda amc_slug, ym: tmp_path / "factsheets" / amc_slug / f"{ym}.pdf",
+    )
+    downloads: list[str] = []
+
+    def fake_download(url, out, expect=None):
+        downloads.append(url)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("PTR=2.0")  # the NEW (re-published) bytes
+        return out
+
+    monkeypatch.setattr(mfs_http, "download_to", fake_download)
+    monkeypatch.setattr(managers_run, "get_adapter", lambda slug: _ForceMgrAdapter())
+    monkeypatch.setattr(managers_run.q, "scheme_master", lambda **kw: _force_sm("forceamc"))
+    monkeypatch.setattr(managers_run.q, "has_factsheet_rows", lambda *a, **k: False)
+    written: list[pl.DataFrame] = []
+    monkeypatch.setattr(
+        managers_run.w, "upsert_portfolio_turnover",
+        lambda df, conn=None: written.append(df) or len(df),
+    )
+    monkeypatch.setattr(dbconn, "connect", _force_fake_connect)
+    # Pre-seed the month's cached artifact with the OLD bytes.
+    cached = tmp_path / "factsheets" / "forceamc" / f"{_YM}.pdf"
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_text("PTR=0.5")
+    return downloads, written, cached
+
+
+def test_managers_force_true_redownloads_and_parses_new_bytes(monkeypatch, tmp_path):
+    downloads, written, cached = _setup_managers_force(monkeypatch, tmp_path)
+    res = managers_run.run_for_amc("forceamc", ym=_YM, force=True)
+    assert downloads == [f"http://x.test/{_YM}.pdf"]   # downloader was called
+    assert res["rows_written_ptr"] == 1
+    assert written[0]["ptr"].to_list() == [2.0]        # NEW bytes parsed in
+    assert cached.read_text() == "PTR=2.0"             # cache replaced
+
+
+def test_managers_force_false_serves_cache_without_download(monkeypatch, tmp_path):
+    downloads, written, cached = _setup_managers_force(monkeypatch, tmp_path)
+    res = managers_run.run_for_amc("forceamc", ym=_YM, force=False)
+    assert downloads == []                             # downloader never called
+    assert written[0]["ptr"].to_list() == [0.5]        # OLD cached bytes parsed
+    assert cached.read_text() == "PTR=0.5"
+
+
+# --- holdings (per-scheme Excel) path ----------------------------------------
+
+
+class _ForceHoldAdapter(GenericHoldingsAdapter):
+    """Uses the INHERITED fetch_excel() — the cached-by-existence path."""
+
+    amc_slug = "forceh"
+    source_label = "Force Holdings"
+
+    def discover_scheme_urls(self, ym):
+        return {"Force Alpha Fund": "http://x.test/a.xlsx"}
+
+
+def _write_portfolio_xlsx(path, prefix: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["ISIN", "Name of the Instrument", "Industry", "% to NAV"])
+    for i in range(6):
+        ws.append([f"INE{i:03d}B0104{i % 10}", f"{prefix} {i}", "X", 16.5])
+    wb.save(path)
+
+
+def _setup_holdings_force(monkeypatch, tmp_path):
+    def fake_excel_raw(amc_slug, ym, scheme_filename):
+        return tmp_path / "holdings" / amc_slug / ym / scheme_filename.replace("/", "_")
+
+    monkeypatch.setattr(mfs_paths, "holdings_excel_raw", fake_excel_raw)
+    downloads: list[str] = []
+
+    def fake_download(url, out, expect=None):
+        downloads.append(url)
+        _write_portfolio_xlsx(out, "NewCo")           # the NEW bytes
+        return out
+
+    monkeypatch.setattr(holdings_generic, "download_to", fake_download)
+    monkeypatch.setattr(holdings_run, "get_adapter", lambda slug: _ForceHoldAdapter())
+    monkeypatch.setattr(holdings_run.q, "scheme_master", lambda **kw: _force_sm("forceh"))
+    written: list[pl.DataFrame] = []
+    monkeypatch.setattr(
+        holdings_run.w, "upsert_holdings",
+        lambda df, conn=None: written.append(df) or len(df),
+    )
+    monkeypatch.setattr(dbconn, "connect", _force_fake_connect)
+    # Pre-seed the month's cached Excel with the OLD bytes.
+    cached = fake_excel_raw("forceh", _YM, "Force Alpha Fund.xlsx")
+    _write_portfolio_xlsx(cached, "OldCo")
+    return downloads, written
+
+
+def test_holdings_force_true_redownloads_and_parses_new_bytes(monkeypatch, tmp_path):
+    downloads, written = _setup_holdings_force(monkeypatch, tmp_path)
+    res = holdings_run.run_for_amc("forceh", ym=_YM, force=True)
+    assert downloads == ["http://x.test/a.xlsx"]       # downloader was called
+    assert res["rows_written"] == 6
+    names = written[0]["security_name"].to_list()
+    assert all(n.startswith("NewCo") for n in names)   # NEW bytes parsed in
+
+
+def test_holdings_force_false_serves_cache_without_download(monkeypatch, tmp_path):
+    downloads, written = _setup_holdings_force(monkeypatch, tmp_path)
+    res = holdings_run.run_for_amc("forceh", ym=_YM, force=False)
+    assert downloads == []                             # downloader never called
+    assert res["rows_written"] == 6
+    names = written[0]["security_name"].to_list()
+    assert all(n.startswith("OldCo") for n in names)   # cached bytes parsed

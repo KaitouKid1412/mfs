@@ -66,6 +66,11 @@ STALE = "STALE"
 SHORT_HISTORY = "SHORT_HISTORY"
 GAP = "GAP"
 INTERIOR_GAP = "INTERIOR_GAP"
+# B15: the contract evaluation itself failed (broken gate SQL / DB error) —
+# coverage is UNKNOWN, which must never masquerade as a legitimate data gap
+# (EMPTY) or pass silently. Blocking-grade sources fail the gate; advisory
+# sources render loudly.
+ERROR = "ERROR"
 
 # Catastrophic entity-coverage floor for BLOCKING sources: below this fraction
 # the ingest is considered broken (wrote almost nothing) rather than merely
@@ -478,11 +483,16 @@ def run_gate(gate: str, as_of: date | None = None, *, raise_on_block: bool = Tru
             report.results.append(evaluate(c, as_of, cfg))
         except Exception as e:  # noqa: BLE001 — a query failure is itself a coverage failure
             log.error("coverage.evaluate_failed", source=c.table, err=str(e))
+            # B15: status=ERROR, never EMPTY — broken gate SQL must be
+            # distinguishable from a legitimate data gap. ok=False halts
+            # blocking-grade sources via raise_if_blocking; advisory sources
+            # stay ok=True (advisory never halts) but render loudly via the
+            # != OK paths in render()/render_summary().
             report.results.append(CoverageResult(
                 source=c.table, label=c.label, cadence=c.cadence,
                 severity=c.severity, need_from=_need_from(c.need_back, as_of),
                 have_from=None, have_till=None, fresh_by=as_of, n_rows=0,
-                n_expected=None, n_present=None, status=EMPTY,
+                n_expected=None, n_present=None, status=ERROR,
                 ok=(c.severity != BLOCKING), remediation=c.remediation,
                 detail=f"coverage query failed: {e}",
             ))
@@ -521,6 +531,11 @@ def render(report: CoverageReport) -> str:
         )
         if r.status != OK:
             lines.append(f"    └ {r.detail}")
+            if r.status == ERROR:
+                lines.append(
+                    "      !! GATE EVALUATION ERROR — coverage UNKNOWN for "
+                    "this source (broken gate query, NOT a data gap)"
+                )
             if r.severity == ADVISORY:
                 lines.append(f"      fix: {r.remediation}")
     bf = report.blocking_failures

@@ -210,6 +210,10 @@ def run_phase1(
     a benchmark mapping. UPSERTs into ``computed_metrics`` with Phase 2
     columns left NULL.
     """
+    # C7: invariant series (calendar / benchmark closes / risk-free) are
+    # lru-cached in alignment for the duration of this run — clear first so
+    # data ingested earlier in this same process is picked up.
+    alignment.clear_caches()
     cfg = get_pipeline_config()
     as_of = as_of or date.today()
     if not skip_freshness:
@@ -351,6 +355,8 @@ def run_phase2(
     row must already exist (``run_phase1`` must have been called first
     for that as_of).
     """
+    # C7: see run_phase1 — never serve pre-ingest cached series.
+    alignment.clear_caches()
     existing = q.computed_metrics_at(as_of)
     if existing.is_empty():
         raise RuntimeError(

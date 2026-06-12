@@ -13,11 +13,13 @@ compatibility with existing imports.
 
 from __future__ import annotations
 
+import statistics
 from datetime import date, datetime
 from pathlib import Path
 
 import polars as pl
 
+from mfs import paths
 from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.errors import IngestError
@@ -32,6 +34,14 @@ from mfs.ingest.managers._scheme_match import (
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
+
+# B14b: month-over-month PTR unit-flip tripwire bounds. The AMC's incoming
+# median PTR is refused only when it shifts BOTH >PTR_FLIP_RATIO-fold AND
+# >PTR_FLIP_ABS absolute vs the previous stored month — the conjunction keeps
+# tiny-base ratio noise (0.05 → 0.3) and large-base drift (1.0 → 2.0) writable
+# while a percent-vs-fraction flip (0.09 → 9.14) is always caught.
+PTR_FLIP_RATIO = 5.0
+PTR_FLIP_ABS = 0.5
 
 
 def _dedupe_by_keys(rows: list[dict], key_cols: tuple[str, ...]) -> list[dict]:
@@ -125,14 +135,32 @@ def run_for_amc(
       pdf_path: optional override — skip fetch and parse this local file.
                 Useful for re-running against an archived PDF or for tests.
       match_threshold: rapidfuzz score floor for accepting a scheme-name match.
+      force: unified --full semantics (B9): re-download AND re-parse AND
+        re-write. Deletes this data month's cached factsheet before fetch
+        (so a corrected/re-published PDF is actually picked up — every
+        ``fetch()`` implementation checks the canonical
+        ``paths.factsheet_raw`` location), bypasses the parse-skip, and
+        overrides the PTR partition-shrinkage guard (B13) with a loud log.
+        Historical months are never touched.
     """
     adapter = get_adapter(amc_slug)
     ym = ym or _default_data_month()
     log.info("managers.run.start", amc=amc_slug, ym=ym)
     as_of_month = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
 
-    # Step 1: fetch (or use override).
+    # Step 1: fetch (or use override). force (--full) evicts the month's
+    # cached artifact first (B9): fetch() returns a cached file by mere
+    # existence, so a corrected/re-published factsheet is unreachable
+    # without deletion. Scoped to ym only — historical months stay cached.
     if pdf_path is None:
+        if force:
+            cached = paths.factsheet_raw(amc_slug, ym)
+            if cached.exists():
+                cached.unlink()
+                log.info(
+                    "managers.force_refetch",
+                    amc=amc_slug, ym=ym, path=str(cached),
+                )
         pdf = adapter.fetch(ym)
     else:
         pdf = Path(pdf_path)
@@ -224,12 +252,55 @@ def run_for_amc(
     if matched_ptr:
         from mfs.db.connection import connect
         incoming_by_month: dict[date, set[str]] = {}
+        ptrs_by_month: dict[date, list[float]] = {}
         for r in matched_ptr:
             incoming_by_month.setdefault(r["as_of_month"], set()).add(
                 r["scheme_code"]
             )
+            ptrs_by_month.setdefault(r["as_of_month"], []).append(
+                float(r["ptr"])
+            )
         ptr_months = sorted(incoming_by_month)
         with connect() as conn:
+            # PTR unit-flip tripwire (B14b): a percent-vs-fraction convention
+            # flip in a re-published factsheet (or a layout change picking the
+            # adjacent column) writes ~100x-wrong PTR that the per-record
+            # bounds (B14a, schemas.py) can't catch on their own. Compare
+            # this batch's median against the AMC's previous stored month
+            # (read-only): a shift that is BOTH >PTR_FLIP_RATIO-fold AND
+            # >PTR_FLIP_ABS absolute is a convention flip, not turnover drift
+            # → refuse the AMC. No prior month → nothing to compare, proceed.
+            for m in ptr_months:
+                row = conn.execute(
+                    "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY ptr) "
+                    "FROM portfolio_turnover_monthly "
+                    "WHERE source_amc = %s AND as_of_month = ("
+                    "SELECT MAX(as_of_month) FROM portfolio_turnover_monthly "
+                    "WHERE source_amc = %s AND as_of_month < %s)",
+                    (amc_slug, amc_slug, m),
+                ).fetchone()
+                prior_median = (
+                    float(row[0])
+                    if row is not None and row[0] is not None else None
+                )
+                if prior_median is None or prior_median <= 0:
+                    continue
+                incoming_median = statistics.median(ptrs_by_month[m])
+                ratio = incoming_median / prior_median
+                fold = max(ratio, 1.0 / ratio)
+                if (
+                    fold > PTR_FLIP_RATIO
+                    and abs(incoming_median - prior_median) > PTR_FLIP_ABS
+                ):
+                    raise IngestError(
+                        f"{amc_slug}: PTR unit-flip tripwire for {m} — "
+                        f"incoming median {incoming_median:.4g} vs prior-month "
+                        f"median {prior_median:.4g} ({fold:.1f}x shift). This "
+                        f"looks like a percent-vs-fraction convention flip, "
+                        f"not turnover drift; refusing this AMC's PTR batch. "
+                        f"If the PRIOR month is the mis-scaled one, delete "
+                        f"those rows and re-run."
+                    )
             # Partition-shrinkage guard (B13): the per-month DELETE below
             # would silently drop a scheme whose PTR parsed last run but not
             # this run. Refuse before ANY month is deleted (IngestError →
@@ -468,9 +539,12 @@ def run_all(
 ) -> dict[str, dict]:
     """Run every registered factsheet adapter with per-AMC fault isolation.
 
-    ``force=True`` (a ``--full`` pipeline run) re-parses every factsheet even if
-    unchanged; the default skips re-parsing factsheets whose bytes and match
-    universe are identical to the last successful ingest (see ``run_for_amc``).
+    ``force=True`` (a ``--full`` pipeline run) re-downloads the current data
+    month's factsheet for every AMC, re-parses it even if unchanged, and
+    re-writes (overriding the partition-shrinkage guard) — see
+    ``run_for_amc``. The default skips re-parsing factsheets whose bytes and
+    match universe are identical to the last successful ingest. Cost of
+    force: ~41 factsheets re-fetched (minutes serially).
 
     Holdings/PTR are advisory signals, so one AMC's failure (a 404 on the
     factsheet URL, a parse error, a layout change) must NOT crash the pipeline —

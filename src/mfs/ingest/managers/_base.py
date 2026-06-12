@@ -52,10 +52,14 @@ class ManagerAdapter(ABC):
         """Download the factsheet for data month ym; return local Path.
 
         Override when the AMC needs referer chains, form posts, etc.
-        Re-uses an existing cached PDF unconditionally — delete the file to
-        force a re-fetch. The payload's magic bytes are validated before
-        caching (``expect='pdf'``): a WAF/SPA HTML shell served as 200
-        raises ``IngestError`` and is never written.
+        Re-uses an existing cached PDF by mere existence; a forced run
+        (``--full`` pipeline / ``--force`` CLI) deletes the data month's
+        cached file in ``managers._run.run_for_amc`` BEFORE calling this,
+        so force re-downloads (B9) — overrides must keep reading/writing
+        the canonical ``paths.factsheet_raw`` location for that to hold.
+        The payload's magic bytes are validated before caching
+        (``expect='pdf'``): a WAF/SPA HTML shell served as 200 raises
+        ``IngestError`` and is never written.
         """
         from mfs import paths
         from mfs.io.http import download_to
