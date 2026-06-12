@@ -27,6 +27,7 @@ import polars as pl
 from mfs import paths
 from mfs.db import queries as q
 from mfs.db import writers as w
+from mfs.errors import IngestError
 from mfs.io.atomic import atomic_write_bytes
 from mfs.io.http import TransientHttpError
 from mfs.utils.logging import get_logger
@@ -105,7 +106,7 @@ def fetch_equity_list(max_age_days: int = _EQUITY_LIST_MAX_AGE_DAYS) -> dict[str
             log.warning("bhavcopy.equity_list.using_stale_cache", path=str(out_path))
             data = out_path.read_bytes()
         else:
-            raise RuntimeError("NSE EQUITY_L.csv unavailable (404)")
+            raise IngestError(f"bhavcopy: NSE EQUITY_L.csv unavailable (404): {_EQUITY_LIST_URL}")
     reader = csv.reader(io.StringIO(data.decode("utf-8")))
     header = next(reader)
     sym_idx = next(i for i, h in enumerate(header) if h.strip() == "SYMBOL")
@@ -211,6 +212,10 @@ def ingest_recent(n_days: int = 75, *, full: bool = False) -> dict:
     the DB, so the trailing ADV window stays intact. ``full=True`` (or a cold,
     empty table) walks the entire n_days window. The day loop is idempotent
     (upsert), so the overlap is safe.
+
+    Raises IngestError (never raw httpx errors) when NSE refuses a fetch —
+    e.g. the archives endpoint's known intermittent 403 — so the pipeline
+    halts via the clean failure path instead of a traceback.
     """
     today = date.today()
     if not full:
@@ -219,17 +224,22 @@ def ingest_recent(n_days: int = 75, *, full: bool = False) -> dict:
             # +3-day overlap re-checks the most recent days (cheap, idempotent).
             n_days = min(n_days, (today - latest).days + 3)
             log.info("bhavcopy.recent.incremental", latest=latest.isoformat(), n_days=n_days)
-    symbol_to_isin = fetch_equity_list()
     fetched = 0
     rows = 0
-    for offset in range(1, n_days + 1):
-        d = today - timedelta(days=offset)
-        # Skip weekends (NSE is closed Sat/Sun).
-        if d.weekday() >= 5:
-            continue
-        n = fetch_one(d, symbol_to_isin=symbol_to_isin)
-        rows += n
-        if n > 0:
-            fetched += 1
+    try:
+        symbol_to_isin = fetch_equity_list()
+        for offset in range(1, n_days + 1):
+            d = today - timedelta(days=offset)
+            # Skip weekends (NSE is closed Sat/Sun).
+            if d.weekday() >= 5:
+                continue
+            n = fetch_one(d, symbol_to_isin=symbol_to_isin)
+            rows += n
+            if n > 0:
+                fetched += 1
+    except (httpx.HTTPError, TransientHttpError) as e:
+        # 403 from the archives endpoint is the proven case (_fetch_with_retry
+        # raise_for_status); translate so _stage halts cleanly, not a traceback.
+        raise IngestError(f"bhavcopy: NSE fetch failed: {e}") from e
     log.info("bhavcopy.recent.done", days_with_data=fetched, total_rows=rows)
     return {"days_with_data": fetched, "total_rows": rows}

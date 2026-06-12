@@ -8,8 +8,12 @@ For each (scheme_code) we derive:
 - benchmark_ticker: from configs/benchmarks.csv
 - base_fund_id: shared key across Direct/Regular and Growth/IDCW siblings
 - inception_date: first NAV date in history
-- is_active: present in the latest NAV pull
+- is_active: present in today's AMFI listing
 - last_seen_date: max NAV date observed
+
+Persistence is a diff-sync, not a rebuild (survivorship containment): schemes
+absent from today's listing are KEPT with is_active=false and a departed_at
+stamp, never deleted — see ``writers.sync_scheme_master``.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import polars as pl
 
 from mfs.db import queries as q
 from mfs.db import writers as w
+from mfs.errors import IngestError
 from mfs.ingest import amfi_nav
 from mfs.master.benchmark_map import benchmark_for
 from mfs.utils.logging import get_logger
@@ -242,12 +247,13 @@ def _base_fund_id(scheme_name: str, amc_slug: str) -> str:
 
 
 def build() -> pl.DataFrame:
-    """Pull today's AMFI snapshot, derive scheme master rows, persist to curated."""
+    """Pull today's AMFI snapshot, derive scheme master rows, diff-sync into
+    Postgres (departed schemes are kept with is_active=false, never dropped)."""
     today = date.today()
     content = amfi_nav.fetch_today().decode("utf-8", errors="replace")
     snap = amfi_nav.parse_to_dataframe(content)
     if snap.is_empty():
-        raise RuntimeError("Empty AMFI NAVAll snapshot; cannot build scheme master")
+        raise IngestError("Empty AMFI NAVAll snapshot; cannot build scheme master")
 
     # Derive plan/option/category/amc_slug/base_fund_id per row
     snap_pd = snap.unique("scheme_code", keep="last")
@@ -333,6 +339,10 @@ def build() -> pl.DataFrame:
             schemes=[f"{code}: {name}" for code, name in unknown_direct.rows()],
         )
 
-    w.upsert_scheme_master(df)
+    w.sync_scheme_master(df)
+    # D2 point-in-time history: record the post-sync state (including
+    # inactive/departed rows) under today's date; same-day re-builds replace
+    # the partition.
+    w.snapshot_scheme_master(today)
     log.info("scheme_master.built", rows=df.height)
     return df

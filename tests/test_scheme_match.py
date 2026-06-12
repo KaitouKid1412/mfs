@@ -270,3 +270,171 @@ def test_below_threshold_rejection_is_not_flagged_ambiguous():
     r = match_one("Completely Unrelated Fund Name XYZ", idx)
     assert r.matched_scheme_code is None
     assert r.ambiguous is False
+
+
+# ---------------------------------------------------------------------------
+# B5-extension: compound cap-token normalization, numeric-token guard,
+# FOF <-> FUND OF FUNDS discriminator equivalence (Motilal heal regressions)
+# ---------------------------------------------------------------------------
+
+
+def test_compound_multicap_matches_spaced_multi_cap_not_midcap():
+    """Live trace: printed 'Motilal Oswal Multicap Fund' scored 92.3 against
+    the MIDCAP sibling because MULTICAP/MULTI+CAP are unrelated tokens to
+    token_set_ratio. After compound normalization it must land EXACTLY on
+    scheme 152651 (real scheme_master names)."""
+    sm = pl.DataFrame([
+        _sm_row(
+            "152651",
+            "Motilal Oswal Multi Cap Fund-Direct Plan Growth",
+            amc="motilal_oswal",
+        ),
+        _sm_row(
+            "127042",
+            "Motilal Oswal Midcap Fund-Direct Plan-Growth Option",
+            amc="motilal_oswal",
+        ),
+    ])
+    idx = build_candidate_index(sm, "motilal_oswal")
+    r = match_one("Motilal Oswal Multicap Fund", idx)
+    assert r.matched_scheme_code == "152651"
+    assert r.ambiguous is False
+    assert r.score == 100.0  # exact canonical equality after normalization
+
+
+def test_compound_normalization_applies_to_candidate_keys_too():
+    """The compound split must hit candidate keys as well as printed names:
+    a printed 'Mid Cap' (spaced) must exact-match an AMFI 'Midcap' row."""
+    sm = pl.DataFrame([
+        _sm_row(
+            "127042",
+            "Motilal Oswal Midcap Fund-Direct Plan-Growth Option",
+            amc="motilal_oswal",
+        ),
+    ])
+    idx = build_candidate_index(sm, "motilal_oswal")
+    assert "MOTILAL OSWAL MID CAP FUND" in idx
+    r = match_one("Motilal Oswal Mid Cap Fund", idx)
+    assert r.matched_scheme_code == "127042"
+
+
+def test_numeric_token_mismatch_rejects_nifty_500_onto_nifty_50():
+    """Live trace: printed 'Motilal Oswal Nifty 500 Index Fund' matched the
+    Nifty 50 fund at 98.5 (its own master row is option_type=UNKNOWN, so
+    absent from the DIRECT+GROWTH index). {500} != {50} must reject the
+    match as ambiguous regardless of score."""
+    sm = pl.DataFrame([
+        _sm_row(
+            "147794",
+            "Motilal Oswal Nifty 50 Index Fund - Direct plan - Growth",
+            amc="motilal_oswal",
+        ),
+    ])
+    idx = build_candidate_index(sm, "motilal_oswal")
+    r = match_one("Motilal Oswal Nifty 500 Index Fund", idx)
+    assert r.matched_scheme_code is None
+    assert r.ambiguous is True
+
+
+def test_numeric_token_mismatch_logs_loud_warning():
+    from structlog.testing import capture_logs
+
+    sm = pl.DataFrame([
+        _sm_row(
+            "147794",
+            "Motilal Oswal Nifty 50 Index Fund - Direct plan - Growth",
+            amc="motilal_oswal",
+        ),
+    ])
+    idx = build_candidate_index(sm, "motilal_oswal")
+    with capture_logs() as logs:
+        match_one("Motilal Oswal Nifty 500 Index Fund", idx)
+    events = [e for e in logs if e["event"] == "scheme_match.ambiguous"]
+    assert len(events) == 1
+    assert events[0]["log_level"] == "warning"
+    assert "numeric_tokens_mismatch" in events[0]["reason"]
+
+
+def test_equal_numeric_token_sets_still_match():
+    """{150, 50} on both sides is numeric-equal — the guard must not fire."""
+    sm = pl.DataFrame([
+        _sm_row(
+            "K1",
+            "Kotak Nifty Midcap 150 Momentum 50 Index Fund-Direct Plan-Growth",
+            amc="kotak_mahindra",
+        ),
+    ])
+    idx = build_candidate_index(sm, "kotak")
+    r = match_one("Kotak Nifty Midcap 150 Momentum 50 Index Fund", idx)
+    assert r.matched_scheme_code == "K1"
+    assert r.ambiguous is False
+
+
+def test_fof_printed_matches_fund_of_funds_master_row():
+    """Live trace: printed '... Flexicap Passive FOF' was false-rejected
+    against its own master row '... FLEXICAP PASSIVE FUND OF FUNDS DIRECT'
+    (suffix '- Direct - Growth' leaves a trailing DIRECT) because the FOF
+    discriminator comparison was literal. FOF <-> FUND OF FUNDS must be
+    treated as equivalent (real scheme_master name, 154112)."""
+    sm = pl.DataFrame([
+        _sm_row(
+            "154112",
+            "Motilal Oswal Diversified Equity Flexicap Passive Fund of Funds- Direct - Growth",
+            amc="motilal_oswal",
+        ),
+        _sm_row(
+            "152651",
+            "Motilal Oswal Multi Cap Fund-Direct Plan Growth",
+            amc="motilal_oswal",
+        ),
+    ])
+    idx = build_candidate_index(sm, "motilal_oswal")
+    r = match_one("Motilal Oswal Diversified Equity Flexicap Passive FOF", idx)
+    assert r.matched_scheme_code == "154112"
+    assert r.ambiguous is False
+
+
+def test_fof_discriminator_still_blocks_poach_onto_non_fof_sibling():
+    """The FOF folding must only equate spellings, not weaken the
+    discriminator: a printed FoF with no FoF master row must still be
+    rejected against the active sibling."""
+    sm = pl.DataFrame([
+        _sm_row("G1", "ABC Gold Fund - Direct Plan - Growth", amc="abc"),
+    ])
+    idx = build_candidate_index(sm, "abc")
+    r = match_one("ABC Gold Fund of Funds", idx)
+    assert r.matched_scheme_code is None
+    assert r.ambiguous is True
+
+
+def test_normalization_keeps_existing_exact_match_intact():
+    """Canonical-token normalization must not disturb a name that already
+    matched exactly (no compound tokens, no glued digits)."""
+    sm = pl.DataFrame([
+        _sm_row("F1", "HDFC Flexi Cap Fund - Direct Plan - Growth Option"),
+        _sm_row("F2", "HDFC Top 100 Fund - Direct Plan - Growth Option"),
+    ])
+    idx = build_candidate_index(sm, "hdfc")
+    r = match_one("HDFC Flexi Cap Fund", idx)
+    assert r.matched_scheme_code == "F1"
+    assert r.score == 100.0
+    # Numeric token present and equal on both sides — guard must not fire.
+    assert match_one("HDFC Top 100 Fund", idx).matched_scheme_code == "F2"
+
+
+def test_canonicalize_splits_compound_and_glued_digit_tokens():
+    assert canonicalize("360 ONE FLEXICAP FUND") == "360 ONE FLEXI CAP FUND"
+    assert (
+        canonicalize("HDFC NIFTY500 Multicap 50:25:25 Index Fund")
+        == "HDFC NIFTY 500 MULTI CAP 50 25 25 INDEX FUND"
+    )
+    assert (
+        canonicalize("Edelweiss Nifty LargeMidcap250 Plus 8-13 Yr G-Sec 70:30 Index Fund")
+        == "EDELWEISS NIFTY LARGE MID CAP 250 PLUS 8 13 YR G SEC 70 30 INDEX FUND"
+    )
+    # MIDSMALL inside MIDSMALLCAP must not double-split; standalone MIDSMALL splits.
+    assert canonicalize("UTI Nifty Midsmallcap 400") == "UTI NIFTY MID SMALL CAP 400"
+    assert (
+        canonicalize("Motilal Oswal Nifty MidSmall Healthcare Index Fund")
+        == "MOTILAL OSWAL NIFTY MID SMALL HEALTHCARE INDEX FUND"
+    )

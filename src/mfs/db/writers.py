@@ -130,25 +130,157 @@ def upsert_risk_free_daily(df: pl.DataFrame) -> int:
         return out.height
 
 
-def upsert_scheme_master(df: pl.DataFrame) -> int:
-    """Replace scheme_master atomically — it's a full snapshot, not incremental."""
+# Fraction of currently-active scheme_master rows a single sync may deactivate.
+# A truncated/partial NAVAll page looks exactly like a mass departure, so a
+# sync above this fraction must halt the run, not deactivate the universe
+# (fail-fast invariant).
+SCHEME_MASTER_MAX_DEACTIVATION_FRAC = 0.20
+
+
+def plan_scheme_master_sync(
+    snapshot_codes: set[str], active_codes: set[str],
+) -> list[str]:
+    """Pure diff for the scheme_master sync: the currently-active scheme codes
+    absent from today's AMFI snapshot, i.e. the rows to flip is_active=false.
+
+    Raises RuntimeError when the diff would deactivate more than
+    ``SCHEME_MASTER_MAX_DEACTIVATION_FRAC`` of the active rows — a partial
+    NAVAll response must halt the sync, never mass-deactivate."""
+    to_deactivate = sorted(active_codes - snapshot_codes)
+    if active_codes:
+        frac = len(to_deactivate) / len(active_codes)
+        if frac > SCHEME_MASTER_MAX_DEACTIVATION_FRAC:
+            raise RuntimeError(
+                f"scheme_master sync would deactivate {len(to_deactivate)} of "
+                f"{len(active_codes)} active schemes ({frac:.1%} > "
+                f"{SCHEME_MASTER_MAX_DEACTIVATION_FRAC:.0%}); refusing — "
+                "today's AMFI NAVAll snapshot is likely partial."
+            )
+    return to_deactivate
+
+
+def sync_scheme_master(df: pl.DataFrame) -> int:
+    """Diff-sync scheme_master against today's AMFI snapshot — never TRUNCATE,
+    never DELETE (survivorship containment).
+
+    In ONE transaction:
+      1. Every snapshot row UPSERTs (snapshot wins on name/category/benchmark)
+         with is_active=true and departed_at=NULL — a re-appearing scheme
+         flips back to active and its departure marker clears.
+      2. Currently-active rows whose scheme_code is absent from the snapshot
+         flip to is_active=false with departed_at=today. Their last_seen_date
+         and every other column are preserved; already-inactive rows keep
+         their original departed_at.
+
+    Raises RuntimeError BEFORE any write when the diff would deactivate >20%
+    of active rows — see ``plan_scheme_master_sync``."""
     if df.is_empty():
         return 0
     cols = [
         "scheme_code", "isin_growth", "isin_idcw", "scheme_name", "amc_name",
         "amc_code", "plan_type", "option_type", "amfi_category",
         "canonical_category", "benchmark_ticker", "inception_date",
-        "base_fund_id", "is_active", "last_seen_date",
+        "base_fund_id", "is_active", "last_seen_date", "departed_at",
     ]
-    out = df.select(cols)
+    out = df.with_columns(
+        pl.lit(True).alias("is_active"),
+        pl.lit(None, dtype=pl.Date).alias("departed_at"),
+    ).select(cols)
+    snapshot_codes = set(out["scheme_code"].to_list())
+    with connect() as c:
+        active_rows = c.execute(
+            "SELECT scheme_code FROM scheme_master WHERE is_active"
+        ).fetchall()
+        to_deactivate = plan_scheme_master_sync(
+            snapshot_codes, {r[0] for r in active_rows}
+        )
+        n = _copy_upsert(c, "scheme_master", cols, out.iter_rows(),
+                         pk=("scheme_code",))
+        if to_deactivate:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE scheme_master SET is_active = FALSE, departed_at = %s "
+                    "WHERE scheme_code = ANY(%s)",
+                    (date.today(), to_deactivate),
+                )
+    log.info("scheme_master.synced", upserted=n, deactivated=len(to_deactivate))
+    return n
+
+
+# All scheme_master columns, mirrored into scheme_master_history per run.
+_SCHEME_MASTER_HISTORY_COLS = [
+    "scheme_code", "isin_growth", "isin_idcw", "scheme_name", "amc_name",
+    "amc_code", "plan_type", "option_type", "amfi_category",
+    "canonical_category", "benchmark_ticker", "inception_date",
+    "base_fund_id", "is_active", "last_seen_date", "departed_at",
+]
+
+
+def snapshot_scheme_master(snapshot_date: date) -> int:
+    """D2 point-in-time snapshot: copy the CURRENT post-sync scheme_master
+    state (including inactive/departed rows — they are part of the
+    point-in-time universe) into scheme_master_history under ``snapshot_date``.
+
+    Server-side INSERT ... SELECT, so the 14k-row table never round-trips
+    through the process. Re-running the same date replaces the partition —
+    DELETE + insert in ONE transaction, so a same-day re-build is idempotent
+    and a kill between the two statements rolls both back."""
+    cols = sql.SQL(", ").join(sql.Identifier(c) for c in _SCHEME_MASTER_HISTORY_COLS)
     with connect() as c:
         with c.cursor() as cur:
-            cur.execute("TRUNCATE scheme_master")
-            col_idents = ", ".join(cols)
-            with cur.copy(f"COPY scheme_master ({col_idents}) FROM STDIN") as cp:
-                for row in out.iter_rows():
-                    cp.write_row(row)
-        return out.height
+            cur.execute(
+                "DELETE FROM scheme_master_history WHERE snapshot_date = %s",
+                (snapshot_date,),
+            )
+            cur.execute(
+                sql.SQL(
+                    "INSERT INTO scheme_master_history (snapshot_date, {cols}) "
+                    "SELECT %s, {cols} FROM scheme_master"
+                ).format(cols=cols),
+                (snapshot_date,),
+            )
+            n = cur.rowcount
+    log.info("scheme_master_history.snapshotted", snapshot_date=str(snapshot_date), rows=n)
+    return n
+
+
+# rank_history columns — must stay identical to the schema.sql definition and
+# to shortlist.RANK_HISTORY_COLS (the frame builder).
+_RANK_HISTORY_COLS = [
+    "as_of_date", "stage", "scheme_code", "canonical_category",
+    "composite_score", "composite_score_stage1", "rank_in_category",
+    "z_ret_3y_median", "z_ret_3y_p25", "z_ret_5y_median", "z_ret_5y_p25",
+    "z_alpha_3y_annualized", "z_sortino_3y", "z_info_ratio_3y",
+    "z_capture_efficiency", "z_active_share_median_1y", "z_style_drift_3y",
+    "ptr_latest", "aum_impact_cost_days",
+    "included", "exclusion_reason", "run_id",
+]
+
+
+def persist_rank_history(df: pl.DataFrame, as_of: date) -> int:
+    """D2 point-in-time snapshot: replace the rank_history partition for
+    ``as_of`` atomically with this run's stage 1/2/3 outcomes.
+
+    Expected columns: any subset of ``_RANK_HISTORY_COLS`` including at least
+    stage / scheme_code / included (``shortlist.build_rank_history`` produces
+    the full set); missing columns are written as NULL. DELETE + insert run in
+    ONE transaction so a re-run of the same as_of replaces the partition and a
+    kill between the two statements rolls both back."""
+    if df.is_empty():
+        return 0
+    if "as_of_date" not in df.columns:
+        df = df.with_columns(pl.lit(as_of).cast(pl.Date).alias("as_of_date"))
+    for c in _RANK_HISTORY_COLS:
+        if c not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias(c))
+    out = df.select(_RANK_HISTORY_COLS)
+    with connect() as c:
+        with c.cursor() as cur:
+            cur.execute("DELETE FROM rank_history WHERE as_of_date = %s", (as_of,))
+        n = _copy_upsert(c, "rank_history", _RANK_HISTORY_COLS, out.iter_rows(),
+                         pk=("as_of_date", "stage", "scheme_code"))
+    log.info("rank_history.persisted", as_of=str(as_of), rows=n)
+    return n
 
 
 _COMPUTED_METRICS_COLS = [

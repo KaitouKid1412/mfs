@@ -1,14 +1,20 @@
-"""Tests for scheme_master category classification.
+"""Tests for scheme_master category classification and the D1 diff-sync.
 
 Focus on the closed-ended / interval guard: closed-ended tax-saver series must
 NOT leak into the equity universe via the "ELSS"/"Tax Saver" substring rules.
+The diff-sync suite (survivorship containment) covers present / absent /
+re-appearing schemes and the mass-deactivation fail-fast guard.
 """
 
 from __future__ import annotations
 
+import contextlib
+from datetime import date
+
 import polars as pl
 import pytest
 
+from mfs.db import writers
 from mfs.master.scheme_master import (
     _apply_single_option_default,
     _base_fund_id,
@@ -231,3 +237,191 @@ def test_direct_unknown_rankable_listing():
         }
     )
     assert _direct_unknown_rankable(df)["scheme_code"].to_list() == ["1"]
+
+
+# ---------------------------------------------------------------------------
+# D1 survivorship containment: diff-sync (writers.plan_scheme_master_sync /
+# writers.sync_scheme_master). Departed schemes flip to is_active=false with a
+# departed_at stamp; nothing is ever TRUNCATEd or DELETEd.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_no_departures():
+    assert writers.plan_scheme_master_sync({"1", "2"}, {"1", "2"}) == []
+
+
+def test_plan_brand_new_scheme_is_not_a_departure():
+    assert writers.plan_scheme_master_sync({"1", "2", "3"}, {"1", "2"}) == []
+
+
+def test_plan_departed_codes_returned_sorted():
+    out = writers.plan_scheme_master_sync(
+        {"1", "2", "3", "4", "5", "6", "7", "8"},
+        {"1", "2", "3", "4", "5", "6", "7", "8", "10", "9"},
+    )
+    assert out == ["10", "9"]
+
+
+def test_plan_reappearing_inactive_code_not_in_plan():
+    """A code that's in the DB but inactive (so not in active_codes) and back
+    in today's snapshot must not be planned for deactivation."""
+    assert writers.plan_scheme_master_sync({"1", "9"}, {"1"}) == []
+
+
+def test_plan_exactly_at_limit_passes():
+    # 1 of 5 active = exactly 20% — the guard is strictly greater-than.
+    assert writers.plan_scheme_master_sync(
+        {"1", "2", "3", "4"}, {"1", "2", "3", "4", "5"}
+    ) == ["5"]
+
+
+def test_plan_mass_deactivation_raises():
+    # 2 of 5 active = 40% > 20% — a partial NAVAll page must halt the sync.
+    with pytest.raises(RuntimeError, match="deactivate"):
+        writers.plan_scheme_master_sync({"1", "2", "3"}, {"1", "2", "3", "4", "5"})
+
+
+def test_plan_empty_db_first_sync_no_guard():
+    assert writers.plan_scheme_master_sync({"1", "2"}, set()) == []
+
+
+def _snapshot_df(codes: list[str]) -> pl.DataFrame:
+    """Minimal frame with the 15 columns build() hands to the writer."""
+    n = len(codes)
+    return pl.DataFrame(
+        {
+            "scheme_code": codes,
+            "isin_growth": pl.Series([None] * n, dtype=pl.Utf8),
+            "isin_idcw": pl.Series([None] * n, dtype=pl.Utf8),
+            "scheme_name": [f"Fund {c} - Direct Plan - Growth" for c in codes],
+            "amc_name": ["Acme Mutual Fund"] * n,
+            "amc_code": ["acme"] * n,
+            "plan_type": ["DIRECT"] * n,
+            "option_type": ["GROWTH"] * n,
+            "amfi_category": ["Open Ended Schemes(Large Cap Fund)"] * n,
+            "canonical_category": ["Large Cap"] * n,
+            "benchmark_ticker": ["NIFTY 100 TRI"] * n,
+            "inception_date": [date(2015, 1, 1)] * n,
+            "base_fund_id": [f"acme::fund_{c}" for c in codes],
+            "is_active": [True] * n,
+            "last_seen_date": [date(2026, 6, 11)] * n,
+        }
+    )
+
+
+class _FakeDB:
+    """Captures every statement / upsert the sync writer issues, seeded with
+    the scheme codes currently active in the fake scheme_master."""
+
+    def __init__(self):
+        self.active_codes: list[str] = []
+        self.statements: list[tuple[str, tuple | None]] = []
+        self.upserts: list[tuple[str, list[str], list[tuple]]] = []
+
+    def updates(self) -> list[tuple[str, tuple | None]]:
+        return [(s, p) for s, p in self.statements if "UPDATE scheme_master" in s]
+
+
+class _FakeCursor:
+    def __init__(self, db: _FakeDB):
+        self._db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, query, params=None):
+        self._db.statements.append((query, params))
+
+
+class _FakeConn:
+    def __init__(self, db: _FakeDB):
+        self._db = db
+
+    def execute(self, query, params=None):
+        self._db.statements.append((query, params))
+        rows = [(c,) for c in self._db.active_codes]
+
+        class _Res:
+            @staticmethod
+            def fetchall():
+                return rows
+
+        return _Res()
+
+    def cursor(self):
+        return _FakeCursor(self._db)
+
+
+@pytest.fixture
+def fake_db(monkeypatch):
+    db = _FakeDB()
+
+    @contextlib.contextmanager
+    def _fake_connect(autocommit=False):
+        yield _FakeConn(db)
+
+    def _fake_copy_upsert(conn, table, columns, rows, pk):
+        rows = list(rows)
+        db.upserts.append((table, list(columns), rows))
+        return len(rows)
+
+    monkeypatch.setattr(writers, "connect", _fake_connect)
+    monkeypatch.setattr(writers, "_copy_upsert", _fake_copy_upsert)
+    return db
+
+
+def test_sync_upserts_snapshot_rows_active_with_clear_departed_at(fake_db):
+    """Snapshot rows (existing + brand-new) upsert with is_active=true and
+    departed_at NULL; no scheme departed, so no deactivation UPDATE runs."""
+    fake_db.active_codes = ["100"]
+    n = writers.sync_scheme_master(_snapshot_df(["100", "200"]))
+    assert n == 2
+    table, cols, rows = fake_db.upserts[0]
+    assert table == "scheme_master"
+    i_active, i_dep = cols.index("is_active"), cols.index("departed_at")
+    assert all(r[i_active] is True for r in rows)
+    assert all(r[i_dep] is None for r in rows)
+    assert fake_db.updates() == []
+
+
+def test_sync_departed_scheme_kept_inactive_with_departed_at(fake_db):
+    """A scheme absent from today's snapshot is KEPT — flipped inactive with
+    departed_at=today via UPDATE; last_seen_date untouched; never DELETEd."""
+    fake_db.active_codes = ["1", "2", "3", "4", "5", "6"]
+    writers.sync_scheme_master(_snapshot_df(["1", "2", "3", "4", "5"]))
+    updates = fake_db.updates()
+    assert len(updates) == 1
+    stmt, params = updates[0]
+    assert "is_active = FALSE" in stmt
+    assert "departed_at" in stmt
+    assert "last_seen_date" not in stmt  # frozen, not rewritten
+    assert params == (date.today(), ["6"])
+    all_sql = " ".join(s for s, _ in fake_db.statements)
+    assert "TRUNCATE" not in all_sql
+    assert "DELETE" not in all_sql
+
+
+def test_sync_reappearing_scheme_flips_back_active(fake_db):
+    """A code present in the DB but inactive that re-appears in the snapshot
+    is upserted with is_active=true / departed_at=NULL (snapshot wins) and is
+    NOT in the deactivation set."""
+    fake_db.active_codes = ["1"]  # '9' exists in the DB but is inactive
+    writers.sync_scheme_master(_snapshot_df(["1", "9"]))
+    _, cols, rows = fake_db.upserts[0]
+    row9 = next(r for r in rows if r[cols.index("scheme_code")] == "9")
+    assert row9[cols.index("is_active")] is True
+    assert row9[cols.index("departed_at")] is None
+    assert fake_db.updates() == []
+
+
+def test_sync_mass_deactivation_halts_before_any_write(fake_db):
+    """>20% of active rows missing (partial NAVAll page) raises BEFORE the
+    upsert — neither the COPY-upsert nor the deactivation UPDATE may run."""
+    fake_db.active_codes = ["1", "2", "3", "4"]
+    with pytest.raises(RuntimeError, match="deactivate"):
+        writers.sync_scheme_master(_snapshot_df(["1", "2"]))
+    assert fake_db.upserts == []
+    assert fake_db.updates() == []

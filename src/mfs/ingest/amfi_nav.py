@@ -18,6 +18,7 @@ from collections.abc import Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import polars as pl
 
 from mfs import paths
@@ -163,7 +164,17 @@ def parse_to_dataframe(content: str) -> pl.DataFrame:
 
 
 def fetch_today() -> bytes:
-    return http.fetch_bytes(NAV_TODAY_URL)
+    """GET today's NAVAll.txt.
+
+    Raises IngestError (never raw httpx errors) on 4xx or exhausted transient
+    retries: this is the fetch boundary for both ingest_today and
+    scheme_master.build, so a raw HTTPStatusError must not escape into either
+    required pipeline stage.
+    """
+    try:
+        return http.fetch_bytes(NAV_TODAY_URL)
+    except (httpx.HTTPError, http.TransientHttpError) as e:
+        raise IngestError(f"AMFI NAVAll fetch failed ({NAV_TODAY_URL}): {e}") from e
 
 
 def fetch_window(from_date: date, to_date: date) -> bytes:
@@ -203,6 +214,8 @@ def ingest_today() -> tuple[int, list[int]]:
     """
     try:
         content = fetch_today()
+    except IngestError:
+        raise  # fetch_today already translated with URL context
     except Exception as e:
         raise IngestError(f"AMFI NAVAll fetch failed after retries: {e}") from e
     today = date.today()

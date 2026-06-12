@@ -11,7 +11,9 @@ differs subtly from AMFI's recorded name. Examples seen in real data:
   - AMC says "HDFC Defence Fund" → AMFI: "HDFC Defence Fund - Direct Plan - Growth Option"
 
 We canonicalize both sides (uppercase, strip plan/option suffix, collapse
-whitespace, remove punctuation) and use rapidfuzz token_set_ratio to score.
+whitespace, remove punctuation, split compound cap-tokens like MULTICAP ->
+MULTI CAP and glued index numbers like NIFTY500 -> NIFTY 500) and use
+rapidfuzz token_set_ratio to score.
 A threshold-based rejection prevents silent mismatches when the AMC adds a
 fund the master doesn't have yet.
 """
@@ -79,6 +81,56 @@ def resolve_scheme_master_amc_code(adapter_slug: str) -> str:
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
+
+# Indian-MF compound cap-tokens, split into their spaced canonical form.
+# AMCs and AMFI disagree freely on "Multicap" vs "Multi Cap"; token_set_ratio
+# treats MULTICAP and MULTI/CAP as unrelated tokens, so the compound spelling
+# defeats fuzzy matching ("Motilal Oswal Multicap Fund" scored 92.3 against
+# the MIDCAP sibling instead of 100 against "MULTI CAP FUND"). Applied to
+# BOTH printed names and candidate keys inside canonicalize(), so exact
+# canonical equality is preserved whichever spelling each side uses.
+# Variants sourced by scanning distinct scheme_master names (May 2026):
+# MIDCAP(199) SMALLCAP(78) MULTICAP(74) FLEXICAP(41) LARGEMIDCAP(20)
+# LARGECAP(18) BLUECHIP(17) MIDSMALL(15) MIDSMALLCAP(9) MICROCAP(2).
+_COMPOUND_TOKEN_SPLITS = {
+    "LARGEMIDCAP": "LARGE MID CAP",
+    "MIDSMALLCAP": "MID SMALL CAP",
+    "MIDSMALL": "MID SMALL",
+    "MULTICAP": "MULTI CAP",
+    "MIDCAP": "MID CAP",
+    "SMALLCAP": "SMALL CAP",
+    "LARGECAP": "LARGE CAP",
+    "FLEXICAP": "FLEXI CAP",
+    "MICROCAP": "MICRO CAP",
+    "BLUECHIP": "BLUE CHIP",
+}
+# Lookarounds instead of \b: digits are word chars, and index names glue
+# digits onto the compound ("LargeMidcap250", "Midsmallcap400"), which would
+# defeat a trailing \b. Letter-only context guards keep e.g. MIDCAP from
+# matching inside LARGEMIDCAP (handled by its own longer-first entry).
+_COMPOUND_TOKEN_RE = re.compile(
+    r"(?<![A-Z])(" + "|".join(_COMPOUND_TOKEN_SPLITS) + r")(?![A-Z])"
+)
+# Split a digit glued onto a preceding word: NIFTY500 -> NIFTY 500. Scheme
+# names mix "Nifty 500" and "NIFTY500" (42x NIFTY200, 38x NIFTY500, 18x
+# NIFTY50, 14x NIFTY100 in scheme_master); splitting makes both spellings
+# canonicalize identically and exposes the number to the numeric-token guard.
+# Digit->letter is deliberately NOT split: FMP duration codes ("1126D",
+# "10JUL", "10Y") are single meaningful tokens.
+_LETTER_DIGIT_SPLIT_RE = re.compile(r"(?<=[A-Z])(?=\d)")
+
+# FOF <-> "FUND OF FUNDS"/"FUND OF FUND" equivalence for the discriminator
+# check. AMCs print "FoF" where AMFI spells out "Fund of Funds" (or the
+# singular "Fund of Fund" — 173 occurrences); a literal token comparison
+# false-rejects e.g. "... Flexicap Passive FOF" against "... FLEXICAP
+# PASSIVE FUND OF FUNDS DIRECT". Folded only for the discriminator-token
+# comparison, NOT in canonicalize(), to keep the blast radius on scoring
+# minimal.
+_FOF_EQUIV_RE = re.compile(r"\bFUND OF FUNDS?\b")
+
+# Numeric tokens for the numeric-token guard: extracted with findall so
+# glued forms ("NIFTY500") and spaced forms ("NIFTY 500") compare equal.
+_NUM_RE = re.compile(r"\d+")
 
 # "(erstwhile ...)" / "(formerly ...)" rename parenthetical — descriptive noise
 # AMFI appends to a renamed scheme's name. Stripped before matching.
@@ -149,6 +201,11 @@ def canonicalize(name: str) -> str:
     s = _TRAILING_PLAN_OPTION_RE.sub("", s)
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip().upper()
+    # Compound-token normalization (MULTICAP -> MULTI CAP, NIFTY500 ->
+    # NIFTY 500, ...). Must run after uppercasing; applied to printed names
+    # and candidate keys alike so both spellings land on one canonical key.
+    s = _COMPOUND_TOKEN_RE.sub(lambda m: _COMPOUND_TOKEN_SPLITS[m.group(1)], s)
+    s = _LETTER_DIGIT_SPLIT_RE.sub(" ", s)
     return s
 
 
@@ -231,9 +288,16 @@ def match_one(
       - token_set_ratio == 100 with plain ratio < ``_SUBSET_POACH_RATIO_FLOOR``
         (the smaller token set is a subset of the larger — e.g. "Bank of
         India MID CAP FUND" against "Bank of India LARGE AND MID CAP FUND");
+      - the NUMERIC tokens of printed name and matched key differ as sets,
+        regardless of score (e.g. "Nifty 500 Index Fund" scored 98.5 against
+        "Nifty 50 Index Fund" — one digit of edit distance, but a different
+        product; equal sets like {150, 50} on both sides pass);
       - the printed name carries a ``DISCRIMINATOR_TOKENS`` member the
         matched key lacks (e.g. "Multi Factor Passive Fund of Funds" must
         not resolve to "Multi Cap Fund", "Nifty Next 50" not to "Nifty 50").
+        "FUND OF FUNDS"/"FUND OF FUND" is folded to FOF on both sides first,
+        so "... Passive FOF" is not false-rejected against its own
+        "... PASSIVE FUND OF FUNDS" master row.
     """
     canon_in = canonicalize(printed_name)
     if not canon_in or not candidates:
@@ -289,7 +353,20 @@ def match_one(
         return _ambiguous("no_unique_best_within_margin")
     if best_score == 100 and best_ratio < _SUBSET_POACH_RATIO_FLOOR:
         return _ambiguous("subset_name_poach")
-    missing = (set(canon_in.split()) & DISCRIMINATOR_TOKENS) - set(best_key.split())
+    # Numeric-token guard: differing number sets mean a different product
+    # (Nifty 500 vs Nifty 50, 200 vs 100), however close the edit distance.
+    nums_in = {int(n) for n in _NUM_RE.findall(canon_in)}
+    nums_key = {int(n) for n in _NUM_RE.findall(best_key)}
+    if nums_in != nums_key:
+        return _ambiguous(
+            f"numeric_tokens_mismatch:printed={sorted(nums_in)},"
+            f"candidate={sorted(nums_key)}"
+        )
+    # Discriminator comparison with FOF <-> FUND OF FUND(S) folded so the
+    # spelled-out master name isn't false-rejected against a printed "FoF".
+    folded_in = _FOF_EQUIV_RE.sub("FOF", canon_in)
+    folded_key = _FOF_EQUIV_RE.sub("FOF", best_key)
+    missing = (set(folded_in.split()) & DISCRIMINATOR_TOKENS) - set(folded_key.split())
     if missing:
         return _ambiguous(
             "discriminator_tokens_missing:" + ",".join(sorted(missing))

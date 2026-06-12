@@ -25,11 +25,13 @@ import json
 from dataclasses import dataclass
 from datetime import date, datetime
 
+import httpx
 import polars as pl
 
 from mfs.db import writers as w
 from mfs.errors import IngestError
 from mfs.io import http
+from mfs.io.http import TransientHttpError
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -194,10 +196,20 @@ def parse_payload(payload: dict, quarter: Quarter) -> list[dict]:
 
 
 def ingest_quarter(label: str) -> dict:
-    """End-to-end: fetch one quarter, write to scheme_aum_monthly, return summary."""
-    q = quarter_from_label(label)
-    log.info("amfi_aum.fetch.start", quarter=label, fy_id=q.fy_id, period_id=q.period_id)
-    payload = fetch_quarter(q)
+    """End-to-end: fetch one quarter, write to scheme_aum_monthly, return summary.
+
+    Raises IngestError (never raw httpx errors) when AMFI refuses the FY-list
+    or schemewise GET — 4xx or exhausted transient retries — so the pipeline
+    halts via the clean failure path instead of a traceback.
+    """
+    try:
+        q = quarter_from_label(label)
+        log.info("amfi_aum.fetch.start", quarter=label, fy_id=q.fy_id, period_id=q.period_id)
+        payload = fetch_quarter(q)
+    except (httpx.HTTPError, TransientHttpError) as e:
+        raise IngestError(
+            f"AMFI AAUM fetch failed for {label} ({SCHEMEWISE_URL}): {e}"
+        ) from e
     rows = parse_payload(payload, q)
     if not rows:
         raise IngestError(f"AMFI AAUM payload for {label} contained zero DIRECT+GROWTH rows")

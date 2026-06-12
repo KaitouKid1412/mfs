@@ -422,3 +422,108 @@ def fund_log_returns(scheme_code: str) -> pl.DataFrame:
     return pl.DataFrame(
         rows, schema={"date": pl.Date, "log_return": pl.Float64}, orient="row"
     )
+
+
+# ---------------------------------------------------------------------------
+# D2: point-in-time history readers (scheme_master_history / rank_history)
+# ---------------------------------------------------------------------------
+
+
+_SCHEME_MASTER_HISTORY_SCHEMA: dict[str, pl.DataType] = {
+    "snapshot_date": pl.Date,
+    "scheme_code": pl.Utf8,
+    "isin_growth": pl.Utf8,
+    "isin_idcw": pl.Utf8,
+    "scheme_name": pl.Utf8,
+    "amc_name": pl.Utf8,
+    "amc_code": pl.Utf8,
+    "plan_type": pl.Utf8,
+    "option_type": pl.Utf8,
+    "amfi_category": pl.Utf8,
+    "canonical_category": pl.Utf8,
+    "benchmark_ticker": pl.Utf8,
+    "inception_date": pl.Date,
+    "base_fund_id": pl.Utf8,
+    "is_active": pl.Boolean,
+    "last_seen_date": pl.Date,
+    "departed_at": pl.Date,
+}
+
+
+def scheme_master_history_at(snapshot_date: date) -> pl.DataFrame:
+    """One scheme_master_history partition — the full universe state recorded
+    by the build() run on ``snapshot_date``. Empty frame when no snapshot
+    exists for that date."""
+    select = ", ".join(_SCHEME_MASTER_HISTORY_SCHEMA)
+    with connect() as c:
+        rows = c.execute(
+            f"SELECT {select} FROM scheme_master_history "
+            f"WHERE snapshot_date = %s ORDER BY scheme_code",
+            (snapshot_date,),
+        ).fetchall()
+    if not rows:
+        return pl.DataFrame()
+    return pl.DataFrame(rows, schema=_SCHEME_MASTER_HISTORY_SCHEMA, orient="row")
+
+
+def scheme_master_history_dates() -> list[date]:
+    """All snapshot dates present in scheme_master_history, ascending."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT DISTINCT snapshot_date FROM scheme_master_history "
+            "ORDER BY snapshot_date"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+_RANK_HISTORY_SCHEMA: dict[str, pl.DataType] = {
+    "as_of_date": pl.Date,
+    "stage": pl.Int32,
+    "scheme_code": pl.Utf8,
+    "canonical_category": pl.Utf8,
+    "composite_score": pl.Float64,
+    "composite_score_stage1": pl.Float64,
+    "rank_in_category": pl.Int32,
+    "z_ret_3y_median": pl.Float64,
+    "z_ret_3y_p25": pl.Float64,
+    "z_ret_5y_median": pl.Float64,
+    "z_ret_5y_p25": pl.Float64,
+    "z_alpha_3y_annualized": pl.Float64,
+    "z_sortino_3y": pl.Float64,
+    "z_info_ratio_3y": pl.Float64,
+    "z_capture_efficiency": pl.Float64,
+    "z_active_share_median_1y": pl.Float64,
+    "z_style_drift_3y": pl.Float64,
+    "ptr_latest": pl.Float64,
+    "aum_impact_cost_days": pl.Float64,
+    "included": pl.Boolean,
+    "exclusion_reason": pl.Utf8,
+    "run_id": pl.Utf8,
+}
+
+
+def rank_history_at(as_of: date, stage: int | None = None) -> pl.DataFrame:
+    """One rank_history partition — every stage 1/2/3 outcome (survivors and
+    exclusions) recorded by the rank_deep run for ``as_of``. Optionally
+    restricted to one stage."""
+    select = ", ".join(_RANK_HISTORY_SCHEMA)
+    sql = f"SELECT {select} FROM rank_history WHERE as_of_date = %s"
+    params: tuple = (as_of,)
+    if stage is not None:
+        sql += " AND stage = %s"
+        params = (as_of, stage)
+    sql += " ORDER BY stage, canonical_category, rank_in_category, scheme_code"
+    with connect() as c:
+        rows = c.execute(sql, params).fetchall()
+    if not rows:
+        return pl.DataFrame()
+    return pl.DataFrame(rows, schema=_RANK_HISTORY_SCHEMA, orient="row")
+
+
+def rank_history_dates() -> list[date]:
+    """All as_of dates present in rank_history, ascending."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT DISTINCT as_of_date FROM rank_history ORDER BY as_of_date"
+        ).fetchall()
+    return [r[0] for r in rows]

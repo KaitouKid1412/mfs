@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -216,6 +217,60 @@ def test_hybrid_synthesis_runtimeerror_translated_to_ingest_error(wired):
     assert wired.lock.exited
 
 
+def _http_403() -> httpx.HTTPStatusError:
+    url = "https://archives.nseindia.com/products/content/sec_bhavdata_full_01062026.csv"
+    req = httpx.Request("GET", url)
+    return httpx.HTTPStatusError(
+        f"Client error '403 Forbidden' for url '{url}'",
+        request=req,
+        response=httpx.Response(403, request=req),
+    )
+
+
+# --- B8 backstop: raw 4xx / RuntimeError leaked by a stage ---------------------
+
+def test_required_stage_raw_4xx_halts_cleanly_as_pipeline_error(wired):
+    wired.failures["bhavcopy"] = _http_403()
+
+    with pytest.raises(PipelineError, match="403 Forbidden") as excinfo:
+        pipeline.run(AS_OF, echo=wired.echo)
+
+    # The raw httpx error is chained, not propagated.
+    assert isinstance(excinfo.value.__cause__, httpx.HTTPStatusError)
+    # Halted at bhavcopy; nothing after it ran. Lock released.
+    assert wired.calls == ["navs", "benchmarks", "hybrids", "tbill",
+                           "scheme_master", "gate_A", "amfi_aum", "managers",
+                           "bhavcopy"]
+    assert wired.lock.exited
+    fail = [m for m in wired.err_lines() if "FAIL at ingest bhavcopy" in m]
+    assert fail and "HTTPStatusError" in fail[0]
+
+
+def test_required_stage_bare_runtimeerror_halts_cleanly(wired):
+    wired.failures["scheme_master"] = RuntimeError(
+        "Empty AMFI NAVAll snapshot; cannot build scheme master"
+    )
+
+    with pytest.raises(PipelineError, match="Empty AMFI NAVAll snapshot") as excinfo:
+        pipeline.run(AS_OF, echo=wired.echo)
+
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert wired.calls == ["navs", "benchmarks", "hybrids", "tbill", "scheme_master"]
+    assert wired.lock.exited
+    assert any("FAIL at build scheme-master" in m for m in wired.err_lines())
+
+
+def test_best_effort_stage_bare_runtimeerror_continues(wired):
+    wired.failures["constituents"] = RuntimeError("manual CSV dir unreadable")
+
+    result = pipeline.run(AS_OF, echo=wired.echo)
+
+    assert wired.calls == FULL_ORDER  # constituents failed but everything else ran
+    assert isinstance(result, pipeline.PipelineResult)
+    warn = [m for m in wired.err_lines() if "WARN at ingest constituents" in m]
+    assert warn and "RuntimeError" in warn[0]
+
+
 def test_gate_a_block_halts_before_phase2_and_renders_summary(wired):
     wired.gate_reports["A"] = FakeReport(blocking=["nav_daily"])
 
@@ -290,6 +345,29 @@ def test_cli_pipeline_gate_a_block_exit_2(wired):
     result = CliRunner().invoke(app, ["pipeline", "--as-of", "2026-06-11"])
 
     assert result.exit_code == 2
+
+
+def test_cli_pipeline_bare_runtimeerror_exit_2_no_traceback(wired):
+    # B8 backstop end-to-end: a leaked RuntimeError exits 2 via the clean
+    # PipelineError path (a raw escape would surface as CliRunner exit 1
+    # with result.exception set to the RuntimeError).
+    from mfs.cli import app
+
+    wired.failures["scheme_master"] = RuntimeError("Empty AMFI NAVAll snapshot")
+    result = CliRunner().invoke(app, ["pipeline", "--as-of", "2026-06-11"])
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+
+
+def test_cli_pipeline_raw_4xx_exit_2_no_traceback(wired):
+    from mfs.cli import app
+
+    wired.failures["bhavcopy"] = _http_403()
+    result = CliRunner().invoke(app, ["pipeline", "--as-of", "2026-06-11"])
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
 
 
 # --- _latest_amfi_quarter_label ----------------------------------------------

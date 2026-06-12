@@ -44,8 +44,13 @@ CREATE TABLE IF NOT EXISTS scheme_master (
     inception_date      DATE,
     base_fund_id        TEXT NOT NULL,
     is_active           BOOLEAN NOT NULL DEFAULT TRUE,
-    last_seen_date      DATE NOT NULL
+    last_seen_date      DATE NOT NULL,
+    departed_at         DATE
 );
+-- D1 survivorship containment: scheme_master is diff-synced, never truncated.
+-- departed_at records the first run date a scheme was absent from the AMFI
+-- NAVAll listing; NULL while active, cleared again if the scheme re-appears.
+ALTER TABLE scheme_master ADD COLUMN IF NOT EXISTS departed_at DATE;
 CREATE INDEX IF NOT EXISTS idx_scheme_master_active_direct_growth
     ON scheme_master (canonical_category)
     WHERE is_active AND plan_type = 'DIRECT' AND option_type = 'GROWTH';
@@ -185,4 +190,73 @@ CREATE TABLE IF NOT EXISTS scheme_aum_monthly (
     CONSTRAINT chk_scheme_aum_source_amfi CHECK (source_amc = 'amfi_aaum')
 );
 CREATE INDEX IF NOT EXISTS idx_aum_scheme ON scheme_aum_monthly (scheme_code);
+
+-- D2 point-in-time snapshots: one full copy of scheme_master per build() run,
+-- keyed by snapshot_date. Captures universe membership, plan/option/category
+-- assignments AND the benchmark map (benchmark_ticker) as of each run, so
+-- backtests and run-diffs can reconstruct any past universe with a plain SQL
+-- filter. Includes the inactive/departed rows — they are part of the
+-- point-in-time state. Re-running build() on the same date replaces the
+-- partition (see writers.snapshot_scheme_master). Derived artifact: no
+-- coverage contract (listed in coverage.OUT_OF_CONTRACT).
+CREATE TABLE IF NOT EXISTS scheme_master_history (
+    snapshot_date       DATE NOT NULL,
+    scheme_code         TEXT NOT NULL,
+    isin_growth         TEXT,
+    isin_idcw           TEXT,
+    scheme_name         TEXT NOT NULL,
+    amc_name            TEXT NOT NULL,
+    amc_code            TEXT NOT NULL,
+    plan_type           TEXT NOT NULL,
+    option_type         TEXT NOT NULL,
+    amfi_category       TEXT,
+    canonical_category  TEXT,
+    benchmark_ticker    TEXT,
+    inception_date      DATE,
+    base_fund_id        TEXT NOT NULL,
+    is_active           BOOLEAN NOT NULL,
+    last_seen_date      DATE NOT NULL,
+    departed_at         DATE,
+    PRIMARY KEY (snapshot_date, scheme_code)
+);
+
+-- D2 point-in-time snapshots: per-run rank outcomes for all three stages,
+-- keyed by as_of_date. One row per (as_of_date, stage, scheme_code): included
+-- rows carry the flat z-scores, composite score(s) and rank mirrored from the
+-- stage CSVs; excluded rows carry included=false plus an exclusion_reason from
+-- the cross-workstream contract vocabulary:
+--   INSUFFICIENT_HISTORY | MISSING_CORE_METRIC:<name> | STALE_NAV | FILTER:<name>
+-- Re-running the same as_of replaces the partition — DELETE + insert in one
+-- transaction (see writers.persist_rank_history). run_id stays NULL until the
+-- workstream-F run-manifest populates it; the key remains
+-- (as_of_date, stage, scheme_code). Derived artifact: no coverage contract
+-- (listed in coverage.OUT_OF_CONTRACT).
+CREATE TABLE IF NOT EXISTS rank_history (
+    as_of_date               DATE NOT NULL,
+    stage                    SMALLINT NOT NULL,
+    scheme_code              TEXT NOT NULL,
+    canonical_category       TEXT,
+    composite_score          DOUBLE PRECISION,
+    composite_score_stage1   DOUBLE PRECISION,
+    rank_in_category         INTEGER,
+    z_ret_3y_median          DOUBLE PRECISION,
+    z_ret_3y_p25             DOUBLE PRECISION,
+    z_ret_5y_median          DOUBLE PRECISION,
+    z_ret_5y_p25             DOUBLE PRECISION,
+    z_alpha_3y_annualized    DOUBLE PRECISION,
+    z_sortino_3y             DOUBLE PRECISION,
+    z_info_ratio_3y          DOUBLE PRECISION,
+    z_capture_efficiency     DOUBLE PRECISION,
+    z_active_share_median_1y DOUBLE PRECISION,
+    z_style_drift_3y         DOUBLE PRECISION,
+    ptr_latest               DOUBLE PRECISION,
+    aum_impact_cost_days     DOUBLE PRECISION,
+    included                 BOOLEAN NOT NULL,
+    exclusion_reason         TEXT,
+    run_id                   TEXT,
+    PRIMARY KEY (as_of_date, stage, scheme_code),
+    CONSTRAINT chk_rank_history_stage CHECK (stage IN (1, 2, 3))
+);
+CREATE INDEX IF NOT EXISTS idx_rank_history_category
+    ON rank_history (as_of_date, canonical_category);
 

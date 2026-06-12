@@ -80,7 +80,11 @@ _DEFAULT_LAG_DAYS = {
 }
 
 # Tables that are derived artifacts, not ingested sources — no coverage contract.
-OUT_OF_CONTRACT = frozenset({"computed_metrics", "fund_log_returns"})
+# scheme_master_history / rank_history are D2's per-run point-in-time snapshots.
+OUT_OF_CONTRACT = frozenset({
+    "computed_metrics", "fund_log_returns",
+    "scheme_master_history", "rank_history",
+})
 
 
 @dataclass(frozen=True)

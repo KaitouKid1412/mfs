@@ -4,6 +4,10 @@ A stale symbol→ISIN map silently drops rows for symbols renamed by M&A /
 corporate actions, so the cache must self-heal on a weekly cadence. These tests
 pin that behaviour: fresh cache is reused, stale cache triggers a re-pull, and a
 failed re-pull falls back to the stale cache rather than aborting the run.
+
+Also pins B8: an NSE 403 (the archives endpoint's proven failure mode) surfaces
+from ingest_recent as IngestError — never a raw httpx.HTTPStatusError — so the
+pipeline halts via the clean failure path.
 """
 
 from __future__ import annotations
@@ -11,8 +15,10 @@ from __future__ import annotations
 import os
 import time
 
+import httpx
 import pytest
 
+from mfs.errors import IngestError
 from mfs.ingest import bhavcopy
 from mfs.io.http import TransientHttpError
 
@@ -77,5 +83,32 @@ def test_refresh_failure_falls_back_to_stale_cache(cache_path, monkeypatch):
 
 def test_missing_cache_and_failed_fetch_is_fatal(cache_path, monkeypatch):
     monkeypatch.setattr(bhavcopy, "_fetch_with_retry", lambda url: None)  # 404
-    with pytest.raises(RuntimeError):
+    with pytest.raises(IngestError, match="EQUITY_L"):
         bhavcopy.fetch_equity_list()
+
+
+# --- B8: raw 4xx never escapes ingest_recent ---------------------------------
+
+def _raise_403(url):
+    """Simulate what _fetch_with_retry's raise_for_status does on an NSE 403."""
+    req = httpx.Request("GET", url)
+    httpx.Response(403, request=req).raise_for_status()
+
+
+def test_ingest_recent_403_becomes_ingest_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bhavcopy, "fetch_equity_list", lambda *a, **kw: {"AAA": "INE000A01001"}
+    )
+    # No cached bhavcopy files → every weekday goes to _fetch_with_retry.
+    monkeypatch.setattr(
+        bhavcopy.paths, "bhavcopy_raw", lambda d: tmp_path / f"{d.isoformat()}.csv"
+    )
+    monkeypatch.setattr(bhavcopy, "_fetch_with_retry", _raise_403)
+
+    # full=True skips the stock_adv_daily watermark query (no DB in tests).
+    with pytest.raises(IngestError, match="bhavcopy: NSE fetch failed") as excinfo:
+        bhavcopy.ingest_recent(n_days=7, full=True)
+
+    # Source context preserved: status code + URL, chained from the raw error.
+    assert "403" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, httpx.HTTPStatusError)

@@ -168,7 +168,15 @@ def fetch_tri_window(trading_name_upper: str, long_name: str, start: date, end: 
             raise TransientHttpError(str(e)) from e
         if r.status_code in (429, 500, 502, 503, 504):
             raise TransientHttpError(f"{r.status_code} from NSE Indices")
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # 4xx is not transient — translate to IngestError with source
+            # context so it surfaces cleanly (per-ticker isolation in
+            # ingest_all_known aggregates these into the stage failure).
+            raise IngestError(
+                f"NSE Indices {r.status_code} for {long_name!r} at {NIFTY_TRI_URL}"
+            ) from e
         outer = r.json()
     if not isinstance(outer, dict) or "d" not in outer:
         raise TransientHttpError(f"Unexpected NSE envelope: {type(outer).__name__}")

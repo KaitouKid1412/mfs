@@ -36,14 +36,62 @@ BETA_BAND_GENERIC = (0.30, 1.70)     # was per-category tight bands
 # were retired (user verifies these manually for Stage 2 survivors).
 
 
-def apply_hard_filters(metrics: pl.DataFrame) -> pl.DataFrame:
+def _exclusion_reason_expr(rankable: set[str]) -> pl.Expr:
+    """First-failing-filter reason, in the exact order ``apply_hard_filters``
+    applies its filters. Vocabulary (cross-workstream contract, consumed by
+    rank_history / E5 report sections):
+
+        INSUFFICIENT_HISTORY | MISSING_CORE_METRIC:<name> | STALE_NAV
+        | FILTER:<name>
+
+    STALE_NAV maps the (A1-3) per-scheme staleness data_quality_flag; no
+    current flag value produces it yet, so the branch is forward-compatible
+    dead code until that gate lands. NULL means the row passed every filter.
+    """
+    conditions: list[tuple[pl.Expr, str]] = [
+        (pl.col("data_quality_flag") == "INSUFFICIENT_HISTORY",
+         "INSUFFICIENT_HISTORY"),
+        (pl.col("data_quality_flag") == "STALE_NAV", "STALE_NAV"),
+        (pl.col("data_quality_flag") == "POOR", "FILTER:data_quality"),
+        (~pl.col("canonical_category").is_in(list(rankable)).fill_null(False),
+         "FILTER:rankable_category"),
+        (pl.col("capture_efficiency").is_not_null()
+         & (pl.col("capture_efficiency") <= CAPTURE_EFFICIENCY_FLOOR),
+         "FILTER:capture_efficiency"),
+        (pl.col("info_ratio_3y").is_not_null()
+         & (pl.col("info_ratio_3y") <= INFO_RATIO_FLOOR),
+         "FILTER:info_ratio"),
+        (pl.col("r_squared_3y").is_not_null()
+         & ((pl.col("r_squared_3y") < R_SQUARED_BAND[0])
+            | (pl.col("r_squared_3y") > R_SQUARED_BAND[1])),
+         "FILTER:r_squared"),
+        (pl.col("beta_3y").is_not_null()
+         & ((pl.col("beta_3y") < BETA_BAND_GENERIC[0])
+            | (pl.col("beta_3y") > BETA_BAND_GENERIC[1])),
+         "FILTER:beta"),
+    ]
+    expr: pl.Expr = pl.lit(None, dtype=pl.Utf8)
+    for cond, reason in reversed(conditions):
+        expr = pl.when(cond).then(pl.lit(reason)).otherwise(expr)
+    return expr
+
+
+def apply_hard_filters(
+    metrics: pl.DataFrame, *, with_reasons: bool = False,
+) -> pl.DataFrame | tuple[pl.DataFrame, pl.DataFrame]:
     """Drop schemes that are unrankable or catastrophically broken on the
-    quality metrics. Survivors still get differentiated by composite_score."""
+    quality metrics. Survivors still get differentiated by composite_score.
+
+    With ``with_reasons=True`` returns ``(survivors, excluded)`` where
+    ``excluded`` is the dropped rows plus an ``exclusion_reason`` column —
+    the first failing filter in application order, using the contract
+    vocabulary (see ``_exclusion_reason_expr``). Survivors are byte-identical
+    to the default return."""
     thr = get_thresholds()
     rankable = set(thr.get("rankable_categories", []))
 
     if metrics.is_empty():
-        return metrics
+        return (metrics, metrics) if with_reasons else metrics
 
     df = metrics
     df = df.filter(pl.col("data_quality_flag") != "INSUFFICIENT_HISTORY")
@@ -74,4 +122,9 @@ def apply_hard_filters(metrics: pl.DataFrame) -> pl.DataFrame:
             & (pl.col("beta_3y") <= BETA_BAND_GENERIC[1])
         )
     )
-    return df
+    if not with_reasons:
+        return df
+    excluded = metrics.join(
+        df.select("scheme_code"), on="scheme_code", how="anti",
+    ).with_columns(_exclusion_reason_expr(rankable).alias("exclusion_reason"))
+    return df, excluded

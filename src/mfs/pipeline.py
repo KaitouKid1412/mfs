@@ -98,6 +98,8 @@ def run(
     ``CoverageError`` on a blocking gate breach). No partial / stale data
     ever reaches compute or rank-deep.
     """
+    import httpx
+
     from mfs import coverage
     from mfs.compute import orchestrator
     from mfs.db.connection import pipeline_lock
@@ -120,6 +122,19 @@ def run(
                 echo(f"[pipeline] FAIL at {name}:\n{e}", err=True)
                 raise
             echo(f"[pipeline] WARN at {name} (best-effort, continuing):\n{e}", err=True)
+            return None
+        except (httpx.HTTPStatusError, RuntimeError) as e:
+            # B8 backstop: a stage leaked a raw 4xx or bare RuntimeError that
+            # its ingester should have translated to IngestError. Render the
+            # same clean failure output (no traceback) and halt via
+            # PipelineError so the CLI wrapper still exits 2.
+            # (PipelineError subclasses RuntimeError, but the clause above
+            # catches it first, so only genuinely untranslated errors land here.)
+            msg = f"{type(e).__name__}: {e}"
+            if required:
+                echo(f"[pipeline] FAIL at {name}:\n{msg}", err=True)
+                raise PipelineError(f"{name}: {msg}") from e
+            echo(f"[pipeline] WARN at {name} (best-effort, continuing):\n{msg}", err=True)
             return None
 
     gate_reports: list[CoverageReport] = []
