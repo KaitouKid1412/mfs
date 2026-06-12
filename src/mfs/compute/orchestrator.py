@@ -23,8 +23,8 @@ from typing import cast
 import polars as pl
 
 from mfs.compute import (
-    active_share, alignment, alpha, aum_impact, capture, info_ratio,
-    returns, sortino,
+    active_share, alignment, alpha, aum_impact, capture, drawdown,
+    info_ratio, returns, sortino,
 )
 from mfs.config import get_pipeline_config
 from mfs.db import queries as q
@@ -154,6 +154,11 @@ def compute_phase1_for_scheme(
         "capture_efficiency": None,
         "r_squared_3y": None,
         "beta_3y": None,
+        # E2 behavioral-risk display columns (never composite-weighted).
+        "max_dd_3y_pct": None,
+        "max_dd_3y_recovery_days": None,
+        "max_dd_5y_pct": None,
+        "max_dd_5y_recovery_days": None,
         # Cheap rolling-regression diagnostics; Phase 2 derives style_drift
         # from these without re-running the regression.
         "beta_3y_std": None,
@@ -197,6 +202,9 @@ def compute_phase1_for_scheme(
         beta_3y_std=abr.get("beta_std"),
         r_squared_3y_mean=abr.get("r2_mean"),
     )
+    # E2: max drawdown + time-to-recover over the trailing 3y/5y NAV windows.
+    # Display-only — threaded into computed_metrics like alpha_confidence.
+    row.update(drawdown.drawdown_row(aligned.select(["date", "nav"]), as_of))
     return row
 
 

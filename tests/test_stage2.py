@@ -457,6 +457,38 @@ def test_aum_attached_from_aum_map():
 
 
 # ---------------------------------------------------------------------------
+# E1 — cohort-size context columns on survivors
+# ---------------------------------------------------------------------------
+
+
+def test_survivors_carry_cohort_size_columns():
+    """Every survivor row carries n_considered / n_survived for its own
+    category, so 'best of 3' is distinguishable from 'only survivor of 1'
+    (the FMCG cohort-of-one case)."""
+    rows = [
+        _scored_row("L1", category="Large Cap", composite_score=0.9),
+        _scored_row("L2", category="Large Cap", composite_score=0.8),
+        _scored_row("L3", category="Large Cap", composite_score=0.7),
+        _scored_row("F1", category="Flexi Cap", composite_score=0.6),
+    ]
+    survivors, _, coverage = apply_stage2(_df(rows), aum_map={}, final_size=2)
+    by = _by_code(survivors)
+    assert by["L1"]["n_considered"] == 3
+    assert by["L1"]["n_survived"] == 2
+    assert "L3" not in by  # cut by final_size
+    assert by["F1"]["n_considered"] == 1
+    assert by["F1"]["n_survived"] == 1
+    # The survivor columns mirror coverage.csv exactly.
+    cov = {
+        r["canonical_category"]: r for r in coverage.iter_rows(named=True)
+    }
+    assert cov["Large Cap"]["n_considered"] == 3
+    assert cov["Large Cap"]["n_survived"] == 2
+    assert cov["Flexi Cap"]["n_considered"] == 1
+    assert cov["Flexi Cap"]["n_survived"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Coverage report shape
 # ---------------------------------------------------------------------------
 
@@ -533,8 +565,14 @@ def test_run_writes_artifacts(tmp_path):
     # Contract columns flow into the per-category CSVs.
     lc = pl.read_csv(tmp_path / "stage2" / "Large_Cap.csv")
     for col in ("missing_disclosures", "partial_disclosure_flag",
-                "liquidity_flag", "aum_impact_cost_days"):
+                "liquidity_flag", "aum_impact_cost_days",
+                "n_considered", "n_survived"):
         assert col in lc.columns
+    # E3 gap-close: the consolidated mf_report carries the contract columns
+    # too (it is what stage 3 / the investor report consume).
+    report = pl.read_csv(tmp_path / "stage2" / "mf_report.csv")
+    for col in ("liquidity_flag", "n_considered", "n_survived"):
+        assert col in report.columns
 
 
 def test_run_handles_empty_input(tmp_path):

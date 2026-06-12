@@ -157,7 +157,12 @@ def harness(monkeypatch, tmp_path):
     output root to tmp_path. Returns (run, captured_history)."""
     metrics = pl.DataFrame(_universe_rows())
     master = pl.DataFrame([
-        {"scheme_code": c, "scheme_name": f"Fund {c}", "base_fund_id": f"bf_{c}"}
+        {
+            "scheme_code": c,
+            "scheme_name": f"Fund {c}",
+            "base_fund_id": f"bf_{c}",
+            "isin_growth": f"INF{c}GR",
+        }
         for c in metrics["scheme_code"].to_list()
     ])
     hmap = _holdings_map()
@@ -292,6 +297,15 @@ def test_rank_deep_e2e_pinned(harness):
         mc_by[c]["liquidity_flag"] == "OK" for c in FINAL_MID if c != "200003"
     )
 
+    # E1: ISIN + cohort-size context flow into the stage-2 outputs.
+    # Large Cap: 8 funds minus 3 exclusions → pool of 5, all survive.
+    assert by_code["100001"]["isin_growth"] == "INF100001GR"
+    assert by_code["100001"]["n_considered"] == 5
+    assert by_code["100001"]["n_survived"] == 5
+    # Mid Cap: pool of 8, final_size=5 cut.
+    assert mc_by["200001"]["n_considered"] == 8
+    assert mc_by["200001"]["n_survived"] == 5
+
     # A2-11: the tied Small Cap twins really tie, and code asc orders them.
     sc_by = {str(r["scheme_code"]): r for r in sc.iter_rows(named=True)}
     assert abs(
@@ -322,6 +336,9 @@ def test_rank_deep_e2e_pinned(harness):
         "200001 Fund 200001 (Mid Cap) @ 60.0%"
     )
     assert s3_by["200001"]["max_overlap_pct"] == 60.0
+    # E1 columns survive into stage 3 untouched.
+    assert s3_by["200001"]["isin_growth"] == "INF200001GR"
+    assert s3_by["200001"]["n_considered"] == 8
     assert all(
         s3_by[c]["overlap_flag"] is False for c in FINAL_MID
         if c not in ("200001", "200002")

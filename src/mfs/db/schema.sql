@@ -118,6 +118,14 @@ ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS scheme_aum_crore       DOU
 -- |t-stat| >= 1.0. Display-only diagnostic — must never be used as a filter.
 ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS alpha_confidence       DOUBLE PRECISION;
 
+-- Phase 6 E2: max drawdown (positive pct) + calendar days to regain the prior
+-- peak over the trailing 3y/5y NAV windows. Display-only behavioral-risk
+-- columns — never composite-weighted, never used as a filter.
+ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS max_dd_3y_pct           DOUBLE PRECISION;
+ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS max_dd_3y_recovery_days DOUBLE PRECISION;
+ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS max_dd_5y_pct           DOUBLE PRECISION;
+ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS max_dd_5y_recovery_days DOUBLE PRECISION;
+
 -- Phase 6 A1-11 (ADV-coverage guard): fraction (0-1) of total portfolio
 -- weight with no NSE EQ-series ADV match. When > 0.20 the aum_impact_cost_days
 -- metric is stored NULL (it would describe a sliver of the book); the fraction

@@ -18,7 +18,8 @@ Outputs:
   1. ``stage2/<category>.csv`` — top-N_final (default 5) per category,
      ordered by ``composite_score``, with ``stage2_rank``,
      ``partial_coverage_flag``, ``partial_disclosure_flag``,
-     ``missing_disclosures`` and ``liquidity_flag`` columns.
+     ``missing_disclosures``, ``liquidity_flag`` and the E1 cohort-context
+     columns ``n_considered`` / ``n_survived``.
   2. ``stage2/dropped.csv`` — vestigial since D3 (header-only; kept for
      tooling compat).
   3. ``stage2/coverage.csv`` — per-category counts + AUM rollup
@@ -200,8 +201,13 @@ def apply_stage2(
             .with_row_index("stage2_rank", offset=1)
         )
         partial = cat_survivors.height < final_size
+        n_survived = int(cat_survivors.height)
         cat_survivors = cat_survivors.with_columns(
-            pl.lit(partial).alias("partial_coverage_flag")
+            pl.lit(partial).alias("partial_coverage_flag"),
+            # E1: cohort context so the final report distinguishes 'best of
+            # 20' from 'only survivor of 1' (the FMCG cohort-of-one case).
+            pl.lit(int(pool.height)).alias("n_considered"),
+            pl.lit(n_survived).alias("n_survived"),
         )
 
         survivors_chunks.append(cat_survivors)
@@ -211,7 +217,6 @@ def apply_stage2(
             float(cat_survivors["aum_crore"].fill_null(0).sum())
             if not cat_survivors.is_empty() else 0.0
         )
-        n_survived = int(cat_survivors.height)
         coverage_rows.append({
             "canonical_category": cat,
             "n_considered": pool.height,

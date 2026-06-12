@@ -283,6 +283,38 @@ def test_excluded_csv_sorted_with_reasons(tmp_path, monkeypatch):
     ]
 
 
+def test_join_scheme_master_carries_isin_growth(monkeypatch):
+    """E1: the scheme-master join threads isin_growth through as execution
+    metadata; unmatched schemes get a null, never a join error."""
+    from mfs.rank import shortlist
+
+    sm = pl.DataFrame({
+        "scheme_code": ["A"],
+        "scheme_name": ["Fund A"],
+        "base_fund_id": ["amc::a"],
+        "isin_growth": ["INF000000001"],
+    })
+    monkeypatch.setattr(shortlist.q, "scheme_master", lambda **kw: sm)
+    out = shortlist._join_scheme_master(pl.DataFrame({"scheme_code": ["A", "B"]}))
+    by = {r["scheme_code"]: r for r in out.iter_rows(named=True)}
+    assert by["A"]["isin_growth"] == "INF000000001"
+    assert by["B"]["isin_growth"] is None
+    assert "isin_growth" in shortlist.STAGE1_OUTPUT_COLS
+
+
+def test_join_scheme_master_empty_master_emits_null_isin_column(monkeypatch):
+    """Empty-master branch must still emit the isin_growth column (as Utf8
+    nulls) so downstream projections never KeyError."""
+    from mfs.rank import shortlist
+
+    monkeypatch.setattr(
+        shortlist.q, "scheme_master", lambda **kw: pl.DataFrame()
+    )
+    out = shortlist._join_scheme_master(pl.DataFrame({"scheme_code": ["A"]}))
+    assert out["isin_growth"].to_list() == [None]
+    assert out["isin_growth"].dtype == pl.Utf8
+
+
 def test_stage1_ignores_active_share_and_style_drift():
     """Stage 1 must not factor in Phase 2 metrics. Two schemes identical on
     Phase 1 but different on active_share + style_drift should tie."""

@@ -15,10 +15,12 @@ ingest_app = typer.Typer(help="Data ingestion subcommands.")
 build_app = typer.Typer(help="Build derived datasets.")
 compute_app = typer.Typer(help="Compute metric snapshots.")
 db_app = typer.Typer(help="Postgres data layer (init / migrate / verify).")
+shortlist_app = typer.Typer(help="Shortlist run-dir utilities (run-to-run diff).")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(build_app, name="build")
 app.add_typer(compute_app, name="compute")
 app.add_typer(db_app, name="db")
+app.add_typer(shortlist_app, name="shortlist")
 
 log = get_logger("mfs.cli")
 
@@ -539,6 +541,43 @@ def rank_deep_cmd(
         f"@ overlap > {overlap_threshold}%; "
         f"breaches: {result['stage3']['breaches_file']})"
     )
+
+
+@shortlist_app.command("diff")
+def shortlist_diff_cmd(
+    run1: str = typer.Argument(
+        ..., help="Older run: a date dir name under data/output/shortlist "
+        "(e.g. 2026-05-22) or a path to a run dir."
+    ),
+    run2: str = typer.Argument(
+        ..., help="Newer run: a date dir name under data/output/shortlist "
+        "or a path to a run dir."
+    ),
+):
+    """E7 run-to-run monitoring: ENTERED / EXITED / RANK-MOVED per category
+    between two shortlist runs, with reasons derived from the run artifacts
+    (excluded.csv, dropped.csv, rank files). Pure file diff — no DB access.
+
+    Prints the markdown diff and writes ``<run2>/DIFF_vs_<run1>.md``.
+    """
+    configure_logging()
+    from pathlib import Path
+
+    from mfs.rank import diff as diff_mod
+
+    def _resolve(run: str) -> Path:
+        p = Path(run)
+        if p.is_dir():
+            return p
+        p = paths.shortlist_dir(run)
+        if not p.is_dir():
+            typer.echo(f"ERROR: no shortlist run dir at {p}", err=True)
+            raise typer.Exit(code=1)
+        return p
+
+    text, out_path = diff_mod.write_diff(_resolve(run1), _resolve(run2))
+    typer.echo(text)
+    typer.echo(f"diff written: {out_path}")
 
 
 @app.command("status")

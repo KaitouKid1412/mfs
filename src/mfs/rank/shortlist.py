@@ -30,6 +30,8 @@ STAGE1_OUTPUT_COLS = [
     "rank",
     "scheme_code",
     "scheme_name",
+    # E1: execution metadata — the ISIN an investor actually transacts on.
+    "isin_growth",
     "composite_score",
     "z_ret_3y_median",
     "z_ret_3y_p25",
@@ -52,6 +54,11 @@ STAGE1_OUTPUT_COLS = [
     "capture_efficiency",
     "r_squared_3y",
     "beta_3y",
+    # E2 drawdown display columns (behavioral-risk context; never weighted).
+    "max_dd_3y_pct",
+    "max_dd_3y_recovery_days",
+    "max_dd_5y_pct",
+    "max_dd_5y_recovery_days",
     "data_quality_flag",
 ]
 
@@ -113,8 +120,12 @@ def _join_scheme_master(metrics: pl.DataFrame) -> pl.DataFrame:
         return metrics.with_columns(
             pl.lit(None, dtype=pl.Utf8).alias("scheme_name"),
             pl.lit(None, dtype=pl.Utf8).alias("base_fund_id"),
+            pl.lit(None, dtype=pl.Utf8).alias("isin_growth"),
         )
-    sm = sm.select(["scheme_code", "scheme_name", "base_fund_id"])
+    # E1: isin_growth rides along as pure display/execution metadata —
+    # 665/665 rankable DIRECT+GROWTH schemes carry it, so no null handling
+    # beyond pass-through.
+    sm = sm.select(["scheme_code", "scheme_name", "base_fund_id", "isin_growth"])
     return metrics.join(sm, on="scheme_code", how="left")
 
 

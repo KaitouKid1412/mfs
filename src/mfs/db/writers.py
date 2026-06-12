@@ -305,6 +305,9 @@ _COMPUTED_METRICS_COLS = [
     "info_ratio_3y",
     "capture_up", "capture_down", "capture_efficiency",
     "r_squared_3y", "beta_3y",
+    # E2 drawdown display columns (never composite-weighted).
+    "max_dd_3y_pct", "max_dd_3y_recovery_days",
+    "max_dd_5y_pct", "max_dd_5y_recovery_days",
     # Phase 2 columns (nullable; populated incrementally across 2.0-2.3).
     "beta_3y_std", "r_squared_3y_mean", "style_drift_3y",
     "active_share_median_1y", "ptr_latest", "aum_impact_cost_days",
