@@ -75,14 +75,16 @@ class FreshnessConfig(BaseModel):
     # days allowed in the last 30 NIFTY 50 TRI trading days. None disables the
     # check (the rollback switch, mirroring the other nullable freshness keys).
     max_nav_interior_gap_days: Optional[int] = 2
-    # Phase 2.1+ ingestion staleness windows. None = freshness check skipped
-    # (used when an ingestion stage hasn't shipped yet, so the table is empty).
-    max_holdings_lag_days: Optional[int] = 45        # monthly disclosures (AMFI mandate: by 10th)
-    max_constituents_lag_days: Optional[int] = 45    # monthly index rebalance cadence
-    max_ptr_lag_days: Optional[int] = 45             # same as holdings (same source PDF)
+    # Phase 2.1+ ingestion staleness windows (B7/D9: live BLOCKING gates on
+    # the GLOBAL MAX(date) per table — whole-source staleness halts the run;
+    # per-fund gaps stay advisory in coverage Gate B). None = check skipped
+    # (rollback switch). Defaults mirror configs/pipeline.yaml exactly.
+    max_holdings_lag_days: Optional[int] = 75        # monthly (AMFI by-10th mandate) + 1 missed cycle
+    max_constituents_lag_days: Optional[int] = 75    # derived monthly in-pipeline (D9)
+    max_ptr_lag_days: Optional[int] = 75             # same factsheet source/cadence as holdings
     # Phase 2.3
-    max_stock_adv_lag_days: Optional[int] = 7        # NSE bhavcopy daily; allow weekend slip
-    max_aum_lag_days: Optional[int] = 45             # AUM tracks holdings cadence
+    max_stock_adv_lag_days: Optional[int] = 10       # NSE bhavcopy daily; holiday + weekend slack
+    max_aum_lag_days: Optional[int] = 150            # AMFI AAUM quarterly (~45d after quarter end)
 
 
 class FiltersConfig(BaseModel):

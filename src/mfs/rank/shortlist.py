@@ -421,6 +421,86 @@ def _latest_holdings_loader() -> Callable[[str], pl.DataFrame]:
     return loader
 
 
+# --- D9 active-share activation banner --------------------------------------
+
+# Mirrors compute.active_share.MIN_SNAPSHOTS_FOR_MEDIAN: the trailing median
+# refuses to report below this many matched (holdings, constituents) months.
+MIN_ACTIVE_SHARE_SNAPSHOTS = 3
+
+
+def _month_add(m: date, n: int) -> date:
+    """First-of-month date `n` months after month `m`."""
+    total = m.year * 12 + (m.month - 1) + n
+    return date(total // 12, total % 12 + 1, 1)
+
+
+def _estimate_activation_date(
+    matched_months: list[date], as_of: date, min_snapshots: int
+) -> date:
+    """Estimated calendar date when >=min_snapshots matched months exist.
+
+    Data month M's disclosures land ~10th of M+1 (AMFI mandate), so with
+    monthly accrual the last needed month is base+missing and is published
+    ~10th of base+missing+1, where base is the latest matched month (or the
+    last completed month before as_of when nothing has matched yet)."""
+    missing = max(min_snapshots - len(matched_months), 0)
+    if matched_months:
+        base = max(matched_months)
+        base = date(base.year, base.month, 1)
+    else:
+        base = _month_add(date(as_of.year, as_of.month, 1), -1)
+    target = _month_add(base, missing + 1)
+    return date(target.year, target.month, 10)
+
+
+def active_share_activation_banner(
+    *,
+    matched_months: list[date],
+    survivors: pl.DataFrame,
+    as_of: date,
+    min_snapshots: int = MIN_ACTIVE_SHARE_SNAPSHOTS,
+) -> str:
+    """One-line activation status for the dormant active_share signal (D9).
+
+    Until any stage-2 survivor carries a non-null active_share_median_1y,
+    report how many matched (holdings, constituents) months have accrued of
+    the ``min_snapshots`` the trailing median needs, plus the estimated
+    go-live date under monthly accrual. Once live, report the non-null share
+    of the stage-2 pool instead."""
+    col = "active_share_median_1y"
+    if not survivors.is_empty() and col in survivors.columns:
+        n_nonnull = int(survivors[col].is_not_null().sum())
+        if n_nonnull > 0:
+            n = survivors.height
+            return (
+                f"[rank] active_share LIVE: non-null for {n_nonnull}/{n} "
+                f"stage-2 survivors ({n_nonnull / n * 100.0:.0f}%)"
+            )
+    est = _estimate_activation_date(matched_months, as_of, min_snapshots)
+    return (
+        f"[rank] active_share: n_matched_months={len(matched_months)}/"
+        f"{min_snapshots}, estimated activation {est.isoformat()}"
+    )
+
+
+def emit_active_share_banner(
+    as_of: date,
+    survivors: pl.DataFrame,
+    matched_months: list[date] | None = None,
+) -> str:
+    """Print (and return) the activation banner. ``matched_months=None``
+    queries the live DB over the trailing 12-month window ending the month
+    before ``as_of`` (the same window active_share medians use)."""
+    if matched_months is None:
+        window_end = _month_add(date(as_of.year, as_of.month, 1), -1)
+        matched_months = q.matched_holdings_constituents_months(window_end)
+    banner = active_share_activation_banner(
+        matched_months=matched_months, survivors=survivors, as_of=as_of
+    )
+    print(banner)
+    return banner
+
+
 def _history_chunk(
     df: pl.DataFrame,
     *,
@@ -621,6 +701,14 @@ def rank_deep(
             scored_pool, aum_map, out_dir,
             pool_size=pool_size, final_size=final_size,
         )
+
+    # D9 activation banner: surface how close the dormant active_share signal
+    # is to its 3-matched-month minimum (or its live coverage once non-null).
+    # Best-effort — a banner failure must never break ranking.
+    try:
+        emit_active_share_banner(as_of, stage2_result["survivors"])
+    except Exception as e:  # noqa: BLE001
+        log.warning("rank.active_share_banner_failed", err=str(e))
 
     # Stage 3.
     stage3_result = stage3_mod.run(

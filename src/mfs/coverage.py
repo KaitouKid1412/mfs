@@ -19,9 +19,10 @@ Two gates run the contracts:
     the expensive Phase-2 ingest.
   * Gate B (ADVISORY) — holdings, PTR, AAUM, constituents, stock-ADV. A breach
     is reported loudly and the affected funds are excluded downstream, but the
-    run continues. Runs after Phase-2 ingest, before compute. This is the ONLY
-    coverage net for these sources, since their freshness gates are disabled
-    (null) in pipeline.yaml.
+    run continues. Runs after Phase-2 ingest, before compute. Gate B is the
+    PER-FUND net for these sources; whole-source staleness (the table's global
+    MAX going dark for >1 publication cycle) is BLOCKING via the freshness
+    thresholds in pipeline.yaml (B7) and halts the run in check_freshness.
 
 The engine answers the six questions; ``render`` turns a report into a bordered
 text block printed to stdout (NOT through structlog, which would flatten a table
@@ -172,7 +173,9 @@ CONTRACTS: list[Contract] = [
         # NIFTY100 ESG TRI has no exact passive tracker (coverage_to_95.md) — it
         # can never reach 100%, so it's an accepted exception, not a gap.
         accepted_missing=frozenset({"NIFTY100 ESG TRI"}),
-        remediation="tools/derive_constituents.py  then  mfs ingest constituents",
+        remediation="uv run python tools/derive_constituents.py --ym <YYYY-MM>  "
+                    "then  mfs ingest constituents  (the pipeline derives the "
+                    "latest month automatically — D9)",
     ),
     Contract(
         table="stock_adv_daily", date_col="date", cadence=TRADING_DAY,

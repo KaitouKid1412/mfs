@@ -53,16 +53,43 @@ freshness:
   # days (~6.7%), one above the special-session (Muhurat / budget Saturday)
   # base rate of ≤1 per any 30-trading-day span.
   max_nav_interior_gap_days: 2
-  # Phase 2.2+: holdings, benchmark constituents, and PTR. All monthly cadence
-  # (AMFI mandate: publish by 10th of next month) — 45-day lag is one full
-  # cycle plus slack. Set to null while the corresponding tables are empty.
-  max_holdings_lag_days: null
-  max_constituents_lag_days: null
-  max_ptr_lag_days: null
-  # Phase 2.3: stock ADV (NSE bhavcopy), per-scheme AUM.
-  # All null until the respective ingestion stage has shipped data.
-  max_stock_adv_lag_days: null
-  max_aum_lag_days: null
+  # Phase 2.2+/2.3 monthly & quarterly signals (B7/D9: real thresholds; the
+  # nulls were a Phase-2 bootstrap and the tables have long since shipped).
+  # Halting-semantics classification:
+  #   BLOCKING  = whole-source staleness, enforced by freshness.check_freshness
+  #               (raise_on_fail=True before compute). These thresholds gate
+  #               the GLOBAL MAX(date) of each table: a breach means the entire
+  #               source went dark for more than one publication cycle —
+  #               systemic, so the run halts (fail-fast invariant).
+  #   ADVISORY  = per-fund / per-AMC coverage, reported by coverage Gate B
+  #               (never halts): one AMC's missing PTR or holdings must not
+  #               stop the run; the affected funds are excluded or penalized
+  #               downstream and the gap is attributed in the Gate B report.
+  # Calibration (empirical table MAX dates verified live 2026-06-13):
+  # Holdings: monthly, AMFI mandate publish-by-10th-of-next-month. MAX
+  # 2026-05-01 (lag 43d) — 75d allows one fully missed monthly cycle + slack.
+  max_holdings_lag_days: 75
+  # Constituents: derived monthly from index-tracker holdings — D9 put
+  # ingest/constituents/derive.py on the pipeline cadence (stage 'derive
+  # constituents'), so a stalled derivation halts the run within ~2 cycles.
+  # MAX 2026-04-01 (lag 73d at calibration): the 2026-05 derive must run with
+  # this change or the gate trips ~2026-06-15. Remediation (~10 min):
+  #   uv run python tools/derive_constituents.py --ym <YYYY-MM>
+  #   uv run mfs ingest constituents
+  max_constituents_lag_days: 75
+  # PTR: same factsheet source/cadence as holdings; MAX 2026-05-01 (lag 43d).
+  # This gates the GLOBAL MAX(as_of_month) via q.latest_ptr_date, so quant's
+  # deliberate annual-report-only PTR rows (2024-03) can never trip it — no
+  # per-AMC exemption machinery needed (per-AMC gaps stay in Gate B).
+  max_ptr_lag_days: 75
+  # Stock ADV: NSE bhavcopy is daily with a 75d ingest window; MAX 2026-06-11
+  # (lag 2d). 10d tolerates holiday clusters + weekend slip while catching a
+  # dead scraper within two weeks.
+  max_stock_adv_lag_days: 10
+  # AAUM: AMFI publishes QUARTERLY, ~45d after quarter end; MAX 2026-03-01
+  # (lag 104d at calibration is nominal). 150d halts only if an entire
+  # quarterly publication is skipped.
+  max_aum_lag_days: 150
 
 filters:
   plan_type: DIRECT

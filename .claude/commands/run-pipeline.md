@@ -17,8 +17,9 @@ There is one end-to-end runner: **`uv run mfs pipeline`**. It orchestrates, in o
 ```
 ingest navs (incremental) → ingest benchmarks → ingest tbill → build scheme-master
   → COVERAGE GATE A (BLOCKING: NAV/benchmark/risk-free/scheme_master)
-  → ingest amfi-aum → ingest managers (PTR) → ingest bhavcopy
-  → ingest constituents (best-effort) → ingest holdings
+  → ingest amfi-aum → ingest managers (PTR) → ingest bhavcopy → ingest holdings
+  → derive constituents (latest month, from tracker holdings — required)
+  → ingest constituents (derived CSVs, best-effort)
   → COVERAGE GATE B (ADVISORY: holdings/PTR/AAUM/constituents/stock-ADV)
   → freshness gate → compute phase1 → rank-deep (stage 1 + 2 + 3)
 ```
@@ -35,7 +36,7 @@ Flags: `--as-of YYYY-MM-DD` (default today), `--skip-phase2` (Phase-1-only debug
 
 ## Two invariants (do not violate)
 
-1. **Every dataset must be fresh.** NAVs, NSE TRI closes, and the 91-day T-bill series each have a max-lag in `configs/pipeline.yaml` under `freshness:` (NAV/benchmark 5 business days, T-bill 14 days, scheme_master 1 day). The monthly/quarterly signals (holdings, constituents, PTR, AUM, stock-ADV) have their `freshness:` lag set to `null` = the FreshnessError gate is disabled for them — **but Coverage Gate B now covers them** (expected-vs-actual entity counts, reported as advisory gaps). Before compute, the pipeline asserts the daily series are in-bounds and raises `FreshnessError` otherwise — **do not bypass; do not pass `skip_freshness=True`.**
+1. **Every dataset must be fresh.** NAVs, NSE TRI closes, and the 91-day T-bill series each have a max-lag in `configs/pipeline.yaml` under `freshness:` (NAV/benchmark 5 business days, T-bill 14 days, scheme_master 1 day). The monthly/quarterly signals are now BLOCKING too: holdings/PTR/constituents 75 days, AAUM 150 days (quarterly), stock-ADV 10 days — a systemically stale signal halts the run with `FreshnessError`; per-AMC gaps within a fresh signal stay advisory in Gate B. Constituents remediation: `uv run python tools/derive_constituents.py --ym <YYYY-MM>` then `uv run mfs ingest constituents` (the pipeline's derive stage does this automatically each run). **Do not bypass; do not pass `skip_freshness=True`.**
 
 2. **Every scrape must succeed within its retry budget.** The HTTP layer retries transient errors. If retries are exhausted for AMFI / NSE / RBI, the stage raises `IngestError`. **Do not silently skip a failed window/ticker/prid.** Re-run the failing stage once; if it still fails, surface the root cause (server outage? renamed field? broken regex?) and STOP.
 

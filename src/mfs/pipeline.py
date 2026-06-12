@@ -130,8 +130,9 @@ def run(
     Factsheet ingest (holdings/PTR/AUM via the per-AMC factsheet adapters)
     plus bhavcopy plus Phase 3.C per-scheme portfolio Excels are required
     for Stage 2/3 of rank-deep to produce non-trivial output. Constituents
-    ingest is best-effort — it no-ops cleanly if the manual CSV directory
-    is empty.
+    are DERIVED in-pipeline from the just-ingested index-tracker holdings
+    (D9: required stage), then the CSV ingest upserts them (best-effort —
+    it no-ops cleanly if the directory is empty).
 
     Halts at the first REQUIRED stage that fails by raising ``PipelineError``
     (the original ``IngestError``/``PipelineError`` from the stage, or
@@ -264,13 +265,6 @@ def run(
                 lambda: bhavcopy_mod.ingest_recent(n_days=75, full=full),
             )
 
-            # ----- Phase 2.2.B: index constituent weights (best-effort, manual CSV) -----
-            _stage(
-                "ingest constituents (manual CSVs)",
-                lambda: constituents.run_all(),
-                required=False,
-            )
-
             # ----- Phase 3.C: per-AMC monthly portfolio Excels (HDFC + SBI + Nippon) -----
             # force=full (B9): --full re-downloads the current data month's
             # ~640 Excels, re-parses, and re-writes (shrinkage guard overridden).
@@ -279,11 +273,29 @@ def run(
                 lambda: holdings.run_all(ym=None, force=full),
             )
 
+            # ----- D9: derive constituent weights for the latest holdings month
+            # from the just-ingested index-tracker portfolios, so
+            # index_constituents_monthly accrues monthly (active_share needs
+            # >=3 matched months). Local-only (DB + CSVs); per-index misses are
+            # SKIPPED rows, so a raise here is systemic and halts. -----
+            _stage(
+                "derive constituents (latest month)",
+                constituents.derive_latest_month,
+            )
+
+            # ----- Phase 2.2.B: ingest constituent weight CSVs (the freshly
+            # derived month plus any operator backfills) -----
+            _stage(
+                "ingest constituents (derived CSVs)",
+                lambda: constituents.run_all(),
+                required=False,
+            )
+
             # ----- Coverage Gate B (ADVISORY): holdings / PTR / AAUM /
-            # constituents / stock-ADV. This is the ONLY coverage net for these
-            # signals (their freshness gates are null in pipeline.yaml). Gaps are
-            # reported loudly and the affected funds are excluded downstream; the
-            # run continues (these are advisory signals, not base data). -----
+            # constituents / stock-ADV. Gate B is the PER-FUND net for these
+            # signals: gaps are reported loudly and the affected funds are
+            # excluded downstream; the run continues. Whole-source staleness is
+            # instead BLOCKING via the freshness thresholds (B7) below. -----
             _coverage_gate("B", halt_on_block=False)
 
         # ----- freshness gate before compute -----

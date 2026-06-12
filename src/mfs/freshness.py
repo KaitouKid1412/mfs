@@ -3,6 +3,15 @@
 Compute and rank stages refuse to run if these checks don't pass. Thresholds are
 configured under `freshness:` in pipeline.yaml.
 
+Blocking-vs-advisory classification (B7): every check here gates the GLOBAL
+MAX(date) of a table and is BLOCKING — a stale global max means the entire
+source went dark for more than one publication cycle (systemic), so the
+pipeline halts via ``raise_on_fail=True``. Per-fund / per-AMC gaps are NOT
+this module's job: they stay in coverage Gate B (advisory, never halts), so
+one AMC's missing PTR can't stop the run. That split is why e.g. quant's
+deliberate annual-only PTR rows can never trip ``max_ptr_lag_days`` — the
+global max is carried by every other AMC's monthly rows.
+
 Indian business days approximated by skipping Saturday/Sunday only — the
 `max_*_lag_bdays` thresholds carry enough slack to cover NSE/AMFI holidays.
 """

@@ -23,5 +23,6 @@ mfs.paths.ticker_slug().
 from __future__ import annotations
 
 from mfs.ingest.constituents._run import run_all, run_for_ticker
+from mfs.ingest.constituents.derive import derive_latest_month, derive_month
 
-__all__ = ["run_all", "run_for_ticker"]
+__all__ = ["run_all", "run_for_ticker", "derive_latest_month", "derive_month"]

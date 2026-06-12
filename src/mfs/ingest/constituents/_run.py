@@ -20,6 +20,16 @@ log = get_logger(__name__)
 
 _YM_RE = re.compile(r"^(\d{4})-(\d{2})$")
 
+# D9 [REVIEW-EXTENDED]: tickers derived (and ingested) on top of the
+# benchmark_ticker column of configs/benchmarks.csv. NIFTY 50 TRI is the
+# equity sleeve of the three hybrid benchmarks and NIFTY Bank TRI is the
+# banking benchmark candidate — both have liquid Direct+Growth index-fund
+# trackers in holdings_monthly (verified live 2026-06-13), and both already
+# have TRI series in benchmark_daily. They are not (yet) any category's
+# mapped benchmark, so discover_tickers would otherwise never ingest the
+# CSVs derive.py writes for them.
+_EXTRA_TICKERS: list[str] = ["NIFTY 50 TRI", "NIFTY Bank TRI"]
+
 
 def _parse_ym(stem: str) -> date | None:
     m = _YM_RE.match(stem)
@@ -135,6 +145,10 @@ def discover_tickers() -> list[str]:
                 if t and t not in seen:
                     seen.add(t)
                     tickers.append(t)
+    for t in _EXTRA_TICKERS:
+        if t not in seen:
+            seen.add(t)
+            tickers.append(t)
     # Keep only those with a directory present
     out: list[str] = []
     for t in tickers:

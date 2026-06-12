@@ -906,8 +906,8 @@ def pipeline_run_all(
     Factsheet ingest (holdings/PTR/AUM via the per-AMC factsheet adapters)
     plus bhavcopy plus Phase 3.C per-scheme portfolio Excels are required
     for Stage 2/3 of rank-deep to produce non-trivial output. Constituents
-    ingest is best-effort — it no-ops cleanly if the manual CSV directory
-    is empty.
+    are derived in-pipeline from index-tracker holdings (D9), then the CSV
+    ingest upserts them (best-effort — no-ops cleanly if the dir is empty).
 
     Halts at the first REQUIRED stage that fails. No partial / stale data
     ever reaches compute or rank-deep.

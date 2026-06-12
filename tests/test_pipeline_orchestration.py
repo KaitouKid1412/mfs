@@ -30,12 +30,18 @@ from mfs.rank import shortlist
 AS_OF = date(2026, 6, 11)
 
 # Stage order as wired in pipeline.run (gate entries are coverage gates).
+# D9: constituents are DERIVED from the just-ingested tracker holdings, then
+# ingested — both stages run after holdings and before Gate B.
 FULL_ORDER = [
     "navs", "benchmarks", "hybrids", "tbill", "scheme_master", "gate_A",
-    "amfi_aum", "managers", "bhavcopy", "constituents", "holdings", "gate_B",
+    "amfi_aum", "managers", "bhavcopy", "holdings", "derive_constituents",
+    "constituents", "gate_B",
     "freshness", "phase1", "rank_deep",
 ]
-PHASE2_STAGES = ["amfi_aum", "managers", "bhavcopy", "constituents", "holdings", "gate_B"]
+PHASE2_STAGES = [
+    "amfi_aum", "managers", "bhavcopy", "holdings", "derive_constituents",
+    "constituents", "gate_B",
+]
 
 RANK_RESULT = {
     "as_of": AS_OF.isoformat(),
@@ -118,6 +124,9 @@ def wired(monkeypatch) -> Harness:
     monkeypatch.setattr(managers, "run_all", make("managers", {}))
     monkeypatch.setattr(bhavcopy, "ingest_recent", make("bhavcopy", {}))
     monkeypatch.setattr(constituents, "run_all", make("constituents", {}))
+    monkeypatch.setattr(
+        constituents, "derive_latest_month", make("derive_constituents", {})
+    )
     monkeypatch.setattr(holdings, "run_all", make("holdings", {}))
     monkeypatch.setattr(freshness, "check_freshness", make("freshness"))
     monkeypatch.setattr(orchestrator, "run_phase1", make("phase1"))
@@ -203,7 +212,27 @@ def test_best_effort_stage_failure_continues(wired):
     assert wired.calls == FULL_ORDER  # constituents failed but everything else ran
     assert isinstance(result, pipeline.PipelineResult)
     assert any(
-        "WARN at ingest constituents (manual CSVs)" in m for m in wired.err_lines()
+        "WARN at ingest constituents (derived CSVs)" in m for m in wired.err_lines()
+    )
+
+
+def test_derive_constituents_is_required_and_halts(wired):
+    """D9: a derivation failure is systemic (local DB + CSV writes only) and
+    must halt before the constituents ingest / Gate B."""
+    wired.failures["derive_constituents"] = IngestError(
+        "derive constituents: holdings_monthly is empty"
+    )
+
+    with pytest.raises(IngestError, match="holdings_monthly is empty"):
+        pipeline.run(AS_OF, echo=wired.echo)
+
+    assert wired.calls == ["navs", "benchmarks", "hybrids", "tbill",
+                           "scheme_master", "gate_A", "amfi_aum", "managers",
+                           "bhavcopy", "holdings", "derive_constituents"]
+    assert wired.lock.exited
+    assert any(
+        "FAIL at derive constituents (latest month)" in m
+        for m in wired.err_lines()
     )
 
 
@@ -308,7 +337,7 @@ def test_lock_contention_raises_pipeline_error(wired):
 
 # --- skip_phase2 ------------------------------------------------------------
 
-def test_skip_phase2_skips_exactly_the_six_phase2_stages(wired):
+def test_skip_phase2_skips_exactly_the_phase2_stages(wired):
     pipeline.run(AS_OF, skip_phase2=True, echo=wired.echo)
 
     expected = [s for s in FULL_ORDER if s not in PHASE2_STAGES]

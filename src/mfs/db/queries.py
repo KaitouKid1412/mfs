@@ -8,7 +8,7 @@ Each function is a thin wrapper around `psycopg.connect().execute()` followed by
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import NamedTuple
 
 import polars as pl
@@ -310,6 +310,32 @@ def latest_ptr_date() -> date | None:
     if val is None:
         return None
     return val.date() if hasattr(val, "date") else val
+
+
+def matched_holdings_constituents_months(
+    window_end: date, window_months: int = 12
+) -> list[date]:
+    """Months (first-of-month) present in BOTH holdings_monthly and
+    index_constituents_monthly within the trailing ``window_months`` window
+    ending at ``window_end`` (inclusive). Input for the D9 active-share
+    activation banner: active_share needs >=3 such matched monthly snapshots
+    before any fund can report a trailing median."""
+    window_start = window_end - timedelta(days=31 * window_months)
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT DISTINCT i.as_of_month
+            FROM index_constituents_monthly i
+            WHERE i.as_of_month <= %s AND i.as_of_month >= %s
+              AND EXISTS (
+                  SELECT 1 FROM holdings_monthly h
+                  WHERE h.as_of_month = i.as_of_month
+              )
+            ORDER BY 1
+            """,
+            (window_end, window_start),
+        ).fetchall()
+    return [v.date() if hasattr(v, "date") else v for (v,) in rows]
 
 
 # ---------------------------------------------------------------------------
