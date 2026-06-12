@@ -493,7 +493,8 @@ def rank_deep_cmd(
     overlap_threshold: float = typer.Option(
         30.0,
         help="Stage 3 overlap threshold percent (default 30.0). Pairs strictly "
-        "above this are dropped in iteration.",
+        "above this are flagged as breaches (locked D4: keep-both + flag; "
+        "no fund is dropped for overlap).",
     ),
     skip_phase2_compute: bool = typer.Option(
         False, "--skip-phase2-compute",
@@ -502,12 +503,13 @@ def rank_deep_cmd(
     ),
 ):
     """Run the staged pipeline: Stage 1 Phase-1 ranking + Stage 2 Phase-2
-    re-rank + Stage 3 iterative overlap drop.
+    re-rank + Stage 3 overlap flagging (locked D4: keep-both + flag).
 
     Stage 1 outputs land in ``<as_of>/stage1/`` (per-category CSVs + parquet,
     plus ``mf_report``). Stage 2 in ``<as_of>/stage2/`` (re-ranked survivors,
-    dropped, coverage, mf_report). Stage 3 in ``<as_of>/stage3/`` (final
-    picks per category, dropped, overlap_pairs, mf_report).
+    dropped, coverage, mf_report). Stage 3 in ``<as_of>/stage3/`` (every
+    Stage 2 survivor per category with overlap-flag columns, plus
+    overlap_breaches, overlap_pairs, overlap_matrix, mf_report).
     """
     configure_logging()
     from mfs.rank import shortlist
@@ -532,9 +534,10 @@ def rank_deep_cmd(
     )
     typer.echo(
         f"stage 3: final={result['stage3']['n_final']} "
-        f"dropped={result['stage3']['n_dropped']} "
-        f"@ overlap > {overlap_threshold}% "
-        f"(dropped: {result['stage3']['dropped_file']})"
+        f"flagged={result['stage3']['n_flagged']} "
+        f"({result['stage3']['n_breach_pairs']} breach pair(s) "
+        f"@ overlap > {overlap_threshold}%; "
+        f"breaches: {result['stage3']['breaches_file']})"
     )
 
 
@@ -936,7 +939,7 @@ def pipeline_run_all(
     )
     typer.echo(
         f"  stage 3: final={result.stage3_counts['n_final']} "
-        f"dropped={result.stage3_counts['n_dropped']}"
+        f"overlap-flagged={result.stage3_counts['n_flagged']}"
     )
 
 

@@ -133,9 +133,14 @@ def apply_stage2(
     for cat_tuple, grp in scored.group_by("canonical_category"):
         cat = cat_tuple[0]
         disclosures = disclosure_metrics_for_category(cat)
-        # Tag with Stage 1 rank within the pool.
+        # Tag with Stage 1 rank within the pool. A2-11 determinism:
+        # (composite desc, scheme_code asc) so tied composites don't inherit
+        # arbitrary row order.
         pool = (
-            grp.sort("composite_score_stage1", descending=True, nulls_last=True)
+            grp.sort(
+                ["composite_score_stage1", "scheme_code"],
+                descending=[True, False], nulls_last=True,
+            )
             .head(pool_size)
             .with_row_index("stage1_rank", offset=1)
         )
@@ -185,8 +190,12 @@ def apply_stage2(
                 pl.lit(0.0).alias(f"z_{m}") for m in POOL_Z_METRICS
             )
         re_scored = composite_score_stage2(pool_z)
+        # A2-11 determinism: composite desc, scheme_code asc.
         cat_survivors = (
-            re_scored.sort("composite_score", descending=True, nulls_last=True)
+            re_scored.sort(
+                ["composite_score", "scheme_code"],
+                descending=[True, False], nulls_last=True,
+            )
             .head(final_size)
             .with_row_index("stage2_rank", offset=1)
         )
@@ -260,7 +269,9 @@ def run(
         for cat_tuple, grp in survivors.group_by("canonical_category"):
             cat = cat_tuple[0]
             safe = "".join(c if c.isalnum() else "_" for c in cat)
-            sorted_grp = grp.sort("stage2_rank")
+            # stage2_rank is already deterministic (A2-11); scheme_code asc
+            # is the backstop should it ever be null.
+            sorted_grp = grp.sort(["stage2_rank", "scheme_code"], nulls_last=True)
             csv_path = stage2_dir / f"{safe}.csv"
             parquet_path = stage2_dir / f"{safe}.parquet"
             sorted_grp.write_csv(csv_path)
@@ -293,7 +304,8 @@ def run(
 
     if report_chunks:
         report = pl.concat(report_chunks, how="diagonal_relaxed").sort(
-            ["canonical_category", "stage2_rank"]
+            ["canonical_category", "stage2_rank", "scheme_code"],
+            nulls_last=True,
         )
         report.write_csv(stage2_dir / "mf_report.csv")
         report.write_parquet(stage2_dir / "mf_report.parquet", compression="zstd")

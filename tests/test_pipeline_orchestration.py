@@ -46,8 +46,8 @@ RANK_RESULT = {
         "coverage_file": "cov.csv", "dropped_file": "dropped.csv",
     },
     "stage3": {
-        "dir": "stage3", "n_final": 4, "n_dropped": 1,
-        "dropped_file": "dropped.csv", "overlap_pairs_file": "pairs.csv",
+        "dir": "stage3", "n_final": 4, "n_flagged": 1, "n_breach_pairs": 1,
+        "breaches_file": "breaches.csv", "overlap_pairs_file": "pairs.csv",
     },
 }
 
@@ -326,7 +326,7 @@ def test_cli_pipeline_success_exit_0(wired):
     assert result.exit_code == 0, result.output
     assert "pipeline done. as_of=2026-06-11" in result.output
     assert "stage 2: survivors=5 dropped=3" in result.output
-    assert "stage 3: final=4 dropped=1" in result.output
+    assert "stage 3: final=4 overlap-flagged=1" in result.output
 
 
 def test_cli_pipeline_required_failure_exit_2(wired):

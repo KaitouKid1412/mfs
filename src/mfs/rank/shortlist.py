@@ -296,9 +296,12 @@ def _write_stage1_outputs(
     report_chunks: list[pl.DataFrame] = []
     for cat, grp in scored.group_by("canonical_category"):
         cat_name = cat[0]
-        ranked = grp.sort("composite_score", descending=True).with_row_index(
-            "rank", offset=1,
-        )
+        # A2-11 determinism: (composite desc, scheme_code asc) everywhere a
+        # ranking is emitted — tied composites must not inherit row order.
+        ranked = grp.sort(
+            ["composite_score", "scheme_code"],
+            descending=[True, False], nulls_last=True,
+        ).with_row_index("rank", offset=1)
         cols = [c for c in STAGE1_OUTPUT_COLS if c in ranked.columns]
         slim = ranked.select(cols)
         safe = "".join(c if c.isalnum() else "_" for c in cat_name)
@@ -338,7 +341,11 @@ def rank(
     report_chunks: list[pl.DataFrame] = []
     for cat, grp in scored.group_by("canonical_category"):
         cat_name = cat[0]
-        ranked = grp.sort("composite_score", descending=True).with_row_index("rank", offset=1)
+        # A2-11 determinism: composite desc, scheme_code asc.
+        ranked = grp.sort(
+            ["composite_score", "scheme_code"],
+            descending=[True, False], nulls_last=True,
+        ).with_row_index("rank", offset=1)
         if top_n is not None:
             ranked = ranked.head(top_n)
         cols = [c for c in STAGE1_OUTPUT_COLS if c in ranked.columns]
@@ -377,8 +384,9 @@ def _top_n_per_category(scored: pl.DataFrame, n: int) -> pl.DataFrame:
         return scored
     return (
         scored.sort(
-            ["canonical_category", "composite_score"],
-            descending=[False, True], nulls_last=True,
+            # A2-11 determinism: scheme_code asc breaks composite ties.
+            ["canonical_category", "composite_score", "scheme_code"],
+            descending=[False, True, False], nulls_last=True,
         )
         .group_by("canonical_category", maintain_order=True)
         .head(n)
@@ -451,7 +459,6 @@ def build_rank_history(
     stage2_survivors: pl.DataFrame,
     stage2_dropped: pl.DataFrame,
     stage3_final: pl.DataFrame,
-    stage3_dropped: pl.DataFrame,
 ) -> pl.DataFrame:
     """Pure function: assemble the per-run rank_history frame from the same
     frames the stage writers put on disk, plus the dropped frames.
@@ -462,16 +469,24 @@ def build_rank_history(
 
       * stage 1 drops — first failing hard filter (``INSUFFICIENT_HISTORY``,
         ``STALE_NAV``, ``FILTER:<name>`` — see filters._exclusion_reason_expr);
-      * stage 2 drops — ``MISSING_CORE_METRIC:<first missing Phase 2 metric>``;
-      * stage 3 drops — ``FILTER:overlap`` (pairwise-overlap iterative drop).
+      * stage 2 drops — ``MISSING_CORE_METRIC:<first missing Phase 2 metric>``.
 
-    Stage 3 drops are looked up in the Stage 2 survivor frame so their scores
-    travel into history (stage3's own drop log only carries identity columns).
+    Stage 3 never excludes (locked D4 keep-both + flag): every Stage 2
+    survivor lands as a stage-3 row with included=true; overlap breaches are
+    flag records, recorded in ``stage3/overlap_breaches.csv`` and the
+    ``overlap_flag`` / ``overlap_breaches`` columns of the stage-3 outputs,
+    not as exclusions.
     """
     chunks: list[pl.DataFrame] = []
 
     if not stage1_scored.is_empty():
-        s1 = stage1_scored.with_columns(
+        # A2-11: deterministic ordinal ranking — sort by (composite desc,
+        # scheme_code asc) before ranking so tied composites don't inherit
+        # arbitrary row order.
+        s1 = stage1_scored.sort(
+            ["canonical_category", "composite_score", "scheme_code"],
+            descending=[False, True, False], nulls_last=True,
+        ).with_columns(
             pl.col("composite_score")
             .rank(method="ordinal", descending=True)
             .over("canonical_category")
@@ -506,25 +521,6 @@ def build_rank_history(
                 pl.col("stage2_rank").cast(pl.Int32).alias("rank_in_category")
             )
         chunks.append(_history_chunk(s3, as_of=as_of, stage=3, included=True))
-    if not stage3_dropped.is_empty():
-        dropped_codes = stage3_dropped["scheme_code_dropped"].to_list()
-        if not stage2_survivors.is_empty():
-            d3 = stage2_survivors.filter(
-                pl.col("scheme_code").is_in(dropped_codes)
-            )
-            if "stage2_rank" in d3.columns:
-                d3 = d3.with_columns(
-                    pl.col("stage2_rank").cast(pl.Int32).alias("rank_in_category")
-                )
-        else:
-            d3 = stage3_dropped.select(
-                pl.col("scheme_code_dropped").alias("scheme_code"),
-                pl.col("category_dropped").alias("canonical_category"),
-            )
-        chunks.append(_history_chunk(
-            d3, as_of=as_of, stage=3, included=False,
-            reason_expr=pl.lit("FILTER:overlap"),
-        ))
 
     nonempty = [c for c in chunks if not c.is_empty()]
     if not nonempty:
@@ -549,8 +545,10 @@ def rank_deep(
     Stage 1's full-universe z-scores, z-score the Phase 2 metrics within each
     pool and re-composite with Stage 2 weights (D3: disclosure nulls are
     flagged + penalized, never dropped); write ``<as_of>/stage2/``.
-    Stage 3: iterative pairwise-overlap drop on Stage 2 survivors; write
-    ``<as_of>/stage3/``.
+    Stage 3: pairwise-overlap *flagging* on Stage 2 survivors (locked D4:
+    keep both funds, flag the breach with overlap %; no fund is dropped for
+    overlap — breaches land in ``stage3/overlap_breaches.csv`` and the flag
+    columns of the final report); write ``<as_of>/stage3/``.
 
     At the tail, the run's stage 1/2/3 outcomes (survivors AND exclusions,
     with contract-vocabulary reasons) are persisted into the rank_history
@@ -641,7 +639,6 @@ def rank_deep(
         stage2_survivors=stage2_result["survivors"],
         stage2_dropped=stage2_result["dropped"],
         stage3_final=stage3_result["final_picks"],
-        stage3_dropped=stage3_result["dropped"],
     )
     w.persist_rank_history(history, as_of)
 
@@ -653,7 +650,8 @@ def rank_deep(
         n_stage2_survivors=stage2_result["n_survivors"],
         n_stage2_dropped=stage2_result["n_dropped"],
         n_stage3_final=stage3_result["n_final"],
-        n_stage3_dropped=stage3_result["n_dropped"],
+        n_stage3_flagged=stage3_result["n_flagged"],
+        n_stage3_breach_pairs=stage3_result["n_breach_pairs"],
     )
     return {
         "as_of": as_of.isoformat(),
@@ -671,8 +669,9 @@ def rank_deep(
         "stage3": {
             "dir": stage3_result["stage3_dir"],
             "n_final": stage3_result["n_final"],
-            "n_dropped": stage3_result["n_dropped"],
-            "dropped_file": stage3_result["dropped_file"],
+            "n_flagged": stage3_result["n_flagged"],
+            "n_breach_pairs": stage3_result["n_breach_pairs"],
+            "breaches_file": stage3_result["breaches_file"],
             "overlap_pairs_file": stage3_result["overlap_pairs_file"],
         },
     }

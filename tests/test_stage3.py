@@ -81,22 +81,21 @@ def test_disjoint_portfolios_no_drops():
     assert drops.is_empty()
 
 
-def test_identical_portfolios_drop_worse_rank():
-    """Identical portfolios → 100% overlap → drop the lower-ranked fund.
-    rank 1 beats rank 2."""
+def test_identical_portfolios_kept_and_flagged():
+    """Identical portfolios → 100% overlap → BOTH kept, pair flagged (D4)."""
     survivors = pl.DataFrame([
         _survivor("S_top", "Top", stage2_rank=1),
         _survivor("S_bot", "Bot", stage2_rank=2),
     ])
     holdings = [_holding("A", 50.0, "INE_A"), _holding("B", 50.0, "INE_B")]
     loader = _make_loader({"S_top": holdings, "S_bot": holdings})
-    final, drops, _ = apply_stage3(survivors, loader, threshold_pct=30.0)
-    assert final["scheme_code"].to_list() == ["S_top"]
-    assert drops.height == 1
-    drop_row = drops.row(0, named=True)
-    assert drop_row["scheme_code_dropped"] == "S_bot"
-    assert drop_row["scheme_code_kept"] == "S_top"
-    assert drop_row["overlap_pct"] == 100.0
+    final, breaches, _ = apply_stage3(survivors, loader, threshold_pct=30.0)
+    assert set(final["scheme_code"]) == {"S_top", "S_bot"}
+    assert final.filter(pl.col("overlap_flag"))["scheme_code"].len() == 2
+    assert breaches.height == 1
+    rec = breaches.row(0, named=True)
+    assert {rec["scheme_code_a"], rec["scheme_code_b"]} == {"S_top", "S_bot"}
+    assert rec["overlap_pct"] == 100.0
 
 
 def test_threshold_boundary_exactly_30_no_drop():
@@ -125,20 +124,22 @@ def test_threshold_boundary_exactly_30_no_drop():
 # ---------------------------------------------------------------------------
 
 
-def test_cascade_three_overlapping_funds():
-    """3 funds A/B/C with pairwise > 30% should leave only the top-ranked
-    fund (A): drop B (overlaps with A), then drop C (overlaps with A)."""
+def test_three_overlapping_funds_all_kept_all_pairs_flagged():
+    """3 identical portfolios → all 3 pairs breach → ALL kept, 3 pair flags
+    (the old greedy cascade that left only the top fund is gone — D4)."""
     survivors = pl.DataFrame([
         _survivor("A", "Fund A", stage2_rank=1),
         _survivor("B", "Fund B", stage2_rank=2),
         _survivor("C", "Fund C", stage2_rank=3),
     ])
-    # Make all 3 portfolios identical → all pairs at 100% overlap.
     holdings = [_holding("X", 100.0, "INE_X")]
     loader = _make_loader({"A": holdings, "B": holdings, "C": holdings})
-    final, drops, _ = apply_stage3(survivors, loader, threshold_pct=30.0)
-    assert final["scheme_code"].to_list() == ["A"]
-    assert set(drops["scheme_code_dropped"].to_list()) == {"B", "C"}
+    final, breaches, _ = apply_stage3(survivors, loader, threshold_pct=30.0)
+    assert set(final["scheme_code"]) == {"A", "B", "C"}
+    assert breaches.height == 3  # AB, AC, BC
+    assert final.filter(pl.col("scheme_code") == "A").row(0, named=True)[
+        "n_overlap_breaches"
+    ] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -146,18 +147,21 @@ def test_cascade_three_overlapping_funds():
 # ---------------------------------------------------------------------------
 
 
-def test_cross_category_drops_apply():
-    """Stage 3 drops across category boundaries — a Flexi Cap fund can be
-    dropped because it overlaps too much with a Large Cap fund."""
+def test_cross_category_breach_keeps_both():
+    """Cross-category overlap flags the pair but never drops — a user who
+    picked only Flexi Cap must still get its fund (D4)."""
     survivors = pl.DataFrame([
         _survivor("S_LC", "LC top", category="Large Cap", stage2_rank=1),
         _survivor("S_FC", "FC mid", category="Flexi Cap", stage2_rank=4),
     ])
     holdings = [_holding("A", 100.0, "INE_A")]
     loader = _make_loader({"S_LC": holdings, "S_FC": holdings})
-    final, drops, _ = apply_stage3(survivors, loader, threshold_pct=30.0)
-    assert final["scheme_code"].to_list() == ["S_LC"]
-    assert drops.row(0, named=True)["scheme_code_dropped"] == "S_FC"
+    final, breaches, _ = apply_stage3(survivors, loader, threshold_pct=30.0)
+    assert set(final["scheme_code"]) == {"S_LC", "S_FC"}
+    assert breaches.height == 1
+    fc = final.filter(pl.col("scheme_code") == "S_FC").row(0, named=True)
+    assert fc["overlap_flag"] is True
+    assert "S_LC" in fc["overlap_breaches"]
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +228,14 @@ def test_run_writes_files_even_when_no_drops(tmp_path):
         "S2": [_holding("B", 100.0, "INE_B")],
     })
     result = run(survivors, loader, tmp_path)
-    assert Path(result["dropped_file"]).exists()
+    assert Path(result["breaches_file"]).exists()
     assert Path(result["overlap_pairs_file"]).exists()
-    assert result["n_dropped"] == 0
+    assert result["n_breach_pairs"] == 0
     assert result["n_final"] == 2
 
 
-def test_run_writes_drop_to_dropped_csv(tmp_path):
+def test_run_keeps_both_and_flags_breach(tmp_path):
+    """D4 keep-both: a 100% overlap pair is flagged, never dropped."""
     survivors = pl.DataFrame([
         _survivor("S_top", "Top", stage2_rank=1),
         _survivor("S_bot", "Bot", stage2_rank=2),
@@ -238,10 +243,12 @@ def test_run_writes_drop_to_dropped_csv(tmp_path):
     holdings = [_holding("A", 100.0, "INE_A")]
     loader = _make_loader({"S_top": holdings, "S_bot": holdings})
     result = run(survivors, loader, tmp_path)
-    dropped = pl.read_csv(result["dropped_file"])
-    assert dropped.height == 1
-    assert dropped.row(0, named=True)["scheme_code_dropped"] == "S_bot"
-    assert result["n_dropped"] == 1
+    assert result["n_final"] == 2          # both kept
+    assert result["n_breach_pairs"] == 1
+    breaches = pl.read_csv(result["breaches_file"])
+    assert breaches.height == 1
+    rec = breaches.row(0, named=True)
+    assert {rec["scheme_code_a"], rec["scheme_code_b"]} == {"S_top", "S_bot"}
 
 
 def test_run_writes_per_category_files(tmp_path):
@@ -261,6 +268,6 @@ def test_run_writes_per_category_files(tmp_path):
 
 def test_run_handles_empty_survivors(tmp_path):
     result = run(pl.DataFrame(), _make_loader({}), tmp_path)
-    assert Path(result["dropped_file"]).exists()
+    assert Path(result["breaches_file"]).exists()
     assert Path(result["overlap_pairs_file"]).exists()
     assert result["n_final"] == 0

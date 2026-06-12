@@ -187,7 +187,6 @@ def test_build_rank_history_shape_and_reasons():
         stage2_survivors=s2_survivors,
         stage2_dropped=s2_dropped,
         stage3_final=s3_final,
-        stage3_dropped=s3_dropped,
     )
     assert out.columns == list(shortlist.RANK_HISTORY_SCHEMA)
     assert out["as_of_date"].unique().to_list() == [AS_OF]
@@ -220,12 +219,11 @@ def test_build_rank_history_shape_and_reasons():
     assert b2["exclusion_reason"] == "MISSING_CORE_METRIC:ptr_latest"
 
     s3 = out.filter(pl.col("stage") == 3)
-    assert s3.filter(pl.col("included"))["scheme_code"].to_list() == ["A"]
-    c3 = s3.filter(pl.col("scheme_code") == "C").row(0, named=True)
-    assert c3["included"] is False
-    assert c3["exclusion_reason"] == "FILTER:overlap"
-    # Stage 3 drops keep their Stage 2 scores (looked up in the survivor frame).
-    assert c3["composite_score"] == 0.9
+    # D4 keep-both: stage 3 never drops — history records are the final picks
+    # only, all included; overlap breaches live in overlap_breaches.csv, not
+    # as exclusion records.
+    assert s3["scheme_code"].to_list() == ["A"]
+    assert s3["included"].all()
 
 
 def test_build_rank_history_all_empty_inputs():
@@ -234,7 +232,7 @@ def test_build_rank_history_all_empty_inputs():
         AS_OF,
         stage1_scored=empty, stage1_excluded=empty,
         stage2_survivors=empty, stage2_dropped=empty,
-        stage3_final=empty, stage3_dropped=empty,
+        stage3_final=empty,
     )
     assert out.is_empty()
     assert out.columns == list(shortlist.RANK_HISTORY_SCHEMA)
@@ -248,7 +246,6 @@ def test_build_rank_history_run_id_is_null_until_workstream_f():
         stage2_survivors=pl.DataFrame(),
         stage2_dropped=pl.DataFrame(),
         stage3_final=pl.DataFrame(),
-        stage3_dropped=pl.DataFrame(),
     )
     assert out["run_id"].null_count() == out.height
 
@@ -343,7 +340,6 @@ def _history_frame() -> pl.DataFrame:
         stage2_survivors=_stage2_frames()[0],
         stage2_dropped=_stage2_frames()[1],
         stage3_final=pl.DataFrame(),
-        stage3_dropped=pl.DataFrame(),
     )
 
 
@@ -483,11 +479,13 @@ def test_rank_deep_persists_history_at_tail(monkeypatch):
         "overlap_pct": 45.0,
     }])
     stage3_result = {
-        "stage3_dir": "stage3", "category_files": {}, "dropped_file": "d",
-        "overlap_pairs_file": "p", "n_initial": s2_survivors.height,
-        "n_final": s3_final.height, "n_dropped": s3_dropped.height,
-        "final_picks": s3_final, "dropped": s3_dropped,
-        "overlap_pairs": pl.DataFrame(),
+        "stage3_dir": "stage3", "category_files": {}, "breaches_file": "b",
+        "overlap_pairs_file": "p", "overlap_matrix_file": "m",
+        "n_initial": s2_survivors.height,
+        "n_final": s3_final.height, "n_flagged": 1,
+        "n_breach_pairs": s3_dropped.height,
+        "final_picks": s3_final, "breaches": s3_dropped,
+        "overlap_pairs": pl.DataFrame(), "overlap_matrix": pl.DataFrame(),
     }
     import mfs.rank.stage2 as stage2_mod
     import mfs.rank.stage3 as stage3_mod
@@ -512,7 +510,7 @@ def test_rank_deep_persists_history_at_tail(monkeypatch):
         df.filter(~pl.col("included"))["exclusion_reason"].to_list()
     )
     assert reasons == {
-        "FILTER:r_squared", "MISSING_CORE_METRIC:ptr_latest", "FILTER:overlap",
+        "FILTER:r_squared", "MISSING_CORE_METRIC:ptr_latest",
     }
     assert df.filter(pl.col("included"))["exclusion_reason"].null_count() == \
         df.filter(pl.col("included")).height
