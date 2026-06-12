@@ -17,9 +17,13 @@ Z_METRICS = (
     "info_ratio_3y",
     "capture_efficiency",
     # Phase 2: z-scored within category so the composite weight applies on the
-    # same scale as the existing metrics. Schemes missing these emit NaN z-scores,
-    # which score.py handles (active_share triggers pro-rata redistribution;
-    # style_drift NaN contributes zero to the penalty).
+    # same scale as the existing metrics. Schemes missing these emit NaN
+    # z-scores, which score.composite_score_stage2 handles (A2-4/D3): a NaN
+    # positive input (active_share) contributes zero and its weight is
+    # renormalized per-row across the present positive inputs; a NaN
+    # style_drift (negative weight) contributes zero, never renormalized.
+    # Either null additionally draws the fixed missing-disclosure penalty
+    # when the metric is live in the row's category pool.
     "active_share_median_1y",
     "style_drift_3y",
 )

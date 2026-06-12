@@ -119,6 +119,47 @@ def test_ptr_null_no_penalty():
     assert abs(a_on - a_off) < 1e-12
 
 
+def test_ptr_exempt_category_no_penalty():
+    """A2-10: Balanced Advantage PTR=3.0 — multi-x turnover is structural
+    arbitrage mechanics there, so the ramp must not fire."""
+    df = pl.DataFrame([
+        _row("A", canonical_category="Balanced Advantage", ptr_latest=3.0),
+        _row("B", canonical_category="Balanced Advantage", ptr_latest=1.0),
+    ])
+    on = _score_with_ptr(df, enabled=True)
+    off = _score_with_ptr(df, enabled=False)
+    a_on = on.filter(pl.col("scheme_code") == "A").row(0, named=True)["composite_score"]
+    a_off = off.filter(pl.col("scheme_code") == "A").row(0, named=True)["composite_score"]
+    assert abs(a_on - a_off) < 1e-12
+
+
+def test_ptr_non_exempt_category_still_penalized():
+    """A2-10 control: Mid Cap PTR=3.0 → excess=1.5, ramp=1.0, full
+    max_penalty=0.10 — the exemption is category-scoped, not global."""
+    df = pl.DataFrame([
+        _row("A", canonical_category="Mid Cap", ptr_latest=3.0),
+        _row("B", canonical_category="Mid Cap", ptr_latest=1.0),
+    ])
+    on = _score_with_ptr(df, enabled=True, max_penalty=0.10, threshold=1.50)
+    off = _score_with_ptr(df, enabled=False)
+    a_on = on.filter(pl.col("scheme_code") == "A").row(0, named=True)["composite_score"]
+    a_off = off.filter(pl.col("scheme_code") == "A").row(0, named=True)["composite_score"]
+    assert abs((a_off - a_on) - 0.10) < 1e-9
+
+
+def test_ptr_exempt_categories_match_yaml():
+    """A2-10 drift guard: the SoftPenaltiesConfig code default must equal the
+    configs/pipeline.yaml value so neither side can silently diverge."""
+    from mfs.config import SoftPenaltiesConfig, get_pipeline_config
+
+    expected = ["Balanced Advantage", "Equity Savings"]
+    assert SoftPenaltiesConfig().ptr_penalty_exempt_categories == expected
+    assert (
+        get_pipeline_config().soft_penalties.ptr_penalty_exempt_categories
+        == expected
+    )
+
+
 def test_ptr_disabled_flag_zeros_everything():
     """High PTR with disabled flag → no deduction."""
     df = pl.DataFrame([_row("A", ptr_latest=5.0), _row("B", ptr_latest=5.0)])

@@ -167,6 +167,10 @@ def _apply_soft_penalties(expr: pl.Expr, df: pl.DataFrame, cfg: PipelineConfig) 
     pens = cfg.soft_penalties
 
     # PTR: linear ramp from 0 at threshold up to max_penalty, capped.
+    # A2-10: structurally high-turnover hybrid categories
+    # (ptr_penalty_exempt_categories — arbitrage mechanics, not churn) are
+    # exempt from the ramp; a *missing* PTR there still draws the
+    # missing-disclosure penalty below.
     pcfg = pens.ptr
     if pcfg.enabled and "ptr_latest" in df.columns:
         threshold = float(pcfg.threshold)
@@ -180,6 +184,13 @@ def _apply_soft_penalties(expr: pl.Expr, df: pl.DataFrame, cfg: PipelineConfig) 
                 .then(0.0)
                 .otherwise(penalty)
             )
+            exempt = list(pens.ptr_penalty_exempt_categories)
+            if exempt and "canonical_category" in df.columns:
+                penalty = (
+                    pl.when(pl.col("canonical_category").is_in(exempt))
+                    .then(0.0)
+                    .otherwise(penalty)
+                )
             expr = expr - penalty
 
     # AUM Impact Cost (A2-6): log-scale ramp — the old linear ramp saturated

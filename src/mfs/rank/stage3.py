@@ -70,7 +70,11 @@ def _compute_pair_records(
         r["scheme_code"]: r for r in survivors.iter_rows(named=True)
     }
     pair_records: list[dict] = []
-    for a_code, b_code in combinations(rows_by_code.keys(), 2):
+    # A2-11 determinism: iterate codes sorted so each unordered pair always
+    # gets the same a/b orientation — the survivors frame arrives in
+    # nondeterministic group_by concat order, which would otherwise flip
+    # scheme_code_a/_b between same-partition re-runs.
+    for a_code, b_code in combinations(sorted(rows_by_code.keys()), 2):
         a = rows_by_code[a_code]
         b = rows_by_code[b_code]
         result: OverlapResult = pairwise_overlap(_h(a_code), _h(b_code))

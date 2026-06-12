@@ -543,3 +543,47 @@ def test_run_handles_empty_input(tmp_path):
     assert Path(result["coverage_file"]).exists()
     assert result["n_survivors"] == 0
     assert result["n_dropped"] == 0
+
+
+# ---------------------------------------------------------------------------
+# A2-11 — deterministic tie-break: (composite desc, scheme_code asc)
+# ---------------------------------------------------------------------------
+
+
+def test_tied_composites_order_by_scheme_code():
+    """Two byte-identical funds (same Stage 1 composite, same Phase 2
+    metrics → same Stage 2 composite) must rank by scheme_code asc,
+    regardless of input row order."""
+    twin_a = _scored_row("T1", composite_score=0.5)
+    twin_b = _scored_row("T9", composite_score=0.5)
+    twin_b["scheme_name"] = twin_a["scheme_name"]  # fully identical but code
+
+    for rows in ([twin_a, twin_b], [twin_b, twin_a]):
+        survivors, _, _ = apply_stage2(_df(rows), aum_map={})
+        ordered = survivors.sort("stage2_rank")["scheme_code"].to_list()
+        assert ordered == ["T1", "T9"]
+        # The tie is real: identical Stage 2 composites.
+        scores = set(survivors["composite_score"].to_list())
+        assert len(scores) == 1
+
+
+def _csv_bytes(stage_dir: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in sorted(stage_dir.glob("*.csv"))}
+
+
+def test_run_byte_identical_across_runs(tmp_path):
+    """A2-11 acceptance: re-running Stage 2 on the same partition — with the
+    input row order perturbed — produces byte-identical CSVs."""
+    rows = [
+        _scored_row("S1", category="Large Cap", composite_score=0.9),
+        _scored_row("S2", category="Large Cap", composite_score=0.5),
+        _scored_row("S3", category="Large Cap", composite_score=0.5),  # tie w/ S2
+        _scored_row("S4", category="Flexi Cap", composite_score=0.7),
+        _scored_row("S5", category="Flexi Cap", composite_score=0.7),  # tie w/ S4
+    ]
+    aum_map = {c: 100.0 for c in ("S1", "S2", "S3", "S4", "S5")}
+    run(_df(rows), aum_map=aum_map, output_dir=tmp_path / "a")
+    run(_df(list(reversed(rows))), aum_map=aum_map, output_dir=tmp_path / "b")
+    a = _csv_bytes(tmp_path / "a" / "stage2")
+    b = _csv_bytes(tmp_path / "b" / "stage2")
+    assert set(a) == set(b) and a == b

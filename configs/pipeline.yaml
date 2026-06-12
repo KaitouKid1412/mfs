@@ -116,6 +116,13 @@ soft_penalties:
     enabled: true
     max_penalty: 0.05
     threshold: 1.50        # 150% PTR begins the ramp (Phase 2.2.H)
+  # A2-10: categories whose multi-x turnover is structural arbitrage
+  # mechanics, not churn (20 of 31 funds with PTR > 1.5 are these two) —
+  # exempt from the PTR ramp entirely. Revisit with the D3 backtest
+  # (alternative: category-relative percentile ramp).
+  ptr_penalty_exempt_categories:
+    - Balanced Advantage
+    - Equity Savings
   aum_impact_cost:
     enabled: true
     max_penalty: 0.05

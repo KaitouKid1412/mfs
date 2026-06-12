@@ -1,8 +1,9 @@
-"""Tests for Stage 3 — iterative pairwise-overlap drop.
+"""Tests for Stage 3 — keep-both + flag overlap annotation (locked D4).
 
-Stage 3 takes the Stage 2 survivor frame and iteratively drops the
-worse-Stage-2-ranked fund of the highest-overlap remaining pair until no
-pair exceeds the threshold. Returns (final_picks, drops, overlap_pairs_log).
+Stage 3 takes the Stage 2 survivor frame, computes all-pairs portfolio
+overlap, and KEEPS every fund: pairs strictly above the threshold are
+flagged (``overlap_flag`` / ``overlap_breaches`` columns + one breach row
+per pair), never dropped. Returns (final_picks, breaches, overlap_pairs_log).
 """
 
 from __future__ import annotations
@@ -195,8 +196,8 @@ def test_pair_with_missing_holdings_reported_no_drop():
 # ---------------------------------------------------------------------------
 
 
-def test_drops_carry_top_shared_holdings_string():
-    """Drop row carries the 'Name (W%), ...' rendered cell."""
+def test_breaches_carry_top_shared_holdings_string():
+    """Breach row carries the 'Name (W%), ...' rendered cell."""
     survivors = pl.DataFrame([
         _survivor("S_top", "Top", stage2_rank=1),
         _survivor("S_bot", "Bot", stage2_rank=2),
@@ -271,3 +272,38 @@ def test_run_handles_empty_survivors(tmp_path):
     assert Path(result["breaches_file"]).exists()
     assert Path(result["overlap_pairs_file"]).exists()
     assert result["n_final"] == 0
+
+
+# ---------------------------------------------------------------------------
+# A2-11 — deterministic outputs across same-partition re-runs
+# ---------------------------------------------------------------------------
+
+
+def _csv_bytes(stage_dir: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in sorted(stage_dir.glob("*.csv"))}
+
+
+def test_run_byte_identical_across_runs(tmp_path):
+    """A2-11 acceptance: re-running Stage 3 with the survivor frame in a
+    different row order (group_by concat order is nondeterministic upstream)
+    produces byte-identical CSVs — including a stable scheme_code_a/_b
+    orientation in the pair-shaped artifacts."""
+    survivors = [
+        _survivor("S_LC_1", "LC one", category="Large Cap", stage2_rank=1),
+        _survivor("S_LC_2", "LC two", category="Large Cap", stage2_rank=2),
+        _survivor("S_FC_1", "FC one", category="Flexi Cap", stage2_rank=1),
+    ]
+    shared = [_holding("A", 60.0, "INE_A"), _holding("B", 40.0, "INE_B")]
+    loader = _make_loader({
+        "S_LC_1": shared,                       # breaches with S_FC_1
+        "S_LC_2": [_holding("C", 100.0, "INE_C")],
+        "S_FC_1": shared,
+    })
+    run(pl.DataFrame(survivors), loader, tmp_path / "a", threshold_pct=30.0)
+    run(
+        pl.DataFrame(list(reversed(survivors))), loader, tmp_path / "b",
+        threshold_pct=30.0,
+    )
+    a = _csv_bytes(tmp_path / "a" / "stage3")
+    b = _csv_bytes(tmp_path / "b" / "stage3")
+    assert set(a) == set(b) and a == b

@@ -152,6 +152,16 @@ class SoftPenaltiesConfig(BaseModel):
     signals without re-jiggering the weights vector. Stage 1 ignores these.
     """
     ptr: PtrPenalty = Field(default_factory=PtrPenalty)
+    # A2-10: categories exempt from the PTR ramp — their multi-x turnover is
+    # structural arbitrage mechanics (hedged equity books rolled monthly),
+    # not manager churn. The yaml list is the source of truth; this default
+    # mirrors it (drift-guard test asserts they stay equal). Exemption is
+    # scoped to the PTR ramp only — a *missing* PTR still draws the
+    # missing-disclosure penalty in these categories.
+    ptr_penalty_exempt_categories: list[str] = [
+        "Balanced Advantage",
+        "Equity Savings",
+    ]
     aum_impact_cost: AumImpactCostPenalty = Field(default_factory=AumImpactCostPenalty)
     missing_disclosure: MissingDisclosurePenalty = Field(
         default_factory=MissingDisclosurePenalty
