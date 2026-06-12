@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import re
+import statistics
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -36,6 +37,58 @@ NAV_TODAY_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
 HISTORY_URL = "https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx"
 
 DATA_HEADER_TOKENS = ("Scheme Code", "ISIN Div Payout", "Net Asset Value", "Date")
+
+# --- B4: partial NAV-volume day detection -----------------------------------
+# AMFI sometimes publishes a day before all AMCs have reported (e.g. 823 rows
+# on 2026-06-08 vs ~7,900-8,600 on a full day). A day whose row count falls
+# below PARTIAL_DAY_MIN_FRAC × the trailing full-day median is rejected; it
+# arrives complete on a later run via the bulk-history path (ingest_incremental
+# re-fetches from the watermark inclusively).
+PARTIAL_BASELINE_DAYS = 30      # trailing distinct days feeding the baseline
+PARTIAL_BASELINE_MIN_ROWS = 1000  # days below this never count toward the baseline
+PARTIAL_DAY_MIN_FRAC = 0.5      # reject a day below this fraction of baseline
+
+
+def _partial_day_baseline() -> float | None:
+    """Median full-day row count over the trailing PARTIAL_BASELINE_DAYS
+    distinct days in nav_daily.
+
+    Days with fewer than PARTIAL_BASELINE_MIN_ROWS rows are excluded from the
+    baseline — those are already-known partial publications (weekend
+    stragglers, special sessions: 5-1,100 rows live) while full days run
+    ~7,900-8,600. Returns None when no baseline can be established (cold/empty
+    DB) — the partial-day check is then disabled.
+    """
+    counts = q.nav_daily_day_counts(PARTIAL_BASELINE_DAYS)
+    full = [n for _, n in counts if n >= PARTIAL_BASELINE_MIN_ROWS]
+    if not full:
+        return None
+    return float(statistics.median(full))
+
+
+def _drop_partial_days(
+    df: pl.DataFrame, baseline: float | None, *, window: str,
+) -> pl.DataFrame:
+    """Drop sub-threshold days from a bulk-history window frame (B4), so a
+    backfill can't (re-)introduce partially-published days into nav_daily.
+    Each dropped day is logged at ERROR as amfi_nav.partial_day_rejected."""
+    if baseline is None or df.is_empty():
+        return df
+    counts = df.group_by("nav_date").len()
+    partial = sorted(
+        r["nav_date"] for r in counts.iter_rows(named=True)
+        if r["len"] < PARTIAL_DAY_MIN_FRAC * baseline
+    )
+    if not partial:
+        return df
+    count_by_day = {r["nav_date"]: r["len"] for r in counts.iter_rows(named=True)}
+    for d in partial:
+        log.error(
+            "amfi_nav.partial_day_rejected",
+            date=d.isoformat(), n_rows=int(count_by_day[d]),
+            baseline=baseline, window=window,
+        )
+    return df.filter(~pl.col("nav_date").is_in(partial))
 
 
 def _fmt_amfi_date(d: date) -> str:
@@ -203,14 +256,19 @@ def _save_raw(content: bytes, path: Path) -> Path:
     return path
 
 
-def _append_year_partition(new_rows: pl.DataFrame) -> list[int]:
+def _append_year_partition(
+    new_rows: pl.DataFrame, *, refresh_log_returns: bool = True,
+) -> list[int]:
     """Upsert NAV rows into Postgres (idempotent on PK scheme_code, nav_date) and
-    refresh the fund_log_returns cache for affected schemes. The
+    refresh the fund_log_returns cache for affected schemes in the SAME
+    transaction (C4). ``refresh_log_returns=False`` suppresses the per-call
+    refresh — the backfill loop uses it per window and runs one
+    ``refresh_fund_log_returns_all()`` after the final window. The
     `_append_year_partition` name is retained for callsite compatibility — the
     actual partitioning is by table/PK now, not by parquet year folder."""
     if new_rows.is_empty():
         return []
-    w.upsert_nav_daily(new_rows)
+    w.upsert_nav_daily(new_rows, refresh_log_returns=refresh_log_returns)
     years = sorted(set(int(d.year) for d in new_rows["nav_date"].to_list()))
     return years
 

@@ -13,13 +13,16 @@ scheme rather than one PDF per AMC.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
+from pathlib import Path
 
 import polars as pl
 
 from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.errors import IngestError, StatementDateMismatchError
+from mfs.ingest.holdings._generic import artifact_statement_months
 from mfs.ingest.holdings._registry import get_adapter, registered_adapters
 from mfs.ingest.managers._scheme_match import (
     DEFAULT_THRESHOLD,
@@ -38,12 +41,124 @@ def _default_data_month(today: date | None = None) -> str:
     return f"{d.year:04d}-{d.month - 1:02d}"
 
 
+# --- Per-portfolio sanity gate (B3) ----------------------------------------
+#
+# Bounds are EMPIRICAL, not the 95-105 a clean spec would suggest. ISIN-less
+# cash / TREPS / derivative rows are dropped at parse, so a complete
+# portfolio's ISIN-bearing weight sum lands well under 100 for cash- and
+# derivative-heavy categories. Live-DB calibration (read-only, 2026-06-12,
+# 1,172 rankable scheme-months): sums span 47.9 (Thematic) to 108.8 (PSU);
+# 318 of 1,172 sit in [60, 95) and 851 in [95, 105]; 0 below 40 and 0 above
+# 115. A 95-105 gate would discard ~27% of good months; [40, 115] discards
+# only true mis-scaling (the audit's 120-186% contaminated months) while the
+# [40,60) / (105,115] shoulders WARN so drift toward the hard bounds is
+# visible before it costs coverage.
+WEIGHT_SUM_HARD_MIN = 40.0
+WEIGHT_SUM_HARD_MAX = 115.0
+WEIGHT_SUM_WARN_LOW = 60.0  # [40, 60) writes, but loudly
+WEIGHT_SUM_WARN_HIGH = 105.0  # (105, 115] writes, but loudly
+
+# Generic net for the Motilal-class contamination: the poached 152651 April
+# row-set was exactly 4 ETF rows written to an active equity fund. Every
+# rankable canonical_category is equity-oriented (incl. the hybrid trio —
+# live min holdings count per rankable scheme-month is 12), so the floor
+# applies to all of them. FoF-flavoured MASTER names are exempt: a genuine
+# FoF legitimately holds a handful of funds, and judging by the MATCHED
+# scheme's name (not the printed one) is what catches a FoF printed name
+# poaching a non-FoF scheme_code.
+MIN_EQUITY_HOLDINGS = 5
+_FOF_NAME_RE = re.compile(r"(?i)fof|fund\s+of\s+fund")
+
+
+def check_portfolio_sanity(
+    *,
+    scheme_code: str,
+    printed_name: str,
+    master_name: str | None,
+    category: str | None,
+    total_weight: float,
+    n_rows: int,
+    amc_slug: str,
+) -> str:
+    """Per-portfolio weight-sum + min-holdings gate at ingest (B3).
+
+    Returns ``"ok"`` (write), ``"weight_sum_breach"`` or
+    ``"too_few_holdings"`` (caller must SKIP the scheme's rows — per the
+    no-half-data invariant a mis-scaled or contaminated portfolio is worse
+    than a missing one). Applies only to rankable schemes
+    (``category`` is not None); shared by the holdings-Excel and the
+    managers/factsheet ingest paths.
+    """
+    if category is None:
+        return "ok"  # not rankable — ETFs/debt legitimately sum anywhere
+    if not (WEIGHT_SUM_HARD_MIN <= total_weight <= WEIGHT_SUM_HARD_MAX):
+        log.error(
+            "holdings.weight_sum_breach",
+            amc=amc_slug, scheme=printed_name, scheme_code=scheme_code,
+            category=category, weight_sum=round(total_weight, 2),
+            bounds=[WEIGHT_SUM_HARD_MIN, WEIGHT_SUM_HARD_MAX],
+        )
+        return "weight_sum_breach"
+    if total_weight < WEIGHT_SUM_WARN_LOW or total_weight > WEIGHT_SUM_WARN_HIGH:
+        log.warning(
+            "holdings.weight_sum_suspect",
+            amc=amc_slug, scheme=printed_name, scheme_code=scheme_code,
+            category=category, weight_sum=round(total_weight, 2),
+        )
+    if n_rows < MIN_EQUITY_HOLDINGS and not _FOF_NAME_RE.search(
+        master_name or printed_name
+    ):
+        log.error(
+            "holdings.too_few_holdings",
+            amc=amc_slug, scheme=printed_name, scheme_code=scheme_code,
+            category=category, n_rows=n_rows, floor=MIN_EQUITY_HOLDINGS,
+        )
+        return "too_few_holdings"
+    return "ok"
+
+
+def _statement_months_for(
+    adapter, excel_path: Path, cache: dict[Path, set[str] | None],
+) -> set[str] | None:
+    """Memoized central banner scan for one artifact (B2).
+
+    Consolidated workbooks (tata/icici/uti style) are parsed once per scheme
+    but scanned once per file. An adapter whose banner is nonstandard can
+    override extraction by defining ``artifact_statement_months(path)``;
+    none needs to today (tata's numeric 'as on 30-04-2026' banners are
+    handled by the shared regex), but the hook is the documented extension
+    point. A scan failure means 'cannot check' (None), never a crash.
+    """
+    if excel_path not in cache:
+        override = getattr(adapter, "artifact_statement_months", None)
+        try:
+            cache[excel_path] = (
+                override(excel_path) if override is not None
+                else artifact_statement_months(excel_path)
+            )
+        except Exception as e:  # noqa: BLE001 — advisory scan must not crash
+            log.debug(
+                "holdings.statement_scan_failed",
+                amc=adapter.amc_slug, path=str(excel_path), err=str(e),
+            )
+            cache[excel_path] = None
+    return cache[excel_path]
+
+
 def run_for_amc(
     amc_slug: str,
     ym: str | None = None,
     match_threshold: int = DEFAULT_THRESHOLD,
+    force: bool = False,
 ) -> dict:
-    """Run one AMC's holdings adapter end-to-end."""
+    """Run one AMC's holdings adapter end-to-end.
+
+    ``force=True`` (a ``--full`` pipeline run) overrides the
+    partition-shrinkage guard (B13): a fresh parse yielding fewer distinct
+    schemes than the DB already holds for (source_amc, month) is normally
+    refused so a partial re-run can't silently delete previously-good
+    schemes; force replaces the partition anyway, loudly.
+    """
     adapter = get_adapter(amc_slug)
     ym = ym or _default_data_month()
     log.info("holdings.run.start", amc=amc_slug, ym=ym)
@@ -66,10 +181,23 @@ def run_for_amc(
     now = datetime.utcnow()
     as_of_month = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
 
+    # canonical_category + master name per scheme_code, for the per-portfolio
+    # sanity gate (B3). iter_rows(named=True).get() tolerates minimal test
+    # frames; the production q.scheme_master() always carries both columns.
+    cat_by_code: dict[str, str | None] = {}
+    master_name_by_code: dict[str, str | None] = {}
+    for r in sm.iter_rows(named=True):
+        cat_by_code[r["scheme_code"]] = r.get("canonical_category")
+        master_name_by_code[r["scheme_code"]] = r.get("scheme_name")
+
     matched_rows: list[dict] = []
     unmatched: list[str] = []
     n_excels_parsed = 0
     n_records_total = 0
+    gate_skipped: dict[str, list[str]] = {
+        "weight_sum_breach": [], "too_few_holdings": [],
+    }
+    statement_months_cache: dict[Path, set[str] | None] = {}
 
     # Resolve every printed name → (scheme_code, score) FIRST. When two
     # similarly-named sibling funds (e.g. "Nifty 50 Index" vs "Nifty Next 50
@@ -117,6 +245,18 @@ def run_for_amc(
             continue
         n_excels_parsed += 1
         try:
+            # Central statement-date screen (B2): EVERY adapter — including
+            # the bespoke fixed-offset parsers that never call
+            # parse_sebi_excel — is checked against the artifact's printed
+            # 'AS ON' month before its rows can be parsed in. Validate-when-
+            # present: an artifact with no parseable banner (or an unreadable
+            # container) proceeds — most AMCs print it, and absence alone
+            # must not nuke coverage.
+            found_months = _statement_months_for(
+                adapter, excel_path, statement_months_cache,
+            )
+            if found_months and ym not in found_months:
+                raise StatementDateMismatchError(excel_path, ym, found_months)
             records = list(adapter.parse_excel(excel_path, scheme_name_printed, ym))
         except StatementDateMismatchError as e:
             # Wrong-month artifact (e.g. the endpoint served last month's
@@ -139,6 +279,26 @@ def run_for_amc(
                 amc=amc_slug, scheme=scheme_name_printed,
                 path=str(excel_path), err=str(e),
             )
+            continue
+        if not records:
+            continue  # zero-record parse: not a weight problem (B1 evicts)
+        # Per-portfolio sanity gate (B3): a rankable scheme whose ISIN-bearing
+        # weights are mis-scaled, or an active equity fund carrying a
+        # contamination-shaped sliver of rows, is skipped entirely — its prior
+        # DB partition rows stay (the DELETE below is per-AMC and only runs
+        # when matched_rows survive; the shrinkage guard then refuses to lose
+        # the skipped scheme without --full).
+        verdict = check_portfolio_sanity(
+            scheme_code=scheme_code,
+            printed_name=scheme_name_printed,
+            master_name=master_name_by_code.get(scheme_code),
+            category=cat_by_code.get(scheme_code),
+            total_weight=sum(float(r.weight_pct) for r in records),
+            n_rows=len(records),
+            amc_slug=amc_slug,
+        )
+        if verdict != "ok":
+            gate_skipped[verdict].append(scheme_name_printed)
             continue
         n_records_total += len(records)
         for rec in records:
@@ -188,7 +348,33 @@ def run_for_amc(
         from mfs.db.connection import connect
         # DELETE + upsert in ONE transaction so a kill between them can't leave
         # this (source_amc, month) partition empty for the next run.
+        incoming_schemes = {r["scheme_code"] for r in matched_rows}
         with connect() as conn:
+            # Partition-shrinkage guard (B13): a scheme that parsed last run
+            # but failed this run would otherwise have its prior-good rows
+            # silently deleted by the partition DELETE. Refuse (IngestError →
+            # transaction rolls back, DB untouched, run_all records the
+            # per-AMC failure); ``force`` (--full) replaces anyway, loudly.
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT scheme_code) FROM holdings_monthly "
+                "WHERE as_of_month = %s AND source_amc = %s",
+                (as_of_month, amc_slug),
+            ).fetchone()
+            existing_schemes = int(row[0]) if row else 0
+            if len(incoming_schemes) < existing_schemes:
+                if not force:
+                    raise IngestError(
+                        f"{amc_slug}: refusing partition shrinkage for "
+                        f"{ym} — incoming {len(incoming_schemes)} distinct "
+                        f"schemes < {existing_schemes} already in DB. A "
+                        f"scheme that ingested before failed this run; "
+                        f"re-run with --full to replace anyway."
+                    )
+                log.warning(
+                    "holdings.partition_shrinkage_forced",
+                    amc=amc_slug, ym=ym,
+                    incoming=len(incoming_schemes), existing=existing_schemes,
+                )
             conn.execute(
                 "DELETE FROM holdings_monthly "
                 "WHERE as_of_month = %s AND source_amc = %s",
@@ -205,6 +391,8 @@ def run_for_amc(
         n_records=n_records_total,
         rows_written=n_written,
         unmatched_unique_schemes=len(unmatched),
+        n_weight_sum_skipped=len(gate_skipped["weight_sum_breach"]),
+        n_too_few_holdings_skipped=len(gate_skipped["too_few_holdings"]),
     )
     return {
         "amc_slug": amc_slug,
@@ -214,11 +402,18 @@ def run_for_amc(
         "n_records": n_records_total,
         "rows_written": n_written,
         "unmatched_schemes": unmatched,
+        "weight_sum_skipped_schemes": gate_skipped["weight_sum_breach"],
+        "too_few_holdings_skipped_schemes": gate_skipped["too_few_holdings"],
     }
 
 
-def run_all(ym: str | None = None) -> dict[str, dict]:
+def run_all(ym: str | None = None, force: bool = False) -> dict[str, dict]:
     """Run every registered holdings adapter with per-AMC fault isolation.
+
+    ``force`` is forwarded to each AMC's run and overrides the
+    partition-shrinkage guard (see ``run_for_amc``); wiring it to the
+    pipeline's ``--full`` flag is an orchestrator (cli.py) change owned by
+    the C-series force-semantics task.
 
     Holdings are an advisory signal: one AMC's failure (a 404 in disclosure
     discovery, a changed page layout, a parse error) is caught, recorded, and
@@ -235,7 +430,7 @@ def run_all(ym: str | None = None) -> dict[str, dict]:
     failed: list[str] = []
     for slug in slugs:
         try:
-            results[slug] = run_for_amc(slug, ym=ym)
+            results[slug] = run_for_amc(slug, ym=ym, force=force)
         except Exception as e:  # noqa: BLE001 — isolate one AMC; never crash the stage
             failed.append(slug)
             results[slug] = {

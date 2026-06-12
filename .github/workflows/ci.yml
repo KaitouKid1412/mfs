@@ -1,0 +1,68 @@
+# F-9 (docs/phase6/stage2_full_remediation.md): CI for a fresh clone —
+# no data/raw, no Postgres, no network services. Adapter value-pin tests
+# that need local artifacts are auto-marked `local_data` (tests/conftest.py)
+# and deselected here; committed PDF extracts keep the parse paths covered
+# (tests/test_managers_fixture_extracts.py).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # F-8 tripwire: number of tests deselected by -m 'not local_data'.
+  # If this GROWS, someone added tests that silently never run in CI —
+  # either back them with a committed fixture extract (see
+  # tools/make_fixture_pdf.py) or bump this pin consciously in the same
+  # change. If it shrinks (tests migrated off local_data), lower the pin.
+  EXPECTED_LOCAL_DATA_DESELECTED: "333"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync dependencies (locked)
+        run: uv sync --frozen
+
+      # Advisory: 178 pre-existing ruff errors at the time F-9 landed.
+      # Do not let them block CI; ratchet to blocking once the backlog
+      # is cleared (tracked in the Stage-2 remediation plan).
+      - name: Ruff (advisory)
+        run: uv run ruff check src tests
+        continue-on-error: true
+
+      # Advisory until the F-7 mypy baseline (compute + rank) reaches 0
+      # errors; then drop continue-on-error to make it blocking.
+      - name: mypy (advisory)
+        run: uv run mypy
+        continue-on-error: true
+
+      - name: Tests (excluding local_data)
+        run: uv run pytest tests/ -m "not local_data"
+
+      - name: local_data deselection tripwire
+        run: |
+          line=$(uv run pytest tests/ -m "not local_data" --collect-only | tail -1)
+          echo "collect summary: ${line}"
+          actual=$(echo "${line}" | sed -nE 's/.*\(([0-9]+) deselected\).*/\1/p')
+          if [ -z "${actual}" ]; then
+            echo "::error::could not parse deselected count from pytest collect output"
+            exit 1
+          fi
+          echo "deselected=${actual} (pinned ${EXPECTED_LOCAL_DATA_DESELECTED})"
+          if [ "${actual}" -gt "${EXPECTED_LOCAL_DATA_DESELECTED}" ]; then
+            echo "::error::local_data deselected count grew from ${EXPECTED_LOCAL_DATA_DESELECTED} to ${actual}: new tests depend on gitignored data/raw and will never run in CI. Add a committed fixture extract or bump EXPECTED_LOCAL_DATA_DESELECTED deliberately."
+            exit 1
+          fi
+
+      # [REVIEW-EXTENDED] dependency CVE scan; currently clean, so blocking.
+      - name: pip-audit
+        run: uv run pip-audit

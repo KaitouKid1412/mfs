@@ -14,10 +14,12 @@ import pytest
 
 from mfs.errors import StatementDateMismatchError
 from mfs.ingest.holdings._generic import (
+    artifact_statement_months,
     classify_section,
     find_statement_months,
     is_isin,
     parse_sebi_excel,
+    statement_months_in_text,
 )
 
 
@@ -154,12 +156,33 @@ def test_april_banner_parses_as_april(tmp_path):
         ("PORTFOLIO AS ON 30-APR-2026", {"2026-04"}),
         ("Monthly Portfolio Statement as on 30th April 2026", {"2026-04"}),
         ("MONTHLY PORTFOLIO STATEMENT AS ON 29 May 2026*", {"2026-05"}),
+        # Numeric day-first banners (tata, B2 calibration over the live cache).
+        ("as on 30-04-2026", {"2026-04"}),
+        ("Portfolio as on 31/05/26", {"2026-05"}),
+        ("Portfolio as on 31-05-26", {"2026-05"}),
+        ("Portfolio as on 30.04.2026", {"2026-04"}),
+        # Numeric triple that isn't a date (month 13): yields nothing.
+        ("as on 30-13-2026", set()),
+        # ISO yyyy-mm-dd is NOT day-first; the lookarounds must refuse to
+        # match its '26-04-30' tail as day=26/month=04/year=2030.
+        ("as on 2026-04-30", set()),
         # 'as on' with no parseable date yields nothing (tata's NAV column).
         ("NAV As on Record Date", set()),
     ],
 )
 def test_find_statement_months_format_matrix(banner, expected):
     assert find_statement_months([(banner, None)]) == expected
+
+
+def test_statement_months_in_text_pairs_each_phrase_with_nearby_date():
+    # PDF-page-style free text (managers advisory path): every 'as on' gets
+    # the FIRST date within its window; far-away dates are not attributed.
+    text = (
+        "Fund Facts as on April 30, 2026. Riskometer as on 31-03-2026. "
+        "Inception date 5 January 2010."
+    )
+    assert statement_months_in_text(text) == {"2026-04", "2026-03"}
+    assert statement_months_in_text("as on nothing here") == set()
 
 
 def test_find_statement_months_split_cell_datetime():
@@ -204,3 +227,48 @@ def test_missing_banner_raises_when_required(tmp_path):
             p, "X", "x", expect_ym="2026-05", require_statement_date=True,
         ))
     assert ei.value.found_yms == set()
+
+
+# ---------------------------------------------------------------------------
+# artifact_statement_months — the orchestrator's central format-sniffing scan
+# (B2) that covers bespoke adapters which never call parse_sebi_excel.
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_months_unions_all_sheets(tmp_path):
+    # tata-shaped consolidated workbook: a stray internal-path reference on a
+    # hidden 'Dummy' sheet names February; the real per-scheme banners name
+    # April (numeric form). The union carries both — the caller's
+    # any-month-matches rule tolerates the stale reference.
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Dummy"
+    ws.append(["Risk-o-Meter Path",
+               r"H:\x\Monthly Portfolio as on 28th February 2026.xlsx"])
+    ws2 = wb.create_sheet("SCHEME1")
+    ws2.append(["Scheme One — Portfolio as on 30-04-2026"])
+    p = tmp_path / "consolidated.xlsx"
+    wb.save(p)
+    assert artifact_statement_months(p) == {"2026-02", "2026-04"}
+
+
+def test_artifact_months_no_banner_is_empty_set(tmp_path):
+    p = _write(tmp_path, _no_banner_rows())
+    assert artifact_statement_months(p) == set()
+
+
+def test_artifact_months_unknown_format_is_none(tmp_path):
+    p = tmp_path / "page.html"
+    p.write_bytes(b"<!doctype html><html>WAF says hello</html>")
+    assert artifact_statement_months(p) is None  # cannot check != no banner
+
+
+def test_artifact_months_corrupt_zip_is_none(tmp_path):
+    # PK magic but not a workbook (uti's .zip container / corrupt cache).
+    p = tmp_path / "broken.xlsx"
+    p.write_bytes(b"PK\x03\x04 this is not a real zip")
+    assert artifact_statement_months(p) is None
+
+
+def test_artifact_months_missing_file_is_none(tmp_path):
+    assert artifact_statement_months(tmp_path / "nope.xlsx") is None

@@ -12,8 +12,13 @@ No network, no DB: the resolvers are pure given a candidate index.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
-from mfs.ingest.managers._run import _resolve_holdings, _resolve_ptr
+from mfs.ingest.managers._run import (
+    _advisory_statement_check,
+    _resolve_holdings,
+    _resolve_ptr,
+)
 from mfs.schemas import ParsedHoldingRecord, ParsedPtrRecord
 
 _AMC = "abc"
@@ -96,3 +101,38 @@ def test_match_threshold_is_passed_through():
 
     holdings = [_holding("ABC Flexi Cap Fundd", "Poacher Security A", 50.0)]
     assert _resolve_holdings(holdings, _CANDIDATES, _AMC, _YM, match_threshold=99) == []
+
+
+# --- B2 advisory statement-date check (factsheet path, log-only) ------------
+
+_FIXTURE_PDF = (
+    Path(__file__).parent / "fixtures" / "factsheets" / "hdfc"
+    / "2026-04_extract.pdf"
+)
+
+
+def test_advisory_ok_when_first_page_month_matches():
+    # The hdfc fixture's first page prints 'As on April 30, 2026'.
+    res = _advisory_statement_check(_FIXTURE_PDF, "2026-04", "hdfc")
+    assert res["status"] == "ok"
+    assert "2026-04" in res["found"]
+
+
+def test_advisory_mismatch_is_warning_only_never_raises():
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        res = _advisory_statement_check(_FIXTURE_PDF, "2026-07", "hdfc")
+    assert res["status"] == "mismatch"
+    assert "2026-04" in res["found"]
+    ev = [e for e in logs if e["event"] == "managers.statement_date_mismatch"]
+    assert len(ev) == 1 and ev[0]["log_level"] == "warning"
+    assert ev[0]["expected"] == "2026-07"
+
+
+def test_advisory_unreadable_pdf_never_crashes(tmp_path):
+    res = _advisory_statement_check(tmp_path / "missing.pdf", "2026-04", "x")
+    assert res["status"] == "unreadable"
+    junk = tmp_path / "junk.pdf"
+    junk.write_bytes(b"<!doctype html>not a pdf")
+    assert _advisory_statement_check(junk, "2026-04", "x")["status"] == "unreadable"

@@ -111,7 +111,7 @@ def test_run_all_isolates_month_mismatch_to_one_amc(tmp_path, monkeypatch):
         holdings_run, "registered_adapters", lambda: ["ok_amc", _SLUG],
     )
 
-    def fake_run(slug, ym=None):
+    def fake_run(slug, ym=None, force=False):
         if slug == _SLUG:
             raise StatementDateMismatchError(
                 tmp_path / "x.xlsx", "2026-05", {"2026-04"},
@@ -124,3 +124,127 @@ def test_run_all_isolates_month_mismatch_to_one_amc(tmp_path, monkeypatch):
     assert res["ok_amc"]["rows_written"] == 7
     assert res[_SLUG]["error_type"] == "StatementDateMismatchError"
     assert res[_SLUG]["rows_written"] == 0
+
+
+# ---------------------------------------------------------------------------
+# B2 coverage extension: BESPOKE adapters (own parse_excel, never calling
+# parse_sebi_excel — the hdfc/sbi/nippon/icici_pru shape) must flow through
+# the orchestrator's central artifact statement-date screen.
+# ---------------------------------------------------------------------------
+
+
+class _StubBespokeAdapter(_StubAprilAdapter):
+    """Bespoke-shaped adapter: parse_excel is hand-rolled (fixed offsets,
+    no expect_ym, no parse_sebi_excel) — exactly the adapters Stage 1 left
+    uncovered. Only the orchestrator's central screen can reject its
+    wrong-month artifact."""
+
+    def parse_excel(self, excel_path, scheme_name_printed, ym):
+        from mfs.schemas import ParsedHoldingRecord
+
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        try:
+            for row in wb.active.iter_rows(values_only=True):
+                isin = row[0]
+                if not (isinstance(isin, str) and isin.startswith("INE")):
+                    continue
+                yield ParsedHoldingRecord(
+                    scheme_name_printed=scheme_name_printed,
+                    security_name=row[1],
+                    weight_pct=float(row[3]),
+                    isin=isin,
+                    instrument_type="Equity",
+                    source_amc=self.amc_slug,
+                )
+        finally:
+            wb.close()
+
+
+def test_bespoke_adapter_flows_through_central_screen(tmp_path, monkeypatch):
+    stub = _StubBespokeAdapter(tmp_path)
+    monkeypatch.setattr(holdings_run, "get_adapter", lambda slug: stub)
+    monkeypatch.setattr(
+        holdings_run.q, "scheme_master", lambda **kw: _fake_scheme_master(),
+    )
+    monkeypatch.setattr(
+        holdings_run.w, "upsert_holdings",
+        lambda *a, **kw: pytest.fail(
+            "upsert_holdings must NOT be called for a wrong-month artifact"
+        ),
+    )
+
+    with pytest.raises(StatementDateMismatchError) as ei:
+        holdings_run.run_for_amc(_SLUG, ym="2026-05")
+    assert ei.value.expected_ym == "2026-05"
+    assert ei.value.found_yms == {"2026-04"}
+    assert not stub.fetched[0].exists()  # evicted, never pinned
+
+
+def test_bespoke_adapter_right_month_parses(tmp_path, monkeypatch):
+    stub = _StubBespokeAdapter(tmp_path)
+    written = []
+    monkeypatch.setattr(holdings_run, "get_adapter", lambda slug: stub)
+    monkeypatch.setattr(
+        holdings_run.q, "scheme_master", lambda **kw: _fake_scheme_master(),
+    )
+    monkeypatch.setattr(
+        holdings_run.w, "upsert_holdings",
+        lambda df, conn=None: written.append(df) or len(df),
+    )
+
+    class _Cur:
+        def fetchone(self):
+            return (0,)
+
+    class _Conn:
+        def execute(self, sql, params=None):
+            return _Cur()
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_connect(autocommit=False):
+        yield _Conn()
+
+    import mfs.db.connection as dbconn
+    monkeypatch.setattr(dbconn, "connect", fake_connect)
+
+    res = holdings_run.run_for_amc(_SLUG, ym="2026-04")
+    assert res["rows_written"] == 1
+    assert written and written[0]["isin"].to_list() == ["INE040A01034"]
+
+
+def test_per_adapter_override_hook_wins(tmp_path, monkeypatch):
+    # An AMC whose banner is nonstandard can supply its own extraction; the
+    # orchestrator must consult it INSTEAD of the generic sniffing scan.
+    stub = _StubBespokeAdapter(tmp_path)
+    stub.artifact_statement_months = lambda path: {"2026-05"}  # banner lies
+    written = []
+    monkeypatch.setattr(holdings_run, "get_adapter", lambda slug: stub)
+    monkeypatch.setattr(
+        holdings_run.q, "scheme_master", lambda **kw: _fake_scheme_master(),
+    )
+    monkeypatch.setattr(
+        holdings_run.w, "upsert_holdings",
+        lambda df, conn=None: written.append(df) or len(df),
+    )
+
+    class _Cur:
+        def fetchone(self):
+            return (0,)
+
+    class _Conn:
+        def execute(self, sql, params=None):
+            return _Cur()
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_connect(autocommit=False):
+        yield _Conn()
+
+    import mfs.db.connection as dbconn
+    monkeypatch.setattr(dbconn, "connect", fake_connect)
+
+    res = holdings_run.run_for_amc(_SLUG, ym="2026-05")
+    assert res["rows_written"] == 1  # override said May; generic scan ignored

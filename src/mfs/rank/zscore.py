@@ -30,7 +30,8 @@ def _zscore_one(arr: np.ndarray) -> np.ndarray:
         return np.full_like(arr, 0.0, dtype=float)
     z = (arr - mu) / sd
     # Winsorize at ±3σ
-    return np.clip(z, -3.0, 3.0)
+    clipped: np.ndarray = np.clip(z, -3.0, 3.0)
+    return clipped
 
 
 def zscore_within_category(df: pl.DataFrame) -> pl.DataFrame:

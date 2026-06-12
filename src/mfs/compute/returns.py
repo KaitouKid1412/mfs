@@ -1,24 +1,28 @@
 """Rolling 3Y / 5Y returns at weekly step.
 
-For each rolling window, compute the annualized simple return:
-    R = (NAV_end / NAV_start)^(252 / window_length_days) - 1
+For each rolling window, compute the annualized calendar-CAGR simple return:
+    R = (NAV_end / NAV_start)^(1 / years) - 1
+    where years = (d_end - d_start).days / 365.25
 
 Then aggregate per scheme: median and 25th-percentile across windows.
+
+Window-epoch convention (A1-4): only windows whose ENDPOINTS fall in the
+trailing ~window_years contribute — the same trailing-endpoint trim as
+``mfs.compute.rolling.trim_to_trailing_endpoints``, implemented inline on
+the polars frame below.
 """
 
 from __future__ import annotations
 
 from datetime import date, timedelta
+from typing import cast
 
 import polars as pl
-
-from mfs.config import get_pipeline_config
 
 
 def rolling_distribution(aligned: pl.DataFrame, window_years: int, step: str = "1w") -> dict:
     """Return {"median": float|None, "p25": float|None} of annualized returns across
     rolling windows. Skips windows where NAV at either endpoint is null."""
-    cfg = get_pipeline_config()
     if aligned.is_empty():
         return {"median": None, "p25": None}
 
@@ -26,7 +30,12 @@ def rolling_distribution(aligned: pl.DataFrame, window_years: int, step: str = "
     if df.is_empty():
         return {"median": None, "p25": None}
 
-    end = df["date"].max()
+    # Trailing-endpoint trim (A1-4 convention; see rolling.trim_to_trailing_
+    # endpoints): keep 2*window_years + 0.05y so the leading window_years feed
+    # the earliest window's lookback and endpoints span only the trailing
+    # ~window_years. Split into two int() terms to preserve the historical
+    # integer-day arithmetic exactly.
+    end = cast(date, df["date"].max())
     start_required = end - timedelta(days=int(365.25 * (window_years + 0.05)))
     df = df.filter(pl.col("date") >= start_required - timedelta(days=int(365.25 * window_years)))
     if df.height < 30:
@@ -40,8 +49,8 @@ def rolling_distribution(aligned: pl.DataFrame, window_years: int, step: str = "
         raise ValueError(f"unsupported step: {step}")
 
     # Build window endpoint dates
-    cur = df["date"].min() + timedelta(days=int(365.25 * window_years))
-    end_date = df["date"].max()
+    cur = cast(date, df["date"].min()) + timedelta(days=int(365.25 * window_years))
+    end_date = cast(date, df["date"].max())
     endpoints: list[date] = []
     while cur <= end_date:
         endpoints.append(cur)
@@ -50,8 +59,8 @@ def rolling_distribution(aligned: pl.DataFrame, window_years: int, step: str = "
         return {"median": None, "p25": None}
 
     # Pre-sort and convert to numpy for speed
-    by_date = {r["date"]: r["nav"] for r in df.iter_rows(named=True)}
-    sorted_dates = sorted(by_date)
+    by_date: dict[date, float] = {r["date"]: r["nav"] for r in df.iter_rows(named=True)}
+    sorted_dates: list[date] = sorted(by_date)
 
     def _nearest_le(d: date) -> date | None:
         # binary search
@@ -63,7 +72,6 @@ def rolling_distribution(aligned: pl.DataFrame, window_years: int, step: str = "
         return sorted_dates[idx]
 
     rs: list[float] = []
-    n_days_year = cfg.returns.trading_days_per_year
     win_calendar_days = int(365.25 * window_years)
     for ep in endpoints:
         sp = ep - timedelta(days=win_calendar_days)
@@ -75,7 +83,7 @@ def rolling_distribution(aligned: pl.DataFrame, window_years: int, step: str = "
         n_end = by_date.get(d_end)
         if not n_start or not n_end or n_start <= 0:
             continue
-        # Annualize on trading-day count (approx win_calendar_days * 252/365.25)
+        # Calendar-CAGR annualization: exponent 1/years on actual elapsed days.
         years = (d_end - d_start).days / 365.25
         if years <= 0:
             continue
@@ -85,4 +93,8 @@ def rolling_distribution(aligned: pl.DataFrame, window_years: int, step: str = "
     if not rs:
         return {"median": None, "p25": None}
     s = pl.Series(rs)
-    return {"median": float(s.median()), "p25": float(s.quantile(0.25))}
+    # rs is non-empty here, so median/quantile cannot return None.
+    return {
+        "median": float(cast(float, s.median())),
+        "p25": float(cast(float, s.quantile(0.25))),
+    }

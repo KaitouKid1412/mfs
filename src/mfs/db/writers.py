@@ -74,10 +74,21 @@ def _copy_upsert(
     return affected
 
 
-def upsert_nav_daily(df: pl.DataFrame) -> int:
+def upsert_nav_daily(df: pl.DataFrame, *, refresh_log_returns: bool = True) -> int:
     """Upsert a chunk of NAV rows. Expected columns:
     scheme_code, isin_growth, isin_idcw, scheme_name, nav, nav_date, amc_name,
-    amfi_category."""
+    amfi_category.
+
+    C4/B10: the fund_log_returns cache refresh runs ON THE SAME connection /
+    transaction as the NAV upsert — a kill between the two can no longer leave
+    nav_daily ahead of the derived log-return cache (the old two-transaction
+    crash window). The refresh is incremental: per scheme, only dates >= the
+    earliest nav_date in this batch are recomputed.
+
+    ``refresh_log_returns=False`` suppresses the refresh — the bulk-backfill
+    path uses it per window and runs one ``refresh_fund_log_returns_all()``
+    after the final window instead.
+    """
     if df.is_empty():
         return 0
     cols = ["scheme_code", "nav_date", "nav", "isin_growth", "isin_idcw",
@@ -86,10 +97,14 @@ def upsert_nav_daily(df: pl.DataFrame) -> int:
     with connect() as c:
         n = _copy_upsert(c, "nav_daily", cols, out.iter_rows(),
                          pk=("scheme_code", "nav_date"))
-        # Refresh log-return cache for the affected schemes
-        affected_schemes = set(out["scheme_code"].unique().to_list())
-    if affected_schemes:
-        refresh_fund_log_returns(affected_schemes)
+        if refresh_log_returns:
+            watermarks = {
+                r["scheme_code"]: r["min_nav_date"]
+                for r in out.group_by("scheme_code")
+                .agg(pl.col("nav_date").min().alias("min_nav_date"))
+                .iter_rows(named=True)
+            }
+            refresh_fund_log_returns(watermarks, conn=c)
     return n
 
 
@@ -286,13 +301,14 @@ def persist_rank_history(df: pl.DataFrame, as_of: date) -> int:
 _COMPUTED_METRICS_COLS = [
     "as_of_date", "scheme_code", "canonical_category", "benchmark_ticker",
     "ret_3y_median", "ret_3y_p25", "ret_5y_median", "ret_5y_p25",
-    "alpha_3y_annualized", "alpha_3y_tstat", "sortino_3y",
+    "alpha_3y_annualized", "alpha_3y_tstat", "alpha_confidence", "sortino_3y",
     "info_ratio_3y",
     "capture_up", "capture_down", "capture_efficiency",
     "r_squared_3y", "beta_3y",
     # Phase 2 columns (nullable; populated incrementally across 2.0-2.3).
     "beta_3y_std", "r_squared_3y_mean", "style_drift_3y",
     "active_share_median_1y", "ptr_latest", "aum_impact_cost_days",
+    "adv_unresolved_pct",
     "data_quality_flag", "computed_at", "pipeline_version",
 ]
 
@@ -301,6 +317,7 @@ _PHASE2_COLS = (
     "active_share_median_1y",
     "ptr_latest",
     "aum_impact_cost_days",
+    "adv_unresolved_pct",
 )
 
 
@@ -354,8 +371,8 @@ def update_computed_metrics_phase2(df: pl.DataFrame, as_of: date) -> int:
 
     Expected columns: ``scheme_code`` + any subset of the Phase 2 columns
     (``style_drift_3y``, ``active_share_median_1y``, ``ptr_latest``,
-    ``aum_impact_cost_days``). Missing rows are skipped — the caller is
-    expected to have run Phase 1 first.
+    ``aum_impact_cost_days``, ``adv_unresolved_pct``). Missing rows are
+    skipped — the caller is expected to have run Phase 1 first.
     """
     if df.is_empty():
         return 0
@@ -489,39 +506,100 @@ def upsert_scheme_aum(df: pl.DataFrame) -> int:
 # ---------------------------------------------------------------------------
 
 
-def refresh_fund_log_returns(scheme_codes: Iterable[str]) -> int:
-    """Recompute daily log returns for given schemes from nav_daily and replace
-    their rows in fund_log_returns.
+def refresh_fund_log_returns(
+    watermarks: dict[str, date],
+    conn: psycopg.Connection | None = None,
+) -> int:
+    """Incrementally recompute fund_log_returns from per-scheme NAV watermarks.
 
-    log_return_t = ln(nav_t) - ln(nav_{t-1}). The first row per scheme has no
-    prior NAV — filtered out via WHERE log_return IS NOT NULL inside the SELECT."""
-    codes = list(scheme_codes)
-    if not codes:
+    ``watermarks`` maps scheme_code → the earliest nav_date present in the
+    triggering NAV batch. Per scheme, cached rows with date >= watermark are
+    deleted and recomputed; rows before the watermark are untouched —
+    a batch can only change NAVs it contains, and the day-of-watermark return
+    needs exactly one preceding NAV, supplied by a per-scheme lookback to the
+    latest positive-NAV date strictly before the watermark.
+
+    log_return_t = ln(nav_t) - ln(nav_{t-1}); the first row per scheme has no
+    prior NAV and is filtered via WHERE log_return IS NOT NULL.
+
+    When ``conn`` is supplied the refresh runs on that connection without
+    committing — ``upsert_nav_daily`` passes its own connection so the NAV
+    upsert and this refresh commit in ONE transaction (closes the C4/B10
+    two-transaction crash window). With ``conn=None`` it opens its own
+    committed connection.
+    """
+    if not watermarks:
         return 0
+    if conn is not None:
+        return _refresh_fund_log_returns_on(conn, watermarks)
     with connect() as c:
-        with c.cursor() as cur:
+        return _refresh_fund_log_returns_on(c, watermarks)
+
+
+def _refresh_fund_log_returns_on(
+    conn: psycopg.Connection, watermarks: dict[str, date],
+) -> int:
+    """Set-based watermark refresh on an existing connection (no commit)."""
+    tmp = f"_w_flr_wm_{uuid.uuid4().hex[:8]}"
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL(
+                "CREATE TEMP TABLE {} "
+                "(scheme_code TEXT PRIMARY KEY, min_date DATE NOT NULL)"
+            ).format(sql.Identifier(tmp))
+        )
+        try:
+            with cur.copy(
+                sql.SQL("COPY {} (scheme_code, min_date) FROM STDIN").format(
+                    sql.Identifier(tmp)
+                )
+            ) as cp:
+                for code, min_date in watermarks.items():
+                    cp.write_row((code, min_date))
             cur.execute(
-                "DELETE FROM fund_log_returns WHERE scheme_code = ANY(%s)", (codes,)
+                sql.SQL(
+                    "DELETE FROM fund_log_returns f USING {} t "
+                    "WHERE f.scheme_code = t.scheme_code AND f.date >= t.min_date"
+                ).format(sql.Identifier(tmp))
             )
             cur.execute(
-                """
-                INSERT INTO fund_log_returns (scheme_code, date, log_return)
-                SELECT scheme_code, date, log_return FROM (
-                    SELECT
-                        scheme_code,
-                        nav_date AS date,
-                        LN(nav) - LN(LAG(nav) OVER (
-                            PARTITION BY scheme_code ORDER BY nav_date
-                        )) AS log_return
-                    FROM nav_daily
-                    WHERE scheme_code = ANY(%s) AND nav > 0
-                ) sub
-                WHERE log_return IS NOT NULL
-                """,
-                (codes,),
+                sql.SQL(
+                    """
+                    WITH lb AS (
+                        SELECT t.scheme_code,
+                               t.min_date,
+                               COALESCE(
+                                   (SELECT MAX(p.nav_date) FROM nav_daily p
+                                    WHERE p.scheme_code = t.scheme_code
+                                      AND p.nav_date < t.min_date
+                                      AND p.nav > 0),
+                                   t.min_date) AS start_date
+                        FROM {} t
+                    )
+                    INSERT INTO fund_log_returns (scheme_code, date, log_return)
+                    SELECT scheme_code, date, log_return FROM (
+                        SELECT
+                            n.scheme_code,
+                            n.nav_date AS date,
+                            lb.min_date,
+                            LN(n.nav) - LN(LAG(n.nav) OVER (
+                                PARTITION BY n.scheme_code ORDER BY n.nav_date
+                            )) AS log_return
+                        FROM nav_daily n
+                        JOIN lb ON lb.scheme_code = n.scheme_code
+                               AND n.nav_date >= lb.start_date
+                        WHERE n.nav > 0
+                    ) sub
+                    WHERE log_return IS NOT NULL AND date >= min_date
+                    """
+                ).format(sql.Identifier(tmp))
             )
             total = cur.rowcount
-    log.info("fund_log_returns.refreshed", n_schemes=len(codes), n_rows=total)
+        finally:
+            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(tmp)))
+    log.info(
+        "fund_log_returns.refreshed", n_schemes=len(watermarks), n_rows=total,
+    )
     return total
 
 

@@ -146,6 +146,72 @@ def test_holdings_with_only_debt_returns_none():
 
 
 # ---------------------------------------------------------------------------
+# A1-8 — ISIN-first matching with canonicalized-name fallback
+# ---------------------------------------------------------------------------
+
+
+def test_same_isins_different_spellings_give_zero_active_share():
+    """(a) Identical portfolios under different spellings but same ISINs →
+    AS == 0.0. Pre-A1-8 name-only matching double-counted '&' vs 'and'
+    spellings as disjoint securities and reported 100."""
+    fund = pl.DataFrame([
+        {**_holding(name="Larsen & Toubro Ltd", weight=60), "isin": "INE018A01030"},
+        {**_holding(name="HDFC Bank Ltd.", weight=40), "isin": "INE040A01034"},
+    ])
+    bench = pl.DataFrame([
+        {**_constituent(name="Larsen and Toubro Limited", weight=60),
+         "isin": "INE018A01030"},
+        {**_constituent(name="HDFC BANK LIMITED", weight=40), "isin": "INE040A01034"},
+    ])
+    assert abs(active_share_one_month(fund, bench) - 0.0) < 1e-9
+
+
+def test_isin_match_despite_entirely_different_names():
+    """(b) Rows sharing an ISIN match even when the printed names share no
+    tokens at all."""
+    fund = pl.DataFrame([
+        {**_holding(name="L&T (formerly Larsen)", weight=100), "isin": "INE018A01030"},
+    ])
+    bench = pl.DataFrame([
+        {**_constituent(name="Completely Unrelated Display String", weight=100),
+         "isin": "INE018A01030"},
+    ])
+    assert abs(active_share_one_month(fund, bench) - 0.0) < 1e-9
+
+
+def test_null_isin_falls_back_to_canonicalized_name():
+    """(c) isin=None rows still match by normalized name, with '&'
+    canonicalized to 'and' before punctuation stripping."""
+    fund = pl.DataFrame([_holding(name="Larsen & Toubro Ltd", weight=100)])
+    bench = pl.DataFrame([_constituent(name="Larsen and Toubro Limited", weight=100)])
+    assert abs(active_share_one_month(fund, bench) - 0.0) < 1e-9
+
+
+def test_mixed_isin_and_name_fallback_in_one_computation():
+    """(d) One ISIN-keyed match plus one name-fallback match in the same
+    portfolio → both cancel, AS == 0.0."""
+    fund = pl.DataFrame([
+        {**_holding(name="Mystery Display Name", weight=60), "isin": "INE018A01030"},
+        _holding(name="ICICI Bank Ltd.", weight=40),  # isin=None → name key
+    ])
+    bench = pl.DataFrame([
+        {**_constituent(name="Larsen and Toubro Limited", weight=60),
+         "isin": "INE018A01030"},
+        _constituent(name="ICICI BANK LIMITED", weight=40),  # isin=None
+    ])
+    assert abs(active_share_one_month(fund, bench) - 0.0) < 1e-9
+
+
+def test_bare_co_inc_tokens_no_longer_over_merge():
+    """(e) 'Apollo Co' and 'Apollo Inc' (no ISINs) are distinct issuers.
+    Pre-A1-8 _LTD_RE stripped bare 'co'/'inc' tokens, merging both with any
+    plain 'Apollo' — AS would have been 0.0. Now fully disjoint → 100."""
+    fund = pl.DataFrame([_holding(name="Apollo Co", weight=100)])
+    bench = pl.DataFrame([_constituent(name="Apollo Inc", weight=100)])
+    assert abs(active_share_one_month(fund, bench) - 100.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
 # trailing_median_active_share — windowing + median
 # ---------------------------------------------------------------------------
 

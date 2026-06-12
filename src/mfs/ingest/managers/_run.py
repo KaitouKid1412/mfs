@@ -69,6 +69,42 @@ def _default_data_month(today: date | None = None) -> str:
     return f"{d.year:04d}-{d.month - 1:02d}"
 
 
+def _advisory_statement_check(pdf: Path, ym: str, amc_slug: str) -> dict:
+    """ADVISORY statement-date check on the factsheet path (B2) — log-only.
+
+    Scans page 1 of the factsheet for 'as on / Data as on <date>' phrases and
+    compares the named month(s) against the requested data month. Factsheet
+    front pages vary far too much for a hard gate (unlike the SEBI portfolio
+    Excels), so a mismatch is a WARNING plus a verdict in the per-AMC result
+    dict for Gate B to surface — never an abort.
+    """
+    # Local import: holdings._generic owns the shared 'as on' grammar; a
+    # module-level import would couple the two packages' import order.
+    from mfs.ingest.holdings._generic import statement_months_in_text
+
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(pdf) as doc:
+            text = (doc.pages[0].extract_text() or "") if doc.pages else ""
+    except Exception as e:  # noqa: BLE001 — advisory scan must never crash a run
+        log.debug(
+            "managers.statement_scan_unreadable",
+            amc=amc_slug, path=str(pdf), err=str(e),
+        )
+        return {"status": "unreadable"}
+    months = statement_months_in_text(text)
+    if not months:
+        return {"status": "absent"}
+    if ym in months:
+        return {"status": "ok", "found": sorted(months)}
+    log.warning(
+        "managers.statement_date_mismatch",
+        amc=amc_slug, expected=ym, found=sorted(months), path=str(pdf),
+    )
+    return {"status": "mismatch", "found": sorted(months)}
+
+
 def run_for_amc(
     amc_slug: str,
     ym: str | None = None,
@@ -102,6 +138,10 @@ def run_for_amc(
         pdf = Path(pdf_path)
         if not pdf.exists():
             raise IngestError(f"Local PDF not found: {pdf}")
+
+    # Step 1.5: advisory statement-date scan (B2) — log-only verdict carried
+    # in the result dict; never gates the run.
+    stmt_check = _advisory_statement_check(pdf, ym, amc_slug)
 
     # Step 2: build candidate index from scheme_master (drives all matching).
     # Built before parsing so it can also fingerprint the match universe for the
@@ -137,6 +177,7 @@ def run_for_amc(
             "amc_slug": amc_slug, "ym": ym,
             "rows_written_holdings": 0, "rows_written_ptr": 0,
             "candidate_count": len(candidates), "skipped": True,
+            "statement_date_check": stmt_check,
         }
 
     # Step 3: parse each optional signal. Adapters that don't override return ().
@@ -147,9 +188,18 @@ def run_for_amc(
 
     # Step 4: resolve names to scheme_codes. Cross-name collisions (two
     # printed names → one scheme_code) are resolved by match score inside the
-    # resolvers; parse order never decides data ownership.
+    # resolvers; parse order never decides data ownership. The per-portfolio
+    # sanity gate (B3) needs canonical_category per code, so build that map
+    # from the scheme_master frame already loaded above.
+    cat_by_code: dict[str, str | None] = {}
+    for r in sm.iter_rows(named=True):
+        cat_by_code[r["scheme_code"]] = r.get("canonical_category")
+    gate_skipped: dict[str, list[str]] = {
+        "weight_sum_breach": [], "too_few_holdings": [],
+    }
     matched_holdings = _resolve_holdings(
         holding_records, candidates, amc_slug, ym, match_threshold,
+        cat_by_code=cat_by_code, gate_skipped=gate_skipped,
     )
     matched_ptr = _resolve_ptr(ptr_records, candidates, amc_slug, ym, match_threshold)
 
@@ -173,8 +223,39 @@ def run_for_amc(
     n_holdings = w.upsert_holdings(pl.DataFrame(matched_holdings)) if matched_holdings else 0
     if matched_ptr:
         from mfs.db.connection import connect
-        ptr_months = sorted({r["as_of_month"] for r in matched_ptr})
+        incoming_by_month: dict[date, set[str]] = {}
+        for r in matched_ptr:
+            incoming_by_month.setdefault(r["as_of_month"], set()).add(
+                r["scheme_code"]
+            )
+        ptr_months = sorted(incoming_by_month)
         with connect() as conn:
+            # Partition-shrinkage guard (B13): the per-month DELETE below
+            # would silently drop a scheme whose PTR parsed last run but not
+            # this run. Refuse before ANY month is deleted (IngestError →
+            # rollback, DB untouched); ``force`` (--full) replaces loudly.
+            for m in ptr_months:
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT scheme_code) "
+                    "FROM portfolio_turnover_monthly "
+                    "WHERE as_of_month = %s AND source_amc = %s",
+                    (m, amc_slug),
+                ).fetchone()
+                existing = int(row[0]) if row else 0
+                if len(incoming_by_month[m]) < existing:
+                    if not force:
+                        raise IngestError(
+                            f"{amc_slug}: refusing PTR partition shrinkage "
+                            f"for {m} — incoming "
+                            f"{len(incoming_by_month[m])} distinct schemes "
+                            f"< {existing} already in DB. Re-run with "
+                            f"--full to replace anyway."
+                        )
+                    log.warning(
+                        "managers.ptr_partition_shrinkage_forced",
+                        amc=amc_slug, month=str(m),
+                        incoming=len(incoming_by_month[m]), existing=existing,
+                    )
             for m in ptr_months:
                 conn.execute(
                     "DELETE FROM portfolio_turnover_monthly "
@@ -200,6 +281,9 @@ def run_for_amc(
         amc=amc_slug, ym=ym,
         rows_written_holdings=n_holdings,
         rows_written_ptr=n_ptr,
+        statement_date_check=stmt_check.get("status"),
+        n_weight_sum_skipped=len(gate_skipped["weight_sum_breach"]),
+        n_too_few_holdings_skipped=len(gate_skipped["too_few_holdings"]),
     )
     return {
         "amc_slug": amc_slug,
@@ -207,6 +291,9 @@ def run_for_amc(
         "rows_written_holdings": n_holdings,
         "rows_written_ptr": n_ptr,
         "candidate_count": len(candidates),
+        "statement_date_check": stmt_check,
+        "weight_sum_skipped_schemes": gate_skipped["weight_sum_breach"],
+        "too_few_holdings_skipped_schemes": gate_skipped["too_few_holdings"],
     }
 
 
@@ -251,9 +338,19 @@ def _resolve_holdings(
     amc_slug: str,
     ym: str,
     match_threshold: int = DEFAULT_THRESHOLD,
+    *,
+    cat_by_code: dict[str, str | None] | None = None,
+    gate_skipped: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     """Resolve printed scheme names → scheme_codes for holdings. Rows with
-    no ISIN are dropped (per the Phase 2.2 locked decision)."""
+    no ISIN are dropped (per the Phase 2.2 locked decision).
+
+    ``cat_by_code`` (scheme_code → canonical_category) enables the
+    per-portfolio weight-sum + min-holdings sanity gate (B3) — same gate,
+    same bounds as the holdings-Excel path. A failing scheme's ENTIRE
+    printed portfolio is dropped; ``gate_skipped`` (verdict → printed names)
+    collects the skips for the caller's run summary.
+    """
     if not records:
         return []
     from mfs.schemas import ParsedHoldingRecord  # local import to avoid cycle
@@ -271,6 +368,7 @@ def _resolve_holdings(
             )
     winners = _winners_by_code(cache, amc_slug, signal="holdings")
     out: list[dict] = []
+    rows_by_printed: dict[str, list[dict]] = {}
     for rec in records:
         if not isinstance(rec, ParsedHoldingRecord):
             continue
@@ -279,7 +377,7 @@ def _resolve_holdings(
         if rec.scheme_name_printed not in winners:
             continue  # unmatched, or a lower-scoring duplicate for its code
         mr = cache[rec.scheme_name_printed]
-        out.append({
+        row = {
             "scheme_code": mr.matched_scheme_code,
             "isin": rec.isin,
             "as_of_month": as_of_month,
@@ -288,7 +386,34 @@ def _resolve_holdings(
             "instrument_type": rec.instrument_type,
             "source_amc": amc_slug,
             "computed_at": now,
-        })
+        }
+        out.append(row)
+        rows_by_printed.setdefault(rec.scheme_name_printed, []).append(row)
+
+    # Per-portfolio sanity gate (B3) — see holdings/_run.check_portfolio_sanity
+    # for the bounds and their live-DB calibration rationale.
+    if cat_by_code:
+        from mfs.ingest.holdings._run import check_portfolio_sanity
+
+        bad_printed: set[str] = set()
+        for printed, rows in rows_by_printed.items():
+            mr = cache[printed]
+            verdict = check_portfolio_sanity(
+                scheme_code=mr.matched_scheme_code,
+                printed_name=printed,
+                master_name=mr.matched_scheme_name,
+                category=cat_by_code.get(mr.matched_scheme_code),
+                total_weight=sum(float(r["weight_pct"]) for r in rows),
+                n_rows=len(rows),
+                amc_slug=amc_slug,
+            )
+            if verdict != "ok":
+                bad_printed.add(printed)
+                if gate_skipped is not None:
+                    gate_skipped.setdefault(verdict, []).append(printed)
+        if bad_printed:
+            bad_rows = {id(r) for p in bad_printed for r in rows_by_printed[p]}
+            out = [r for r in out if id(r) not in bad_rows]
     return out
 
 

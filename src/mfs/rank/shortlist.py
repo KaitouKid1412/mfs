@@ -3,8 +3,10 @@ shortlist per category, then orchestrate Stage 2 and Stage 3."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
@@ -72,7 +74,7 @@ RANK_HISTORY_Z_COLS = [
 
 # Full rank_history frame schema (column -> dtype, in table order). Must stay
 # identical to writers._RANK_HISTORY_COLS / the rank_history DDL in schema.sql.
-RANK_HISTORY_SCHEMA: dict[str, pl.DataType] = {
+RANK_HISTORY_SCHEMA: dict[str, pl.datatypes.DataTypeClass] = {
     "as_of_date": pl.Date,
     "stage": pl.Int32,
     "scheme_code": pl.Utf8,
@@ -288,19 +290,25 @@ def _top_n_per_category(scored: pl.DataFrame, n: int) -> pl.DataFrame:
     )
 
 
-def _build_aum_map(scored: pl.DataFrame) -> dict[str, float]:
+def _build_aum_map(
+    scored: pl.DataFrame, as_of: date | None = None,
+) -> dict[str, float]:
+    """Latest AUM per scheme, bounded to quarters on or before ``as_of``
+    (A1-12): a quarter published after the run's as_of must not leak future
+    AUM into a historical ranking. ``as_of=None`` keeps the globally-latest
+    quarter (current-run behavior)."""
     if scored.is_empty():
         return {}
     codes = scored["scheme_code"].unique().to_list()
     aum_map: dict[str, float] = {}
     for code in codes:
-        row = q.latest_scheme_aum(code)
+        row = q.latest_scheme_aum(code, on_or_before=as_of)
         if row is not None:
             aum_map[code] = float(row[1])
     return aum_map
 
 
-def _latest_holdings_loader():
+def _latest_holdings_loader() -> Callable[[str], pl.DataFrame]:
     def loader(scheme_code: str) -> pl.DataFrame:
         h = q.holdings_for_scheme(scheme_code)
         if h.is_empty():
@@ -475,7 +483,7 @@ def rank_deep(
     candidates_with_phase2 = q.computed_metrics_for_schemes(as_of, candidate_codes)
     if candidates_with_phase2.is_empty():
         log.warning("rank.rank_deep.no_candidates_after_phase2")
-        stage2_result = {
+        stage2_result: dict[str, Any] = {
             "stage2_dir": str(out_dir / "stage2"),
             "category_files": {},
             "dropped_file": "",
@@ -501,7 +509,7 @@ def rank_deep(
         # ``composite_score_stage1`` it needs for pool ranking.
         zscored = zscore_within_category(candidates_with_phase2)
         scored_pool = composite_score_stage1(zscored)
-        aum_map = _build_aum_map(scored_pool)
+        aum_map = _build_aum_map(scored_pool, as_of=as_of)
         stage2_result = stage2_mod.run(
             scored_pool, aum_map, out_dir,
             pool_size=pool_size, final_size=final_size,

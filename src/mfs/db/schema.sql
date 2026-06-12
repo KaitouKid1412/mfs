@@ -114,6 +114,16 @@ ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS aum_impact_cost_days   DOU
 -- Phase 2.3: scheme AUM diagnostic surfaced into computed_metrics.
 ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS scheme_aum_crore       DOUBLE PRECISION;
 
+-- Phase 6 A1-2 (locked D1, signed alpha): share of rolling alpha windows with
+-- |t-stat| >= 1.0. Display-only diagnostic — must never be used as a filter.
+ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS alpha_confidence       DOUBLE PRECISION;
+
+-- Phase 6 A1-11 (ADV-coverage guard): fraction (0-1) of total portfolio
+-- weight with no NSE EQ-series ADV match. When > 0.20 the aum_impact_cost_days
+-- metric is stored NULL (it would describe a sliver of the book); the fraction
+-- itself is always stored so stage 2 / reports can show why.
+ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS adv_unresolved_pct     DOUBLE PRECISION;
+
 -- Manager-tenure (Phase 2.1) and SEBI stress-test (Phase 2.3) ingest paths
 -- and their computed_metrics columns were removed when the user opted to
 -- verify those signals manually for the Stage 2 survivor set. The columns

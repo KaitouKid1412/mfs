@@ -1,17 +1,21 @@
 """Rolling 3Y Jensen's alpha via OLS: r_f - r_rf = alpha + beta*(r_b - r_rf) + eps.
 
-Returns the median annualized alpha (and median beta, R²) across rolling windows.
+Reported alpha is SIGNED (locked decision D1, 2026-06-11): the median
+annualized alpha across ALL rolling windows, with no per-window significance
+censor. A fund that persistently trails its benchmark reports a negative
+alpha; `alpha_tstat` is the median intercept t-stat over the same full
+window set.
 
-Per-window t-stat filter: only windows with `tstat >= ALPHA_TSTAT_FILTER_MIN`
-contribute to the reported alpha and alpha_tstat. This restricts the reported
-alpha to periods where the regression provided meaningful evidence of a
-positive intercept. Beta and R² are diagnostics of the fund/benchmark
-relationship and are reported over *all* windows so downstream filters (R²
-band, beta band) keep their full sample.
+`alpha_confidence` is the share of windows whose intercept satisfies
+|t| >= ALPHA_CONFIDENCE_TSTAT_MIN — i.e. how often the regression found
+statistically meaningful intercept evidence in either direction. It is a
+DISPLAY-ONLY diagnostic: per locked D1 it must never be used as a filter
+(not in window aggregation here, not in ranking downstream).
 
-If no windows pass the t-stat threshold, alpha and alpha_tstat are None — the
-scheme then drops out of ranking via the existing not-null filter, even if
-its beta/R² are otherwise reasonable.
+Beta and R² are diagnostics of the fund/benchmark relationship, also reported
+over all windows (median beta/R²; sample-std of beta and mean R² feed the
+Phase 2 Style Drift metric). All outputs are None only when no window is
+computable (short history or empty alignment).
 """
 
 from __future__ import annotations
@@ -24,23 +28,28 @@ import statsmodels.api as sm
 from mfs.compute.rolling import iter_windows
 from mfs.config import get_pipeline_config
 
-# Minimum per-window t-stat for that window's alpha to be counted (one-sided,
-# positive). At ~750 daily obs and 1 regressor, t ≥ 1.0 corresponds to ~84%
-# confidence that alpha is positive.
-ALPHA_TSTAT_FILTER_MIN = 1.0
+# |t| threshold a window must clear to count toward `alpha_confidence` (the
+# share of windows with statistically meaningful intercept evidence, either
+# sign). This constant no longer filters anything: every window contributes
+# to the reported alpha (locked D1). At ~750 daily obs and 1 regressor,
+# |t| ≥ 1.0 is ~68% two-sided confidence the intercept is nonzero.
+ALPHA_CONFIDENCE_TSTAT_MIN = 1.0
 
 
 def rolling_alpha_beta_r2(aligned: pl.DataFrame, window_years: int = 3, step: str = "1w") -> dict:
-    """Return {"alpha_ann", "alpha_tstat", "beta", "r2", "beta_std", "r2_mean"}.
+    """Return {"alpha_ann", "alpha_tstat", "alpha_confidence", "beta", "r2",
+    "beta_std", "r2_mean"}.
 
-    Uses log returns. Alpha is the daily intercept; annualized by trading_days_per_year.
-    Aggregation: median across the t-stat-filtered window set for alpha/t-stat;
-    median across *all* windows for beta/R²; sample-std of beta and mean of R²
-    across all windows feed the Phase 2 Style Drift metric.
+    Uses log returns. Alpha is the daily intercept; annualized by
+    trading_days_per_year. Aggregation: median across ALL windows for
+    alpha/t-stat/beta/R² — signed, so negative alpha is representable.
+    `alpha_confidence` = share of windows with |t| >= ALPHA_CONFIDENCE_TSTAT_MIN
+    (display-only, never a filter; locked D1). Sample-std of beta and mean of
+    R² across all windows feed the Phase 2 Style Drift metric.
     """
     cfg = get_pipeline_config()
     empty = {
-        "alpha_ann": None, "alpha_tstat": None,
+        "alpha_ann": None, "alpha_tstat": None, "alpha_confidence": None,
         "beta": None, "r2": None,
         "beta_std": None, "r2_mean": None,
     }
@@ -73,9 +82,9 @@ def rolling_alpha_beta_r2(aligned: pl.DataFrame, window_years: int = 3, step: st
             alpha_ann = (1.0 + a_daily) ** n_days_year - 1.0
             betas.append(b)
             r2s.append(r2)
-            if tstat >= ALPHA_TSTAT_FILTER_MIN:
-                alphas.append(alpha_ann)
-                tstats.append(tstat)
+            # No significance censor (locked D1): every window contributes.
+            alphas.append(alpha_ann)
+            tstats.append(tstat)
         except Exception:  # noqa: BLE001
             pass
 
@@ -84,9 +93,12 @@ def rolling_alpha_beta_r2(aligned: pl.DataFrame, window_years: int = 3, step: st
     # ddof=1 sample std. Needs ≥2 windows; single-window scheme has no drift signal.
     beta_std = float(np.std(betas, ddof=1)) if len(betas) >= 2 else None
     r2_mean = float(np.mean(r2s)) if r2s else None
+    n_confident = sum(1 for t in tstats if abs(t) >= ALPHA_CONFIDENCE_TSTAT_MIN)
     out = {
         "alpha_ann": float(np.median(alphas)) if alphas else None,
         "alpha_tstat": float(np.median(tstats)) if tstats else None,
+        # Display-only diagnostic (locked D1): NEVER use as a filter.
+        "alpha_confidence": (n_confident / len(tstats)) if tstats else None,
         "beta": median_beta,
         "r2": median_r2,
         "beta_std": beta_std,

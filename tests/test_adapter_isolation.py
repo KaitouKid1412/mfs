@@ -57,7 +57,7 @@ def test_managers_run_all_raises_when_all_fail(monkeypatch):
 def test_holdings_run_all_isolates_one_amc(monkeypatch):
     monkeypatch.setattr(holdings_run, "registered_adapters", lambda: ["x", "y"])
 
-    def fake_run(slug, ym=None):
+    def fake_run(slug, ym=None, force=False):
         if slug == "y":
             raise _http_404()
         return {"amc_slug": slug, "ym": ym, "rows_written": 10}
@@ -73,7 +73,7 @@ def test_holdings_run_all_isolates_one_amc(monkeypatch):
 def test_holdings_run_all_raises_when_all_fail(monkeypatch):
     monkeypatch.setattr(holdings_run, "registered_adapters", lambda: ["x"])
 
-    def fake_run(slug, ym=None):
+    def fake_run(slug, ym=None, force=False):
         raise ValueError("boom")
 
     monkeypatch.setattr(holdings_run, "run_for_amc", fake_run)

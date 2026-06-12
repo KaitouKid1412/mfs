@@ -1,7 +1,11 @@
 """Pre-rank filters — a floor, not a tight band.
 
 Data-quality filters (mandatory): INSUFFICIENT_HISTORY and POOR schemes have
-no usable metrics; schemes outside `rankable_categories` have no benchmark.
+no usable metrics; STALE schemes (A1-3: last NAV lags the run's as_of beyond
+quality.max_scheme_nav_lag_bdays trading days — dead/merged/suspended funds)
+have metrics describing a portfolio that no longer exists, and are excluded
+with exclusion_reason STALE_NAV; schemes outside `rankable_categories` have
+no benchmark.
 
 Metric filters (relaxed floors): drop only catastrophically broken funds. The
 old strict thresholds (capture > 1.0, IR > 0.2, R² in [0.70, 0.98], tight
@@ -17,10 +21,11 @@ user picks the top-5 per category by eye.
 
 from __future__ import annotations
 
+from typing import Literal, overload
+
 import polars as pl
 
 from mfs.config import get_thresholds
-
 
 # Floor values — schemes failing any of these are too broken to be informative.
 CAPTURE_EFFICIENCY_FLOOR = 0.50      # was 1.00
@@ -41,14 +46,15 @@ def _exclusion_reason_expr(rankable: set[str]) -> pl.Expr:
         INSUFFICIENT_HISTORY | MISSING_CORE_METRIC:<name> | STALE_NAV
         | FILTER:<name>
 
-    STALE_NAV maps the (A1-3) per-scheme staleness data_quality_flag; no
-    current flag value produces it yet, so the branch is forward-compatible
-    dead code until that gate lands. NULL means the row passed every filter.
+    STALE_NAV maps the (A1-3) per-scheme staleness data_quality_flag value
+    ``STALE`` (set by the compute orchestrator when a scheme's last NAV lags
+    the run's as_of beyond quality.max_scheme_nav_lag_bdays trading days).
+    NULL means the row passed every filter.
     """
     conditions: list[tuple[pl.Expr, str]] = [
         (pl.col("data_quality_flag") == "INSUFFICIENT_HISTORY",
          "INSUFFICIENT_HISTORY"),
-        (pl.col("data_quality_flag") == "STALE_NAV", "STALE_NAV"),
+        (pl.col("data_quality_flag") == "STALE", "STALE_NAV"),
         (pl.col("data_quality_flag") == "POOR", "FILTER:data_quality"),
         (~pl.col("canonical_category").is_in(list(rankable)).fill_null(False),
          "FILTER:rankable_category"),
@@ -73,6 +79,18 @@ def _exclusion_reason_expr(rankable: set[str]) -> pl.Expr:
     return expr
 
 
+@overload
+def apply_hard_filters(
+    metrics: pl.DataFrame, *, with_reasons: Literal[True],
+) -> tuple[pl.DataFrame, pl.DataFrame]: ...
+
+
+@overload
+def apply_hard_filters(
+    metrics: pl.DataFrame, *, with_reasons: Literal[False] = ...,
+) -> pl.DataFrame: ...
+
+
 def apply_hard_filters(
     metrics: pl.DataFrame, *, with_reasons: bool = False,
 ) -> pl.DataFrame | tuple[pl.DataFrame, pl.DataFrame]:
@@ -92,6 +110,7 @@ def apply_hard_filters(
 
     df = metrics
     df = df.filter(pl.col("data_quality_flag") != "INSUFFICIENT_HISTORY")
+    df = df.filter(pl.col("data_quality_flag") != "STALE")
     df = df.filter(pl.col("data_quality_flag") != "POOR")
     df = df.filter(pl.col("canonical_category").is_in(list(rankable)))
 

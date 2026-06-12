@@ -19,8 +19,21 @@ ingest:
     history_start: "2013-01-01"
 
 quality:
-  min_history_years_for_ranking: 5
+  # 3 is the live deliberate history gate (A1-5 wired it into the
+  # orchestrator; the old YAML value of 5 was dead config). Moving to 5y is
+  # a separate product decision.
+  min_history_years_for_ranking: 3
   max_missing_pct_in_window: 0.05
+  # A1-3 per-scheme staleness gate: last NAV older than the N-th-from-last
+  # trading day <= as_of -> data_quality_flag STALE (visible in
+  # computed_metrics, excluded from ranking as STALE_NAV). 10 trading days
+  # = 2x freshness.max_nav_lag_bdays: tolerates per-scheme publication lag,
+  # catches anything dead for weeks.
+  max_scheme_nav_lag_bdays: 10
+  # A1-9: per-scheme compute failures skip-and-report up to this fraction of
+  # attempted schemes; beyond it the run halts (PipelineError) instead of
+  # silently shrinking the universe.
+  max_scheme_compute_failure_rate: 0.01
 
 freshness:
   # Maximum acceptable staleness for each curated dataset. Pipeline hard-fails

@@ -8,11 +8,13 @@ over the union of holdings i (in fund OR in benchmark).
 Result is a percentage (0-100). High Active Share means the fund's portfolio
 diverges materially from its benchmark; low means it's closet-indexing.
 
-**Implementation note**: Indian AMC factsheets do NOT print ISINs in their
-portfolio listings (we discovered this when shipping PR 2.2.C). Holdings
-are therefore stored by normalized `security_name` rather than ISIN. The
-constituent CSVs (user-provided) DO include ISINs, but matching is done on
-the normalized name so the two sources can interoperate.
+**Implementation note**: matching is ISIN-first (A1-8). In the Phase-2.2
+factsheet-PDF era holdings carried no ISINs, so matching was name-only; that
+is obsolete — post-Phase-5 SEBI-Excel ingestion both sides carry ISINs at
+100% coverage (holdings_monthly and index_constituents_monthly, verified
+live). Each row is keyed on `isin` when non-null/non-empty, else on the
+normalized `security_name`; the two key kinds coexist in one weight dict, so
+legacy/partial sources still interoperate via the name fallback.
 
 Locked choices:
 - **Equity-only filter**: only holdings whose `instrument_type` normalizes
@@ -29,9 +31,12 @@ Locked choices:
   holdings are already dropped by the equity-only filter (they would not
   cancel). The benchmark's fixed equity/debt split is recorded as metadata in
   the `composite_recipe` column of `configs/benchmarks.csv` for transparency.
-- **Normalized name match**: `_normalize_name` lowercases, strips punctuation,
-  and removes Ltd./Limited variants so "HDFC Bank Ltd." matches "HDFC Bank
-  Limited" across sources.
+- **ISIN-first match, normalized-name fallback**: rows with an ISIN match on
+  it directly. Rows without one fall back to `normalize_name`, which
+  lowercases, strips punctuation, canonicalizes '&' to 'and' (so "Larsen &
+  Toubro" matches "Larsen and Toubro"), and removes Ltd./Limited/Corp
+  suffixes so "HDFC Bank Ltd." matches "HDFC Bank Limited" across sources.
+  Bare 'Co'/'Inc' tokens are intentionally NOT stripped (over-merge risk).
 - **Trailing 1Y median**: per (scheme, as_of_compute_date), look at trailing
   12 monthly snapshots and report the median Active Share. Schemes with
   <3 usable snapshots in the window get a null result.
@@ -49,69 +54,79 @@ import polars as pl
 # Minimum number of monthly snapshots required for a meaningful median.
 MIN_SNAPSHOTS_FOR_MEDIAN = 3
 
-_LTD_RE = re.compile(r"\b(ltd|limited|ltd\.|inc|corp|co)\.?\b", re.IGNORECASE)
+# Suffixes safe to strip for name matching. Bare 'co'/'inc' tokens are
+# deliberately excluded (A1-8): stripping them over-merged distinct issuers.
+_LTD_RE = re.compile(r"\b(ltd|limited|corp)\.?\b", re.IGNORECASE)
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
 
 
 def normalize_name(name: str) -> str:
-    """Normalize a security name for cross-source matching.
+    """Normalize a security name for cross-source name matching (the fallback
+    key for rows without an ISIN).
 
     'HDFC Bank Ltd.' / 'HDFC BANK LIMITED' / 'HDFC Bank Limited.' all → 'hdfc bank'.
+    '&' canonicalizes to 'and' (before punctuation stripping) so
+    'Larsen & Toubro' matches 'Larsen and Toubro'.
     """
     if not name:
         return ""
-    s = _LTD_RE.sub("", name)
+    s = name.replace("&", " and ")
+    s = _LTD_RE.sub("", s)
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip().lower()
     return s
 
 
-def _normalize_equity_weights(holdings_df: pl.DataFrame) -> dict[str, float]:
-    """Filter to equity rows and renormalize weights to 100% on a normalized
-    security_name key. Returns {normalized_name: weight_pct} summing to 100.0
-    (or empty dict if no equity rows present)."""
-    if holdings_df.is_empty():
-        return {}
-    eq = holdings_df.filter(
-        (pl.col("instrument_type") == "Equity")
-        & pl.col("security_name").is_not_null()
-        & (pl.col("security_name") != "")
-    )
-    if eq.is_empty():
-        return {}
-    total = float(eq["weight_pct"].sum())
+def _row_key(isin: object, security_name: object) -> str | None:
+    """ISIN-first match key (A1-8): the ISIN when non-null/non-empty, else the
+    normalized security name; None when neither is usable. ISIN keys are
+    uppercased and name keys lowercased, so the two key kinds cannot collide
+    in a shared dict."""
+    if isinstance(isin, str) and isin.strip():
+        return isin.strip().upper()
+    if isinstance(security_name, str) and security_name:
+        return normalize_name(security_name) or None
+    return None
+
+
+def _renormalize_on_key(df: pl.DataFrame) -> dict[str, float]:
+    """Renormalize weight_pct to 100% over rows with a usable match key,
+    accumulating on the ISIN-first key. Returns {} if nothing is keyable or
+    total weight is non-positive."""
+    keyed: list[tuple[str, float]] = []
+    for r in df.iter_rows(named=True):
+        key = _row_key(r.get("isin"), r.get("security_name"))
+        if key is None:
+            continue
+        keyed.append((key, float(r["weight_pct"])))
+    total = sum(wt for _, wt in keyed)
     if total <= 0:
         return {}
     out: dict[str, float] = {}
-    for r in eq.iter_rows(named=True):
-        key = normalize_name(r["security_name"])
-        if not key:
-            continue
-        out[key] = out.get(key, 0.0) + float(r["weight_pct"]) / total * 100.0
+    for key, wt in keyed:
+        out[key] = out.get(key, 0.0) + wt / total * 100.0
     return out
+
+
+def _normalize_equity_weights(holdings_df: pl.DataFrame) -> dict[str, float]:
+    """Filter to equity rows and renormalize weights to 100% on the ISIN-first
+    match key (ISIN when present, else normalized security_name). Returns
+    {key: weight_pct} summing to 100.0 (or empty dict if no equity rows)."""
+    if holdings_df.is_empty():
+        return {}
+    eq = holdings_df.filter(pl.col("instrument_type") == "Equity")
+    if eq.is_empty():
+        return {}
+    return _renormalize_on_key(eq)
 
 
 def _normalize_constituent_weights(constituents_df: pl.DataFrame) -> dict[str, float]:
-    """Renormalize benchmark constituent weights to 100% on normalized
-    security_name key. Constituents are all equity by definition."""
+    """Renormalize benchmark constituent weights to 100% on the ISIN-first
+    match key. Constituents are all equity by definition."""
     if constituents_df.is_empty():
         return {}
-    df = constituents_df.filter(
-        pl.col("security_name").is_not_null() & (pl.col("security_name") != "")
-    )
-    if df.is_empty():
-        return {}
-    total = float(df["weight_pct"].sum())
-    if total <= 0:
-        return {}
-    out: dict[str, float] = {}
-    for r in df.iter_rows(named=True):
-        key = normalize_name(r["security_name"])
-        if not key:
-            continue
-        out[key] = out.get(key, 0.0) + float(r["weight_pct"]) / total * 100.0
-    return out
+    return _renormalize_on_key(constituents_df)
 
 
 def active_share_one_month(

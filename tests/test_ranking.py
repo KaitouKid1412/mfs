@@ -62,6 +62,19 @@ def test_filters_drop_insufficient_history():
     assert set(out["scheme_code"]) == {"A"}
 
 
+def test_filters_drop_stale_with_reason_stale_nav():
+    """A1-3: a row flagged STALE by the orchestrator staleness gate is dropped
+    by apply_hard_filters, with contract-vocabulary reason STALE_NAV."""
+    df = pl.DataFrame([
+        _row("A"),
+        _row("B", data_quality_flag="STALE"),
+    ])
+    out, excluded = apply_hard_filters(df, with_reasons=True)
+    assert set(out["scheme_code"]) == {"A"}
+    reason = excluded.filter(pl.col("scheme_code") == "B")["exclusion_reason"][0]
+    assert reason == "STALE_NAV"
+
+
 def test_filters_keep_marginal_metric_schemes():
     """HDFC-flexicap-style: capture < 1.0 and IR ≈ 0 but still informative.
     Floors should NOT drop these."""

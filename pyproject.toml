@@ -41,6 +41,10 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.7",
   "mypy>=1.11",
+  # F-8: one-time fixture-extract tool (tools/make_fixture_pdf.py).
+  "pypdf>=5.0",
+  # F-9: dependency CVE scanning in CI.
+  "pip-audit>=2.7",
 ]
 
 [tool.ruff]
@@ -51,6 +55,27 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
+[tool.mypy]
+# F-7: strictness ramp scoped to the numeric core (compute + rank) first.
+# Full `strict = true` is a later ratchet once these pass; do NOT expand
+# `files` beyond compute+rank in this phase.
+python_version = "3.11"
+mypy_path = "src"
+files = ["src/mfs/compute", "src/mfs/rank"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Libraries without type stubs (polars and pydantic ship their own types).
+module = ["statsmodels.*", "pdfplumber.*", "pandas.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "local_data: test depends on gitignored artifacts under data/raw (auto-applied by tests/conftest.py; deselected in CI via -m 'not local_data')",
+]

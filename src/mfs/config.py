@@ -43,8 +43,24 @@ class IngestConfig(BaseModel):
 
 
 class QualityConfig(BaseModel):
-    min_history_years_for_ranking: int = 5
+    # 3 is the live deliberate history gate (A1-5): the orchestrator wires this
+    # value into _data_quality_flag, so it must match the long-standing
+    # effective 3y behavior. Any move to 5y is a separate product decision.
+    min_history_years_for_ranking: int = 3
     max_missing_pct_in_window: float = 0.05
+    # A1-3 per-scheme staleness gate: a scheme whose last NAV predates the
+    # N-th-from-last trading day on or before the run's as_of is flagged
+    # STALE (metrics stay visible in computed_metrics but rank/filters.py
+    # excludes them with exclusion_reason STALE_NAV). 10 trading days =
+    # 2x freshness.max_nav_lag_bdays — tolerates per-scheme publication lag
+    # while catching anything dead for weeks.
+    max_scheme_nav_lag_bdays: int = 10
+    # A1-9 halt threshold: per-scheme compute failures are skip-and-report
+    # (no-half-data invariant: skip the scheme, never store partial junk) up
+    # to this fraction of attempted schemes; beyond it the run halts with
+    # PipelineError (fail-fast: systemic breakage must not silently shrink
+    # the universe).
+    max_scheme_compute_failure_rate: float = 0.01
 
 
 class FreshnessConfig(BaseModel):

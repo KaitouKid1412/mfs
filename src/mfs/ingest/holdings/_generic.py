@@ -138,17 +138,26 @@ _MONTH_NUM = {
 
 _AS_ON_RE = re.compile(r"\bas\s+on\b", re.IGNORECASE)
 
-# Date snippet following an 'as on' phrase. Two shapes:
+# Date snippet following an 'as on' phrase. Three shapes:
 #   day-first:   '30 Apr 2026', '30-Apr-2026', '30-APR-2026', '30th April 2026'
 #   month-first: 'April 30, 2026', 'April 30,2026'
-# Separators are spaces / hyphens / commas; the day may carry an ordinal
-# suffix; trailing footnote markers ('29 May 2026*') are simply not consumed.
+#   numeric day-first (tata, B2 calibration over the live cache): 'as on
+#     30-04-2026', 'Portfolio as on 31/05/26', '31-05-26'. Indian convention
+#     is strictly dd-mm; statement dates are month-ends (28-31) so the
+#     day-first read is never ambiguous in practice. Month is validated
+#     1..12 at parse time; the lookarounds stop us matching INSIDE a longer
+#     digit run (e.g. the '26-04-30' tail of an ISO '2026-04-30').
+# Separators are spaces / hyphens / commas (word-month) or - / . (numeric);
+# the day may carry an ordinal suffix; trailing footnote markers
+# ('29 May 2026*') are simply not consumed.
 _STMT_DATE_RE = re.compile(
     r"""
     (?:
         (?P<d1>\d{1,2})(?:st|nd|rd|th)?[\s\-,]+(?P<m1>[A-Za-z]{3,9})[\s\-,]+(?P<y1>\d{4})
       |
         (?P<m2>[A-Za-z]{3,9})[\s\-,]+(?P<d2>\d{1,2})(?:st|nd|rd|th)?[\s\-,]*(?P<y2>\d{4})
+      |
+        (?<!\d)(?P<d3>\d{1,2})[./-](?P<m3>\d{1,2})[./-](?P<y3>\d{4}|\d{2})(?!\d)
     )
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -167,11 +176,36 @@ def _month_token_num(token: str) -> int | None:
 def _ym_from_text(text: str) -> str | None:
     """First parseable 'AS ON'-style date in ``text`` as 'YYYY-MM', or None."""
     for m in _STMT_DATE_RE.finditer(text):
+        if m.group("m3") is not None:  # numeric dd-mm-yy(yy) form
+            month = int(m.group("m3"))
+            if not 1 <= month <= 12:
+                continue  # '13' etc. — digit triple that isn't a date
+            year = int(m.group("y3"))
+            if year < 100:
+                year += 2000  # '26' → 2026 (no pre-2000 statements exist)
+            return f"{year:04d}-{month:02d}"
         month = _month_token_num(m.group("m1") or m.group("m2"))
         if month is None:
             continue  # regex shape matched but the word isn't a month
         return f"{int(m.group('y1') or m.group('y2')):04d}-{month:02d}"
     return None
+
+
+def statement_months_in_text(text: str, *, window: int = 80) -> set[str]:
+    """All months ('YYYY-MM') named by 'as on <date>' phrases in free text.
+
+    Each 'as on' occurrence is paired with the first parseable date in the
+    following ``window`` characters (close-binding: a faraway date elsewhere
+    in the text must not be attributed to this phrase). Shared by the
+    in-cell Excel banner scan below and the managers/factsheet advisory
+    first-page scan (B2).
+    """
+    found: set[str] = set()
+    for m in _AS_ON_RE.finditer(text):
+        ym = _ym_from_text(text[m.end(): m.end() + window])
+        if ym is not None:
+            found.add(ym)
+    return found
 
 
 def _ym_from_cell(cell: object) -> str | None:
@@ -199,20 +233,99 @@ def find_statement_months(rows: list[tuple]) -> set[str]:
     found: set[str] = set()
     for row in rows:
         for j, cell in enumerate(row):
-            if not isinstance(cell, str):
+            if not isinstance(cell, str) or not _AS_ON_RE.search(cell):
                 continue
-            m = _AS_ON_RE.search(cell)
-            if not m:
-                continue
-            ym = _ym_from_text(cell[m.end():])
-            if ym is None:
+            yms = statement_months_in_text(cell)
+            if not yms:
                 # Split-cell: date lives in a later cell of the same row.
                 for later in row[j + 1:]:
                     ym = _ym_from_cell(later)
                     if ym is not None:
+                        yms = {ym}
                         break
-            if ym is not None:
-                found.add(ym)
+            found |= yms
+    return found
+
+
+# Magic bytes distinguishing the two workbook containers we can scan.
+_XLSX_MAGIC = b"PK\x03\x04"  # OOXML zip (.xlsx)
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0"  # legacy compound file (.xls)
+
+
+def _xlsx_head_rows(path: Path, max_rows: int) -> list[list[tuple]]:
+    """First ``max_rows`` rows of every sheet of an .xlsx, one list per sheet."""
+    out: list[list[tuple]] = []
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for ws in wb.worksheets:
+            out.append(list(ws.iter_rows(min_row=1, max_row=max_rows, values_only=True)))
+    finally:
+        wb.close()
+    return out
+
+
+def _xls_head_rows(path: Path, max_rows: int) -> list[list[tuple]]:
+    """First ``max_rows`` rows of every sheet of a legacy OLE2 .xls (xlrd).
+
+    Typed date cells are converted to datetimes so the split-cell banner
+    variant ('AS ON :' + a date cell) parses the same as on the openpyxl
+    path.
+    """
+    import xlrd  # localized: only OLE2 artifacts need it
+
+    out: list[list[tuple]] = []
+    wb = xlrd.open_workbook(str(path))
+    for ws in wb.sheets():
+        rows: list[tuple] = []
+        for i in range(min(max_rows, ws.nrows)):
+            cells: list[object] = []
+            for cell in ws.row(i):
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    try:
+                        cells.append(
+                            xlrd.xldate.xldate_as_datetime(cell.value, wb.datemode)
+                        )
+                    except Exception:  # noqa: BLE001 — malformed date serial
+                        cells.append(None)
+                else:
+                    cells.append(cell.value)
+            rows.append(tuple(cells))
+        out.append(rows)
+    return out
+
+
+def artifact_statement_months(path: Path, max_rows: int = 15) -> set[str] | None:
+    """Union of 'AS ON <date>' banner months over the first ``max_rows`` rows
+    of EVERY sheet in the workbook at ``path``.
+
+    This is the orchestrator's central statement-date screen (B2): it
+    format-sniffs the artifact (xlsx zip via openpyxl, legacy OLE2 .xls via
+    xlrd) so every holdings adapter — including the bespoke fixed-offset
+    parsers that never call ``parse_sebi_excel`` — flows through the same
+    wrong-month check.
+
+    Returns ``None`` when the artifact cannot be scanned (unknown magic,
+    corrupt/non-workbook container such as uti's .zip): 'cannot check' must
+    be distinguished from 'checked, found no banner' (empty set). Scanning
+    is validate-when-present — the CALLER decides what an empty set means.
+    """
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+    except OSError:
+        return None
+    try:
+        if magic == _XLSX_MAGIC:
+            sheets = _xlsx_head_rows(path, max_rows)
+        elif magic == _OLE2_MAGIC:
+            sheets = _xls_head_rows(path, max_rows)
+        else:
+            return None
+    except Exception:  # noqa: BLE001 — corrupt workbook: cannot check
+        return None
+    found: set[str] = set()
+    for rows in sheets:
+        found |= find_statement_months(rows)
     return found
 
 

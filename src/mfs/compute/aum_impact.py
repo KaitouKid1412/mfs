@@ -1,7 +1,8 @@
 """AUM Impact Cost compute layer (Phase 2.3).
 
-Measures how many trading days the fund would need to liquidate its most
-illiquid major positions. For each holding:
+Reports the worst-case (max) days-to-exit across all ADV-resolved equity
+holdings — i.e. how many trading days the fund would need to liquidate its
+single most illiquid position. For each holding:
 
     days_to_exit = holding_value_INR / ADV_INR
 
@@ -9,21 +10,27 @@ where:
     holding_value_INR = (weight_pct / 100) × fund_AUM_INR
     ADV_INR          = trailing-60-day median of total_traded_value (INR) on NSE
 
-We then take the **top 10 LEAST LIQUID holdings** (highest days_to_exit)
-and report the MAX — i.e. the worst-case exit time for any major position.
+ADV-coverage guard (A1-11): ``adv_unresolved_fraction`` measures the share of
+total portfolio weight with no NSE EQ-series ADV match (missing/blank ISIN, or
+an ISIN absent from the bhavcopy — e.g. international stocks, debt, cash).
+When more than ``MAX_ADV_UNRESOLVED_FRAC`` of the portfolio weight is
+unresolved, the metric is meaningless (it would describe a sliver of the book,
+e.g. ICICI Pru US Bluechip computing liquidity over <5% of weight) and
+``aum_impact_cost`` returns None. The fraction itself is always surfaced as
+``computed_metrics.adv_unresolved_pct`` so stage 2 / reports can show why.
 
 Returns None when:
 - The scheme's AUM is unknown
-- No holdings have ISINs (factsheets often don't print ISINs; the join is
-  via security_name → constituent ISIN, which only covers benchmark stocks)
+- No holdings have ISINs with an associated ADV value
 - Fewer than 3 holdings have an associated ADV value
+- More than MAX_ADV_UNRESOLVED_FRAC of portfolio weight has no ADV match
 
 Stored in computed_metrics.aum_impact_cost_days (days, float).
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, cast
 
 import polars as pl
 
@@ -32,8 +39,9 @@ import polars as pl
 # AUM Impact Cost. Below this, return None — too little data.
 MIN_HOLDINGS_FOR_IMPACT = 3
 
-# How many "least liquid" holdings to consider before taking the max.
-TOP_N_ILLIQUID = 10
+# A1-11: maximum fraction (0-1) of portfolio weight allowed to have no NSE
+# EQ-series ADV match. Above this, aum_impact_cost returns None.
+MAX_ADV_UNRESOLVED_FRAC = 0.20
 
 # Trailing-day window for the ADV median.
 ADV_WINDOW_DAYS = 60
@@ -46,10 +54,11 @@ def _median_adv(adv_history: pl.DataFrame, window_days: int = ADV_WINDOW_DAYS) -
     """
     if adv_history.is_empty():
         return {}
-    end_date = adv_history["date"].max()
-    if end_date is None:
+    end_date_raw = adv_history["date"].max()
+    if end_date_raw is None:
         return {}
-    from datetime import timedelta
+    from datetime import date, timedelta
+    end_date = cast(date, end_date_raw)
     cutoff = end_date - timedelta(days=window_days)
     recent = adv_history.filter(pl.col("date") > cutoff)
     if recent.is_empty():
@@ -62,27 +71,56 @@ def _median_adv(adv_history: pl.DataFrame, window_days: int = ADV_WINDOW_DAYS) -
     return {r["isin"]: float(r["adv"]) for r in grouped.iter_rows(named=True)}
 
 
+def adv_unresolved_fraction(
+    holdings_df: pl.DataFrame,
+    adv_by_isin: dict[str, float],
+) -> Optional[float]:
+    """Fraction (0-1) of total portfolio weight with no NSE EQ-series ADV match.
+
+    A holding is unresolved when its ISIN is null/blank or maps to no positive
+    ADV value. ``weight_pct`` is percent-of-portfolio, so the denominator is
+    100; the result is clamped to 1.0 against slightly over-100 weight sums.
+    Returns None when there are no holdings at all (nothing to measure).
+    """
+    if holdings_df.is_empty():
+        return None
+    unresolved_weight = 0.0
+    for r in holdings_df.iter_rows(named=True):
+        isin = r["isin"]
+        adv = adv_by_isin.get(isin) if isin else None
+        if not adv or adv <= 0:
+            unresolved_weight += float(r["weight_pct"])
+    return min(unresolved_weight / 100.0, 1.0)
+
+
 def aum_impact_cost(
     holdings_df: pl.DataFrame,
     adv_by_isin: dict[str, float],
     aum_crore: float,
     *,
-    top_n: int = TOP_N_ILLIQUID,
     min_holdings: int = MIN_HOLDINGS_FOR_IMPACT,
+    max_unresolved_frac: float = MAX_ADV_UNRESOLVED_FRAC,
 ) -> Optional[float]:
-    """Compute the max days-to-exit across the top-N least-liquid holdings.
+    """Compute the worst-case (max) days-to-exit across all ADV-resolved
+    equity holdings.
 
     Args:
       holdings_df: latest holdings for one scheme. Expected columns:
         isin, weight_pct, instrument_type. Rows without isin are skipped.
       adv_by_isin: trailing-window median ADV in INR by ISIN.
       aum_crore: scheme AUM in Crore (1 Cr = 1e7 INR).
-      top_n: how many illiquid holdings to inspect.
       min_holdings: minimum number of ISIN-resolved equity holdings required.
+      max_unresolved_frac: A1-11 ADV-coverage guard — when more than this
+        fraction of total portfolio weight has no ADV match, return None.
 
     Returns: max days-to-exit (float) or None.
     """
     if holdings_df.is_empty() or aum_crore <= 0 or not adv_by_isin:
+        return None
+    # A1-11: refuse to report a days-to-exit computed over a sliver of the
+    # portfolio (international/FoF-style books resolve almost nothing on NSE).
+    unresolved = adv_unresolved_fraction(holdings_df, adv_by_isin)
+    if unresolved is not None and unresolved > max_unresolved_frac:
         return None
     # Filter to equity rows with an ISIN we have an ADV for.
     eq = holdings_df.filter(
@@ -105,6 +143,4 @@ def aum_impact_cost(
 
     if len(days_to_exit) < min_holdings:
         return None
-    days_to_exit.sort(reverse=True)
-    worst = days_to_exit[:top_n]
-    return max(worst)
+    return max(days_to_exit)

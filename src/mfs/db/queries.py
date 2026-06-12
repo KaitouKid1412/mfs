@@ -127,13 +127,14 @@ def scheme_master(
 _COMPUTED_METRICS_COLS = [
     "as_of_date", "scheme_code", "canonical_category", "benchmark_ticker",
     "ret_3y_median", "ret_3y_p25", "ret_5y_median", "ret_5y_p25",
-    "alpha_3y_annualized", "alpha_3y_tstat", "sortino_3y",
+    "alpha_3y_annualized", "alpha_3y_tstat", "alpha_confidence", "sortino_3y",
     "info_ratio_3y",
     "capture_up", "capture_down", "capture_efficiency",
     "r_squared_3y", "beta_3y",
     # Phase 2 additive columns (nullable until ingestion stages fill them).
     "beta_3y_std", "r_squared_3y_mean", "style_drift_3y",
     "active_share_median_1y", "ptr_latest", "aum_impact_cost_days",
+    "adv_unresolved_pct",
     "data_quality_flag", "computed_at", "pipeline_version",
 ]
 
@@ -175,19 +176,34 @@ def computed_metrics_for_schemes(
 # ---------------------------------------------------------------------------
 
 
-def holdings_for_scheme(scheme_code: str) -> pl.DataFrame:
+def holdings_for_scheme(
+    scheme_code: str, on_or_before: date | None = None,
+) -> pl.DataFrame:
     """All holdings rows for one scheme across all months. Sorted by as_of_month.
 
     Returned columns: scheme_code, security_name, as_of_month, weight_pct, isin,
-    instrument_type. ISIN may be null (factsheet PDFs don't print ISINs).
+    instrument_type. ISIN is populated by the Phase-5 SEBI-Excel ingestion
+    (100% coverage live) but the column stays nullable for legacy
+    factsheet-era rows; active_share matches ISIN-first with a
+    normalized-name fallback (A1-8).
+
+    When ``on_or_before`` is given, only months with ``as_of_month`` on or
+    before that date are returned (point-in-time reads, A1-12): a month
+    published after a historical metric date must not leak into its compute.
+    When None, all months are returned (current-run behavior).
     """
+    sql = (
+        "SELECT scheme_code, security_name, as_of_month, weight_pct, isin, "
+        "instrument_type FROM holdings_monthly "
+        "WHERE scheme_code = %s "
+    )
+    params: tuple = (scheme_code,)
+    if on_or_before is not None:
+        sql += "AND as_of_month <= %s "
+        params = (scheme_code, on_or_before)
+    sql += "ORDER BY as_of_month, security_name"
     with connect() as c:
-        rows = c.execute(
-            "SELECT scheme_code, security_name, as_of_month, weight_pct, isin, "
-            "instrument_type FROM holdings_monthly "
-            "WHERE scheme_code = %s ORDER BY as_of_month, security_name",
-            (scheme_code,),
-        ).fetchall()
+        rows = c.execute(sql, params).fetchall()
     if not rows:
         return pl.DataFrame()
     schema = {
@@ -222,14 +238,25 @@ def constituents_for_ticker(ticker: str) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=schema, orient="row")
 
 
-def portfolio_turnover_for_scheme(scheme_code: str) -> pl.DataFrame:
-    """All PTR rows for one scheme, sorted by as_of_month."""
+def portfolio_turnover_for_scheme(
+    scheme_code: str, on_or_before: date | None = None,
+) -> pl.DataFrame:
+    """All PTR rows for one scheme, sorted by as_of_month.
+
+    ``on_or_before`` bounds the read to months on or before that date
+    (point-in-time reads, A1-12); None returns all months.
+    """
+    sql = (
+        "SELECT scheme_code, as_of_month, ptr FROM portfolio_turnover_monthly "
+        "WHERE scheme_code = %s "
+    )
+    params: tuple = (scheme_code,)
+    if on_or_before is not None:
+        sql += "AND as_of_month <= %s "
+        params = (scheme_code, on_or_before)
+    sql += "ORDER BY as_of_month"
     with connect() as c:
-        rows = c.execute(
-            "SELECT scheme_code, as_of_month, ptr FROM portfolio_turnover_monthly "
-            "WHERE scheme_code = %s ORDER BY as_of_month",
-            (scheme_code,),
-        ).fetchall()
+        rows = c.execute(sql, params).fetchall()
     if not rows:
         return pl.DataFrame()
     schema = {
@@ -408,6 +435,21 @@ def latest_dates() -> dict[str, date | None]:
         "scheme_master_latest": sm_max,
         "benchmarks": {t: d for t, d in bench},
     }
+
+
+def nav_daily_day_counts(n: int) -> list[tuple[date, int]]:
+    """Per-day nav_daily row counts for the most recent ``n`` distinct days,
+    newest first. B4: the amfi_nav partial-publication guard derives its
+    trailing full-day baseline from these pairs."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT nav_date, COUNT(*) FROM nav_daily "
+            "GROUP BY nav_date ORDER BY nav_date DESC LIMIT %s",
+            (n,),
+        ).fetchall()
+    return [
+        (d.date() if hasattr(d, "date") else d, int(cnt)) for d, cnt in rows
+    ]
 
 
 def fund_log_returns(scheme_code: str) -> pl.DataFrame:

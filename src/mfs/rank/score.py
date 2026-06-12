@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import polars as pl
 
-from mfs.config import get_pipeline_config
+from mfs.config import PipelineConfig, get_pipeline_config
 
 # Stage-1 keys → z-score column names.
 STAGE1_WEIGHT_TO_COL = {
@@ -101,7 +101,7 @@ def composite_score_stage2(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(expr.alias("composite_score"))
 
 
-def _apply_soft_penalties(expr: pl.Expr, df: pl.DataFrame, cfg) -> pl.Expr:
+def _apply_soft_penalties(expr: pl.Expr, df: pl.DataFrame, cfg: PipelineConfig) -> pl.Expr:
     """Subtract configured soft-penalty terms from the composite expression."""
     pens = cfg.soft_penalties
 

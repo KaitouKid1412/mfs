@@ -462,7 +462,7 @@ def test_rank_deep_persists_history_at_tail(monkeypatch):
         lambda as_of=None: (AS_OF, scored, excluded),
     )
     monkeypatch.setattr(shortlist, "_write_stage1_outputs", lambda s, a: {})
-    monkeypatch.setattr(shortlist, "_build_aum_map", lambda s: {})
+    monkeypatch.setattr(shortlist, "_build_aum_map", lambda s, as_of=None: {})
     monkeypatch.setattr(
         q, "computed_metrics_for_schemes",
         lambda as_of, codes: pl.DataFrame([_row(c) for c in sorted(codes)]),
