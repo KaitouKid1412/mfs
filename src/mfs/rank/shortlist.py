@@ -1,5 +1,6 @@
-"""Top-level ranker: filters → zscore → composite_score_stage1 → write
-shortlist per category, then orchestrate Stage 2 and Stage 3."""
+"""Top-level ranker: filters → D2 core-metric gate → bonus-option dedupe →
+zscore → composite_score_stage1 → write shortlist per category, then
+orchestrate Stage 2 and Stage 3."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import polars as pl
 from mfs import paths
 from mfs.db import queries as q
 from mfs.db import writers as w
-from mfs.rank.filters import apply_hard_filters
+from mfs.rank.filters import apply_hard_filters, split_core_complete
 from mfs.rank.score import composite_score_stage1
 from mfs.rank.zscore import zscore_within_category
 from mfs.utils.logging import get_logger
@@ -43,6 +44,7 @@ STAGE1_OUTPUT_COLS = [
     "ret_5y_median",
     "ret_5y_p25",
     "alpha_3y_annualized",
+    "alpha_confidence",
     "sortino_3y",
     "info_ratio_3y",
     "capture_up",
@@ -55,6 +57,19 @@ STAGE1_OUTPUT_COLS = [
 
 REPORT_TOP_N_PER_CATEGORY = 5
 REPORT_FILENAME = "mf_report"
+
+# D2 "excluded — insufficient data" artifact (stage1/excluded.csv): one row
+# per dropped fund with the contract-vocabulary exclusion_reason; the
+# missing_core_metrics column is ';'-joined and only populated for
+# MISSING_CORE_METRIC drops.
+EXCLUDED_OUTPUT_COLS = [
+    "scheme_code",
+    "scheme_name",
+    "canonical_category",
+    "data_quality_flag",
+    "exclusion_reason",
+    "missing_core_metrics",
+]
 
 # D2 run history: flat z-score columns mirrored from the stage CSVs into the
 # rank_history table. The first eight are Stage 1's; the last two are the
@@ -109,22 +124,35 @@ def _dedupe_legacy_unit_classes(scored: pl.DataFrame) -> pl.DataFrame:
     under separate scheme_codes; both pass our Direct+Growth filter, produce
     identical NAV histories, and so produce identical metrics. Keep the
     Growth Option (non-`_bonus`); drop the Bonus Option.
+
+    Runs BEFORE z-scoring (A2-3): a duplicate NAV history must not enter the
+    category nanmean/nanstd, so no ``composite_score`` exists yet. The winner
+    sort therefore prefers the non-bonus row, then ``ret_3y_median`` (the
+    duplicates have identical NAV-derived metrics — this plus ``scheme_code``
+    is only a deterministic tie-break).
+
+    Rows with null ``base_fund_id`` are passed through untouched — fill-null
+    would otherwise collapse all of them onto one shared '' dedup key.
     """
     if "base_fund_id" not in scored.columns or scored.is_empty():
         return scored
-    with_key = scored.with_columns(
+    null_base = scored.filter(pl.col("base_fund_id").is_null())
+    keyed = scored.filter(pl.col("base_fund_id").is_not_null())
+    if keyed.is_empty():
+        return scored
+    with_key = keyed.with_columns(
         pl.col("base_fund_id")
-        .fill_null("")
         .str.replace(r"_bonus$", "")
         .alias("_dedup_key"),
         pl.col("base_fund_id")
-        .fill_null("")
         .str.ends_with("_bonus")
         .alias("_is_legacy"),
     )
     winners = (
         with_key.sort(
-            ["_is_legacy", "composite_score"], descending=[False, True], nulls_last=True
+            ["_is_legacy", "ret_3y_median", "scheme_code"],
+            descending=[False, True, False],
+            nulls_last=True,
         )
         .unique(subset=["canonical_category", "_dedup_key"], keep="first")
         .select(["canonical_category", "_dedup_key", "scheme_code"])
@@ -151,10 +179,13 @@ def _dedupe_legacy_unit_classes(scored: pl.DataFrame) -> pl.DataFrame:
                 r["canonical_category"]: r["len"] for r in tally.iter_rows(named=True)
             },
         )
-    return (
+    deduped = (
         enriched.filter(pl.col("scheme_code") == pl.col("_winner_code"))
         .drop(["_dedup_key", "_is_legacy", "_winner_code"])
     )
+    if null_base.is_empty():
+        return deduped
+    return pl.concat([deduped, null_base], how="vertical")
 
 
 def build_scored_stage1(
@@ -162,11 +193,13 @@ def build_scored_stage1(
     category: str | None = None,
     skip_filters: bool = False,
 ) -> tuple[date, pl.DataFrame, pl.DataFrame]:
-    """Stage 1 in-memory: load metrics, filter, z-score, composite_score_stage1,
-    dedupe legacy bonus options. Returns ``(as_of, scored, excluded)`` where
-    ``excluded`` is the hard-filter drops with an ``exclusion_reason`` column
-    (contract vocabulary; empty when ``skip_filters=True``) — persisted into
-    rank_history by ``rank_deep``.
+    """Stage 1 in-memory: load metrics, hard-filter, D2 core-metric gate,
+    z-score, composite_score_stage1, dedupe legacy bonus options. Returns
+    ``(as_of, scored, excluded)`` where ``excluded`` is the hard-filter drops
+    plus the D2 ``MISSING_CORE_METRIC`` drops, each with an
+    ``exclusion_reason`` column (contract vocabulary; empty when
+    ``skip_filters=True``) — written to stage1/excluded.csv and persisted
+    into rank_history by ``rank_deep``.
     """
     as_of = as_of or q.latest_computed_metrics_date()
     if as_of is None:
@@ -181,24 +214,83 @@ def build_scored_stage1(
         excluded = pl.DataFrame()
     else:
         survivors, excluded = apply_hard_filters(metrics, with_reasons=True)
+        # D2 core-metric gate: a fund missing any core Stage-1 metric is
+        # hard-dropped BEFORE z-scoring — nulls must never score as
+        # category-average.
+        survivors, core_excluded = split_core_complete(survivors)
+        if not core_excluded.is_empty():
+            excluded = (
+                pl.concat([excluded, core_excluded], how="diagonal_relaxed")
+                if not excluded.is_empty()
+                else core_excluded
+            )
     if category:
         survivors = survivors.filter(pl.col("canonical_category") == category)
         if not excluded.is_empty():
             excluded = excluded.filter(pl.col("canonical_category") == category)
+    if not excluded.is_empty():
+        excluded = _join_scheme_master(excluded)
 
+    # A2-3: dedupe legacy bonus options BEFORE z-scoring — a duplicate NAV
+    # history must not contaminate the category z statistics. The scheme-
+    # master join comes first because dedupe needs base_fund_id.
+    survivors = _join_scheme_master(survivors)
+    survivors = _dedupe_legacy_unit_classes(survivors)
     zscored = zscore_within_category(survivors)
     scored = composite_score_stage1(zscored)
-    scored = _join_scheme_master(scored)
-    scored = _dedupe_legacy_unit_classes(scored)
     scored = scored.with_columns(pl.lit(as_of).cast(pl.Date).alias("as_of_date"))
     return as_of, scored, excluded
 
 
-def _write_stage1_outputs(scored: pl.DataFrame, as_of: date) -> dict[str, Path]:
-    """Disk-write side of Stage 1: per-category CSV + parquet plus the
-    consolidated ``mf_report`` (top-5 per category)."""
+def _write_excluded_csv(excluded: pl.DataFrame, stage1_dir: Path) -> Path:
+    """D2 'excluded — insufficient data' artifact: ``stage1/excluded.csv``.
+
+    Always written — header-only when nothing was dropped — sorted by
+    (canonical_category, scheme_code). Logs ``rank.stage1.excluded`` with
+    per-category counts."""
+    stage1_dir.mkdir(parents=True, exist_ok=True)
+    path = stage1_dir / "excluded.csv"
+    out = excluded
+    if out.is_empty():
+        out = pl.DataFrame(schema={c: pl.Utf8 for c in EXCLUDED_OUTPUT_COLS})
+    missing_cols = [c for c in EXCLUDED_OUTPUT_COLS if c not in out.columns]
+    if missing_cols:
+        out = out.with_columns(
+            pl.lit(None, dtype=pl.Utf8).alias(c) for c in missing_cols
+        )
+    out = out.select(EXCLUDED_OUTPUT_COLS).sort(
+        ["canonical_category", "scheme_code"], nulls_last=True
+    )
+    out.write_csv(path)
+    by_category = (
+        {
+            r["canonical_category"]: r["len"]
+            for r in out.group_by("canonical_category")
+            .len()
+            .sort("canonical_category")
+            .iter_rows(named=True)
+        }
+        if out.height
+        else {}
+    )
+    log.info(
+        "rank.stage1.excluded",
+        n_excluded=out.height,
+        by_category=by_category,
+        path=str(path),
+    )
+    return path
+
+
+def _write_stage1_outputs(
+    scored: pl.DataFrame, excluded: pl.DataFrame, as_of: date,
+) -> dict[str, Path]:
+    """Disk-write side of Stage 1: per-category CSV + parquet, the
+    consolidated ``mf_report`` (top-5 per category), and the D2
+    ``excluded.csv`` (always present, header even when empty)."""
     out_dir = paths.shortlist_dir(as_of.isoformat()) / "stage1"
     out_dir.mkdir(parents=True, exist_ok=True)
+    _write_excluded_csv(excluded, out_dir)
     written: dict[str, Path] = {}
     report_chunks: list[pl.DataFrame] = []
     for cat, grp in scored.group_by("canonical_category"):
@@ -232,13 +324,15 @@ def rank(
     top_n: int | None = None,
     skip_filters: bool = False,
 ) -> dict[str, Path]:
-    """Stage 1 only. Apply hard filters + z-score + composite_score_stage1
-    and write per-category CSVs under ``<as_of>/stage1/``."""
-    as_of, scored, _excluded = build_scored_stage1(
+    """Stage 1 only. Apply hard filters + D2 core-metric gate + z-score +
+    composite_score_stage1 and write per-category CSVs plus the D2
+    ``excluded.csv`` under ``<as_of>/stage1/``."""
+    as_of, scored, excluded = build_scored_stage1(
         as_of=as_of, category=category, skip_filters=skip_filters,
     )
     out_dir = paths.shortlist_dir(as_of.isoformat()) / "stage1"
     out_dir.mkdir(parents=True, exist_ok=True)
+    _write_excluded_csv(excluded, out_dir)
     written: dict[str, Path] = {}
     report_chunks: list[pl.DataFrame] = []
     for cat, grp in scored.group_by("canonical_category"):
@@ -466,8 +560,9 @@ def rank_deep(
 
     # Stage 1.
     as_of, scored_stage1, excluded_stage1 = build_scored_stage1(as_of=as_of)
-    stage1_paths = _write_stage1_outputs(scored_stage1, as_of)
+    stage1_paths = _write_stage1_outputs(scored_stage1, excluded_stage1, as_of)
     out_dir = paths.shortlist_dir(as_of.isoformat())
+    excluded_file = out_dir / "stage1" / "excluded.csv"
 
     # Identify Stage 2 candidate pool: top-N per category from Stage 1.
     pool_df = _top_n_per_category(scored_stage1, n=pool_size)
@@ -539,6 +634,8 @@ def rank_deep(
     log.info(
         "rank.rank_deep.done",
         n_stage1_categories=len(stage1_paths),
+        n_excluded=excluded_stage1.height,
+        excluded_file=str(excluded_file),
         n_stage2_survivors=stage2_result["n_survivors"],
         n_stage2_dropped=stage2_result["n_dropped"],
         n_stage3_final=stage3_result["n_final"],
@@ -547,6 +644,8 @@ def rank_deep(
     return {
         "as_of": as_of.isoformat(),
         "out_dir": str(out_dir),
+        "n_excluded": excluded_stage1.height,
+        "excluded_file": str(excluded_file),
         "stage1": {cat: str(p) for cat, p in stage1_paths.items()},
         "stage2": {
             "dir": stage2_result["stage2_dir"],

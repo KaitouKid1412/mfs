@@ -124,19 +124,30 @@ def scheme_master(
     return pl.DataFrame(rows, schema=schema, orient="row")
 
 
-_COMPUTED_METRICS_COLS = [
-    "as_of_date", "scheme_code", "canonical_category", "benchmark_ticker",
-    "ret_3y_median", "ret_3y_p25", "ret_5y_median", "ret_5y_p25",
-    "alpha_3y_annualized", "alpha_3y_tstat", "alpha_confidence", "sortino_3y",
-    "info_ratio_3y",
-    "capture_up", "capture_down", "capture_efficiency",
-    "r_squared_3y", "beta_3y",
-    # Phase 2 additive columns (nullable until ingestion stages fill them).
-    "beta_3y_std", "r_squared_3y_mean", "style_drift_3y",
-    "active_share_median_1y", "ptr_latest", "aum_impact_cost_days",
-    "adv_unresolved_pct",
-    "data_quality_flag", "computed_at", "pipeline_version",
-]
+# Explicit dtypes: the sparse Phase 2 columns can be all-null in the first
+# rows of a partition, which breaks polars' row-orient schema inference
+# (infer_schema_length=100) — never rely on inference for DB reads.
+_COMPUTED_METRICS_SCHEMA: dict[str, pl.datatypes.DataTypeClass] = {
+    "as_of_date": pl.Date,
+    "scheme_code": pl.Utf8,
+    "canonical_category": pl.Utf8,
+    "benchmark_ticker": pl.Utf8,
+    **{c: pl.Float64 for c in (
+        "ret_3y_median", "ret_3y_p25", "ret_5y_median", "ret_5y_p25",
+        "alpha_3y_annualized", "alpha_3y_tstat", "alpha_confidence",
+        "sortino_3y", "info_ratio_3y",
+        "capture_up", "capture_down", "capture_efficiency",
+        "r_squared_3y", "beta_3y",
+        # Phase 2 additive columns (nullable until ingestion stages fill them).
+        "beta_3y_std", "r_squared_3y_mean", "style_drift_3y",
+        "active_share_median_1y", "ptr_latest", "aum_impact_cost_days",
+        "adv_unresolved_pct",
+    )},
+    "data_quality_flag": pl.Utf8,
+    "computed_at": pl.Datetime,
+    "pipeline_version": pl.Utf8,
+}
+_COMPUTED_METRICS_COLS = list(_COMPUTED_METRICS_SCHEMA)
 
 
 def computed_metrics_at(as_of: date) -> pl.DataFrame:
@@ -149,7 +160,7 @@ def computed_metrics_at(as_of: date) -> pl.DataFrame:
         ).fetchall()
     if not rows:
         return pl.DataFrame()
-    return pl.DataFrame(rows, schema=_COMPUTED_METRICS_COLS, orient="row")
+    return pl.DataFrame(rows, schema=_COMPUTED_METRICS_SCHEMA, orient="row")
 
 
 def computed_metrics_for_schemes(
@@ -168,7 +179,7 @@ def computed_metrics_for_schemes(
         ).fetchall()
     if not rows:
         return pl.DataFrame()
-    return pl.DataFrame(rows, schema=_COMPUTED_METRICS_COLS, orient="row")
+    return pl.DataFrame(rows, schema=_COMPUTED_METRICS_SCHEMA, orient="row")
 
 
 # ---------------------------------------------------------------------------

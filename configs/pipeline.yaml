@@ -67,14 +67,21 @@ freshness:
 filters:
   plan_type: DIRECT
   option_type: GROWTH
-  capture_efficiency_min: 1.00
-  info_ratio_3y_min: 0.2
-  r_squared_band: [0.70, 0.98]
+  # A2-1: single source of truth for the Stage-1 hard-filter floors —
+  # rank/filters.py reads these via get_pipeline_config(). Values are the
+  # deliberately relaxed floors (drop only catastrophically broken funds;
+  # surviving-but-weak funds rank lower via the composite instead).
+  capture_efficiency_min: 0.50
+  info_ratio_3y_min: -1.00
+  r_squared_band: [0.40, 1.00]   # upper bound 1.00 keeps index-hugging funds visible
+  beta_band: [0.30, 1.70]        # generic band (replaced the per-category bands)
 
 composite_weights_stage1:
   # Stage 1 — Performance & Consistency only. Positive weights sum to 1.00.
-  # No Phase 2 metrics; no pro-rata redistribution (all eight z-scores are
-  # available for every fund that survives the hard-filter floor).
+  # No Phase 2 metrics; no pro-rata redistribution — the D2 core-metric gate
+  # (rank/filters.py split_core_complete, A2-2) hard-drops funds missing any
+  # core Stage-1 metric before scoring, so every scored fund has real values
+  # behind its z-scores (the 5y pair may proxy from 3y for young funds).
   ret_3y_median: 0.15
   ret_3y_p25:    0.10
   ret_5y_median: 0.15
@@ -86,9 +93,10 @@ composite_weights_stage1:
 
 composite_weights_stage2:
   # Stage 2 — re-rank the top-20 per category from Stage 1 with Phase 2
-  # metrics layered in. Positive weights sum to 0.95; style_drift is a
-  # signed penalty subtracted on top, and PTR + AUM-Impact soft penalties
-  # ramp on top of that.
+  # metrics layered in. Positive weights sum to 0.85 (deliberately NOT
+  # renormalized to 1.00 — z-composites are scale-invariant within a
+  # cohort); style_drift is a signed penalty subtracted on top, and PTR +
+  # AUM-Impact soft penalties ramp on top of that.
   ret_3y_median: 0.10
   ret_3y_p25:    0.07
   ret_5y_median: 0.10
@@ -112,8 +120,5 @@ soft_penalties:
     enabled: true
     max_penalty: 0.05
     threshold_days: 5.0    # days-to-liquidate above 5 begins the ramp
-
-output:
-  top_n_per_category: 10
 
 pipeline_version: "v2.3.0-phase2.3a"

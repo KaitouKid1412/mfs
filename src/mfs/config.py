@@ -86,15 +86,18 @@ class FreshnessConfig(BaseModel):
 
 
 class FiltersConfig(BaseModel):
+    """Stage-1 hard-filter floors (A2-1: configs/pipeline.yaml `filters:` is
+    the single source of truth; rank/filters.py reads these). Defaults mirror
+    the yaml values exactly — a drift-guard test asserts they stay equal.
+    Floors are deliberately relaxed: drop only catastrophically broken funds;
+    weak-but-measurable funds rank lower via the composite instead."""
+
     plan_type: str = "DIRECT"
     option_type: str = "GROWTH"
-    capture_efficiency_min: float = 1.15
-    info_ratio_3y_min: float = 0.5
-    r_squared_band: tuple[float, float] = (0.70, 0.90)
-
-
-class OutputConfig(BaseModel):
-    top_n_per_category: int = 10
+    capture_efficiency_min: float = 0.50
+    info_ratio_3y_min: float = -1.00
+    r_squared_band: tuple[float, float] = (0.40, 1.00)
+    beta_band: tuple[float, float] = (0.30, 1.70)
 
 
 class PtrPenalty(BaseModel):
@@ -146,7 +149,6 @@ class PipelineConfig(BaseModel):
     composite_weights_stage1: dict[str, float]
     composite_weights_stage2: dict[str, float]
     soft_penalties: SoftPenaltiesConfig = Field(default_factory=SoftPenaltiesConfig)
-    output: OutputConfig
     pipeline_version: str = "v1.0.0"
 
 

@@ -1,39 +1,7 @@
-beta_bands:
-  Large Cap:           [0.80, 1.10]
-  Large & Mid Cap:     [0.85, 1.15]
-  Mid Cap:             [0.85, 1.20]
-  Small Cap:           [0.85, 1.25]
-  Multi Cap:           [0.80, 1.15]
-  Flexi Cap:           [0.80, 1.15]
-  Focused:             [0.75, 1.20]
-  ELSS:                [0.80, 1.15]
-  Value:               [0.75, 1.15]
-  Contra:              [0.75, 1.15]
-  Dividend Yield:      [0.70, 1.10]
-  Aggressive Hybrid:   [0.55, 0.80]
-  Balanced Advantage:  [0.30, 0.70]
-  Equity Savings:      [0.20, 0.50]
-  # Sector funds: benchmarked against their own sector TRI, so beta should
-  # tightly hug 1.0. Wider band on the upside accommodates concentrated
-  # high-conviction funds.
-  Banking & Financial Services: [0.85, 1.20]
-  IT:                  [0.85, 1.20]
-  Pharma & Healthcare: [0.85, 1.20]
-  FMCG:                [0.85, 1.15]
-  Auto:                [0.85, 1.20]
-  Energy:              [0.85, 1.20]
-  Infrastructure:      [0.85, 1.20]
-  PSU:                 [0.85, 1.20]
-  Consumption:         [0.85, 1.15]
-  MNC:                 [0.80, 1.15]
-  ESG:                 [0.85, 1.10]
-  Manufacturing:       [0.85, 1.20]
-  # Residual thematic funds: benchmarked vs NIFTY 500 TRI, so beta band mirrors
-  # a diversified equity fund.
-  Thematic:            [0.80, 1.20]
-
 # Categories that participate in ranking. Sector funds added in v1.1; "Thematic"
 # is the residual bucket for scheme names that don't fit any specific sector.
+# (The old per-category beta-band block was dead config — the generic
+# beta_band hard-filter floor lives in configs/pipeline.yaml `filters:`.)
 rankable_categories:
   - Large Cap
   - Large & Mid Cap

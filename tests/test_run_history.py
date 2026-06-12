@@ -461,7 +461,7 @@ def test_rank_deep_persists_history_at_tail(monkeypatch):
         shortlist, "build_scored_stage1",
         lambda as_of=None: (AS_OF, scored, excluded),
     )
-    monkeypatch.setattr(shortlist, "_write_stage1_outputs", lambda s, a: {})
+    monkeypatch.setattr(shortlist, "_write_stage1_outputs", lambda s, e, a: {})
     monkeypatch.setattr(shortlist, "_build_aum_map", lambda s, as_of=None: {})
     monkeypatch.setattr(
         q, "computed_metrics_for_schemes",

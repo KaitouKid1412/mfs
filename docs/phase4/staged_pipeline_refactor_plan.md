@@ -181,7 +181,7 @@ metrics are non-null. Funds missing any get dropped with reason recorded.
    | ptr_latest | soft penalty | ramp above 1.50 PTR, max −0.05 |
    | aum_impact_cost_days | soft penalty | ramp above 5 days, max −0.05 |
 
-   Positive weights sum to 0.95; style_drift & soft penalties subtract on top.
+   Positive weights sum to 0.85; style_drift & soft penalties subtract on top.
 4. Re-rank within category by composite_score_v2.
 5. Take top-5 per category as Stage 2 final picks.
 

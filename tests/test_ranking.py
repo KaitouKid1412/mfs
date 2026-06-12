@@ -9,7 +9,7 @@ from datetime import date, datetime
 
 import polars as pl
 
-from mfs.rank.filters import apply_hard_filters
+from mfs.rank.filters import apply_hard_filters, split_core_complete
 from mfs.rank.score import composite_score_stage1, composite_score_stage2
 from mfs.rank.zscore import zscore_within_category
 
@@ -101,6 +101,35 @@ def test_filters_drop_catastrophic_floors():
     assert set(out["scheme_code"]) == {"A"}
 
 
+def test_filters_read_from_config(monkeypatch):
+    """A2-1: the floors come from pipeline.yaml's `filters:` block, not from
+    code. Tightening capture_efficiency_min in the config must drop a fund
+    that passes the relaxed default floor."""
+    import mfs.rank.filters as filters_mod
+    from mfs.config import get_pipeline_config
+
+    cfg = get_pipeline_config().model_copy(deep=True)
+    cfg.filters.capture_efficiency_min = 0.90
+    monkeypatch.setattr(filters_mod, "get_pipeline_config", lambda: cfg)
+
+    df = pl.DataFrame([
+        _row("A"),                                # capture 1.235 — passes either way
+        _row("B", capture_efficiency=0.75),       # passes 0.50, fails 0.90
+    ])
+    survivors, excluded = apply_hard_filters(df, with_reasons=True)
+    assert set(survivors["scheme_code"]) == {"A"}
+    reasons = dict(excluded.select("scheme_code", "exclusion_reason").rows())
+    assert reasons == {"B": "FILTER:capture_efficiency"}
+
+
+def test_filters_config_defaults_match_yaml():
+    """A2-1 drift guard: FiltersConfig code defaults must equal the values in
+    configs/pipeline.yaml so neither side can silently diverge."""
+    from mfs.config import FiltersConfig, get_pipeline_config
+
+    assert FiltersConfig().model_dump() == get_pipeline_config().filters.model_dump()
+
+
 # ---------------------------------------------------------------------------
 # composite_score_stage1 — Phase 1 only
 # ---------------------------------------------------------------------------
@@ -133,21 +162,125 @@ def test_stage1_uses_3y_proxy_for_missing_5y():
     assert b["composite_score"] is not None
 
 
-def test_stage1_handles_null_alpha_without_nan():
-    """A scheme with null alpha must not produce a NaN composite (polars sorts
-    NaN to the top in descending order)."""
-    import math
+# ---------------------------------------------------------------------------
+# D2 core-metric gate (A2-2) — split_core_complete + excluded.csv
+# ---------------------------------------------------------------------------
 
+
+def test_null_alpha_fund_excluded_and_listed():
+    """D2: a fund with null alpha is hard-dropped (never scored as
+    category-average) and listed in the excluded frame with the contract
+    reason. Replaces the pre-D2 null-tolerant test
+    (test_stage1_handles_null_alpha_without_nan)."""
     df = pl.DataFrame([
         _row("A"),
         _row("B", alpha_3y_annualized=None),
         _row("C", alpha_3y_annualized=0.02),
     ])
-    z = zscore_within_category(df)
-    scored = composite_score_stage1(z)
+    complete, excluded = split_core_complete(df)
+    assert set(complete["scheme_code"]) == {"A", "C"}
+    b = excluded.filter(pl.col("scheme_code") == "B").row(0, named=True)
+    assert b["missing_core_metrics"] == "alpha_3y_annualized"
+    assert b["exclusion_reason"] == "MISSING_CORE_METRIC:alpha_3y_annualized"
+
+
+def test_nan_core_metric_excluded():
+    """Missing = null OR NaN: NaN reaches the rank layer via the zero-NAV
+    poisoning path and must not slip through null-only checks."""
+    df = pl.DataFrame([
+        _row("A"),
+        _row("B", sortino_3y=float("nan")),
+    ])
+    complete, excluded = split_core_complete(df)
+    assert set(complete["scheme_code"]) == {"A"}
+    b = excluded.row(0, named=True)
+    assert b["scheme_code"] == "B"
+    assert b["missing_core_metrics"] == "sortino_3y"
+    assert b["exclusion_reason"] == "MISSING_CORE_METRIC:sortino_3y"
+
+
+def test_multiple_missing_core_metrics_joined_first_reason():
+    """missing_core_metrics is ';'-joined in declaration order; the reason
+    carries the FIRST missing metric."""
+    df = pl.DataFrame([
+        _row("A"),
+        _row("B", alpha_3y_annualized=None, sortino_3y=None,
+             info_ratio_3y=float("nan")),
+    ])
+    _, excluded = split_core_complete(df)
+    b = excluded.row(0, named=True)
+    assert b["missing_core_metrics"] == "alpha_3y_annualized;sortino_3y;info_ratio_3y"
+    assert b["exclusion_reason"] == "MISSING_CORE_METRIC:alpha_3y_annualized"
+
+
+def test_young_fund_with_null_5y_not_excluded():
+    """The 5y pair is deliberately NOT core: a young fund with a full 3y set
+    but null 5y survives the gate and gets the 5y→3y proxy in scoring."""
+    df = pl.DataFrame([
+        _row("A"),
+        _row("B", ret_5y_median=None, ret_5y_p25=None),
+        _row("C", ret_5y_median=0.10, ret_5y_p25=0.05),
+    ])
+    complete, excluded = split_core_complete(df)
+    assert set(complete["scheme_code"]) == {"A", "B", "C"}
+    assert excluded.is_empty()
+    scored = composite_score_stage1(zscore_within_category(complete))
     b = scored.filter(pl.col("scheme_code") == "B").row(0, named=True)
+    assert b["z_ret_5y_median"] == b["z_ret_3y_median"]
+    assert b["z_ret_5y_p25"] == b["z_ret_3y_p25"]
     assert b["composite_score"] is not None
-    assert not math.isnan(b["composite_score"])
+
+
+def test_excluded_csv_written_with_header_when_empty(tmp_path, monkeypatch):
+    """stage1/excluded.csv is ALWAYS written — header-only when no fund was
+    dropped — so downstream consumers never hit a missing file."""
+    from mfs import paths
+    from mfs.rank import shortlist
+
+    monkeypatch.setattr(
+        paths, "shortlist_dir", lambda as_of: tmp_path / as_of,
+    )
+    scored = composite_score_stage1(
+        zscore_within_category(pl.DataFrame([_row("A"), _row("B")]))
+    )
+    shortlist._write_stage1_outputs(scored, pl.DataFrame(), date(2026, 6, 12))
+    csv_path = tmp_path / "2026-06-12" / "stage1" / "excluded.csv"
+    assert csv_path.exists()
+    out = pl.read_csv(csv_path)
+    assert out.columns == shortlist.EXCLUDED_OUTPUT_COLS
+    assert out.is_empty()
+
+
+def test_excluded_csv_sorted_with_reasons(tmp_path, monkeypatch):
+    """excluded.csv carries the contract columns sorted by
+    (canonical_category, scheme_code)."""
+    from mfs import paths
+    from mfs.rank import shortlist
+
+    monkeypatch.setattr(
+        paths, "shortlist_dir", lambda as_of: tmp_path / as_of,
+    )
+    df = pl.DataFrame([
+        _row("Z", cat="Mid Cap", alpha_3y_annualized=None),
+        _row("M", capture_efficiency=0.30),
+        _row("A", cat="Mid Cap", sortino_3y=None),
+    ])
+    survivors, excluded = apply_hard_filters(df, with_reasons=True)
+    survivors, core_excluded = split_core_complete(survivors)
+    excluded = pl.concat([excluded, core_excluded], how="diagonal_relaxed")
+    scored = composite_score_stage1(zscore_within_category(survivors))
+    shortlist._write_stage1_outputs(scored, excluded, date(2026, 6, 12))
+    out = pl.read_csv(tmp_path / "2026-06-12" / "stage1" / "excluded.csv")
+    assert out.columns == shortlist.EXCLUDED_OUTPUT_COLS
+    assert out["scheme_code"].to_list() == ["M", "A", "Z"]
+    assert out["exclusion_reason"].to_list() == [
+        "FILTER:capture_efficiency",
+        "MISSING_CORE_METRIC:sortino_3y",
+        "MISSING_CORE_METRIC:alpha_3y_annualized",
+    ]
+    assert out["missing_core_metrics"].to_list() == [
+        None, "sortino_3y", "alpha_3y_annualized",
+    ]
 
 
 def test_stage1_ignores_active_share_and_style_drift():
@@ -162,6 +295,72 @@ def test_stage1_ignores_active_share_and_style_drift():
     a = scored.filter(pl.col("scheme_code") == "A").row(0, named=True)
     b = scored.filter(pl.col("scheme_code") == "B").row(0, named=True)
     assert a["composite_score"] == b["composite_score"]
+
+
+# ---------------------------------------------------------------------------
+# A2-3 — bonus-option dedupe BEFORE z-scoring
+# ---------------------------------------------------------------------------
+
+
+def test_bonus_duplicate_does_not_contaminate_z_stats():
+    """The bonus-option duplicate must be removed BEFORE z-scoring so the
+    category nanmean/nanstd derive from distinct funds only: B's z equals the
+    value computed on {A, B, C} without the duplicate A'."""
+    from mfs.rank.shortlist import _dedupe_legacy_unit_classes
+
+    a = _row("A", ret_3y_median=0.20, base_fund_id="acme::flexi")
+    a_bonus = _row("A2", ret_3y_median=0.20, base_fund_id="acme::flexi_bonus")
+    b = _row("B", ret_3y_median=0.10, base_fund_id="bcorp::flexi")
+    c = _row("C", ret_3y_median=0.30, base_fund_id="ccorp::flexi")
+
+    # Build-equivalent path (build_scored_stage1 order): dedupe → z-score.
+    full = pl.DataFrame([a, a_bonus, b, c])
+    deduped = _dedupe_legacy_unit_classes(full)
+    assert set(deduped["scheme_code"]) == {"A", "B", "C"}
+    z_pipeline = zscore_within_category(deduped)
+
+    # Reference: z-stats computed on {A, B, C} with no duplicate ever present.
+    z_reference = zscore_within_category(pl.DataFrame([a, b, c]))
+
+    b_pipeline = z_pipeline.filter(pl.col("scheme_code") == "B")["z_ret_3y_median"][0]
+    b_reference = z_reference.filter(pl.col("scheme_code") == "B")["z_ret_3y_median"][0]
+    assert b_pipeline == b_reference
+
+    # Control: had the duplicate stayed in, B's z would have shifted.
+    z_contaminated = zscore_within_category(full)
+    b_contaminated = z_contaminated.filter(
+        pl.col("scheme_code") == "B"
+    )["z_ret_3y_median"][0]
+    assert b_contaminated != b_reference
+
+
+def test_dedupe_keeps_growth_over_bonus():
+    """Winner sort prefers the non-bonus row regardless of scheme_code or
+    metric ordering (composite_score no longer exists at dedupe time)."""
+    from mfs.rank.shortlist import _dedupe_legacy_unit_classes
+
+    df = pl.DataFrame([
+        _row("9001", base_fund_id="acme::flexi_bonus"),
+        _row("1001", base_fund_id="acme::flexi"),
+        _row("2001", base_fund_id="bcorp::flexi"),
+    ])
+    out = _dedupe_legacy_unit_classes(df)
+    assert set(out["scheme_code"]) == {"1001", "2001"}
+
+
+def test_null_base_fund_id_rows_not_collapsed():
+    """Rows with null base_fund_id must pass through untouched — fill-null
+    would give them all the same '' dedup key and collapse distinct funds."""
+    from mfs.rank.shortlist import _dedupe_legacy_unit_classes
+
+    df = pl.DataFrame([
+        _row("A", base_fund_id=None),
+        _row("B", base_fund_id=None),
+        _row("C", base_fund_id="ccorp::flexi"),
+        _row("C2", base_fund_id="ccorp::flexi_bonus"),
+    ])
+    out = _dedupe_legacy_unit_classes(df)
+    assert set(out["scheme_code"]) == {"A", "B", "C"}
 
 
 # ---------------------------------------------------------------------------

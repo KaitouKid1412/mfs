@@ -78,7 +78,7 @@ If `pyproject.toml` is missing → STOP (wrong directory). If `uv` is missing �
 - **freshness gate** — hard gate before compute (NAV/benchmark/T-bill/scheme_master lags). Raises `FreshnessError` if any daily series is stale.
 - **compute phase1** — Performance & Consistency metrics for every eligible Direct+Growth scheme. CPU-bound; benign statsmodels RuntimeWarnings ("divide by zero", "degrees of freedom") appear — mention once, ignore.
 - **rank-deep** — the production ranking, three stages (Phase 2 compute runs internally on the Stage-1 pool):
-  - **Stage 1** — Phase-1-only composite, hard filters, per-category ranking. → `<as_of>/stage1/`.
+  - **Stage 1** — Phase-1-only composite, hard filters + D2 core-metric gate (funds missing any core Stage-1 metric are hard-dropped, never scored as average), per-category ranking. → `<as_of>/stage1/`, including `excluded.csv` (always written; one row per dropped fund with `exclusion_reason` — `INSUFFICIENT_HISTORY | MISSING_CORE_METRIC:<name> | STALE_NAV | FILTER:<name>` — and `missing_core_metrics`).
   - **Stage 2** — take top-20/category, drop funds missing a **required Phase-2 metric** (`style_drift_3y`, `ptr_latest`, `aum_impact_cost_days`), re-rank with Stage-2 weights, keep top-5. **`active_share` is NOT required** (it's a soft signal, currently null universe-wide until ≥3 months of holdings+constituents accumulate). → `<as_of>/stage2/` with `coverage.csv` + `dropped.csv`.
   - **Stage 3** — iterative pairwise portfolio-overlap **DROP** (cross-category): repeatedly drop the worse-ranked fund of the highest-overlap pair >30% until none remain. → `<as_of>/stage3/` with `dropped.csv` (each drop names the kept fund + shared holdings) + `overlap_pairs.csv`. **Note: this DROPS funds — it is not informational.**
 
@@ -90,6 +90,7 @@ If `pyproject.toml` is missing → STOP (wrong directory). If `uv` is missing �
    AS=$(uv run python -c "import polars as pl,glob,os; print(sorted(os.path.basename(p) for p in glob.glob('data/output/shortlist/*') if os.path.isdir(p))[-1])")
    echo "latest run: $AS"
    column -t -s, data/output/shortlist/$AS/stage2/coverage.csv | head -30
+   echo "--- stage1 excluded (hard-filter + D2 core-metric drops) ---"; column -t -s, data/output/shortlist/$AS/stage1/excluded.csv | head -20
    echo "--- stage2 data-drops (missing required Phase-2 metric) ---"; column -t -s, data/output/shortlist/$AS/stage2/dropped.csv | head
    echo "--- stage3 overlap drops (dropped -> kept) ---"; column -t -s, data/output/shortlist/$AS/stage3/dropped.csv | head -40
    ```
@@ -128,7 +129,7 @@ If `pyproject.toml` is missing → STOP (wrong directory). If `uv` is missing �
 
 ## Rank diagnostic playbook (if very few funds make Stage 2)
 
-Stage 1 hard filters live in **code** (`src/mfs/rank/filters.py`, not the yaml), and are deliberately permissive floors: drops `INSUFFICIENT_HISTORY`/`POOR`, then catastrophic-only metric floors — `capture_efficiency > 0.50`, `info_ratio_3y > -1.0`, `r_squared_3y ∈ [0.40, 1.00]`, `beta_3y ∈ [0.30, 1.70]` (all null-tolerant). The funnel (per-gate):
+Stage 1 hard filters are applied by `src/mfs/rank/filters.py` with thresholds read from **`configs/pipeline.yaml` `filters:`** (single source of truth since A2-1), and are deliberately permissive floors: drops `INSUFFICIENT_HISTORY`/`STALE`/`POOR`, then catastrophic-only metric floors — `capture_efficiency > 0.50`, `info_ratio_3y > -1.0`, `r_squared_3y ∈ [0.40, 1.00]`, `beta_3y ∈ [0.30, 1.70]` (all null-tolerant), then the D2 core-metric gate (funds missing any core Stage-1 metric land in `stage1/excluded.csv` with `MISSING_CORE_METRIC:<name>`). The funnel (per-gate):
 
 ```bash
 uv run python - <<'PY'
@@ -141,7 +142,7 @@ print("computed:",m.height," after data-quality:",d.height)
 PY
 ```
 
-If Stage 2 is near-empty, the usual cause is **missing Phase-2 data**, NOT filters — i.e. `ingest holdings` / `ingest amfi-aum` / `ingest managers` / `ingest bhavcopy` didn't populate, so `ptr_latest` / `aum_impact_cost_days` are null and Stage 2's completeness filter drops everyone. Check `stage2/dropped.csv`'s `missing_metrics` column. Re-run the missing ingest stage. Only relax filters (via `AskUserQuestion`, unless `--no-rank-ask`) if the funnel shows a metric floor is the culprit — and **announce any `configs/pipeline.yaml` change before making it** (note: the live floors are in `filters.py`, so changing the yaml `filters:` block alone has no effect on hard-filtering).
+If Stage 2 is near-empty, the usual cause is **missing Phase-2 data**, NOT filters — i.e. `ingest holdings` / `ingest amfi-aum` / `ingest managers` / `ingest bhavcopy` didn't populate, so `ptr_latest` / `aum_impact_cost_days` are null and Stage 2's completeness filter drops everyone. Check `stage2/dropped.csv`'s `missing_metrics` column. Re-run the missing ingest stage. Only relax filters (via `AskUserQuestion`, unless `--no-rank-ask`) if the funnel shows a metric floor is the culprit — and **announce any `configs/pipeline.yaml` change before making it** (since A2-1 the yaml `filters:` block IS the live floors — `filters.py` reads it directly, so a yaml edit changes hard-filtering on the next run).
 
 ## Diagnose-and-halt playbook
 
