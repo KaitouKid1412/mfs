@@ -115,6 +115,35 @@ def _amc_slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
 
 
+# Option tokens enumerated empirically from the AMFI NAVAll snapshot
+# (2026-06-11). IDCW appears as the acronym, the spelled-out phrase
+# ("... Income Distribution cum Capital Withdrawal ..."), bare "Dividend",
+# the abbreviation "Div" ("Quarterly Div Option"), and recurring AMFI typos
+# (IDWC / ICDW / Divdend). ICICI Pru names its growth plans "Cumulative
+# Option". "Bonus" marks legacy bonus-unit plans — neither growth nor IDCW —
+# which stay UNKNOWN (out of the ranked universe).
+_IDCW_PATTERN = (
+    r"idcw|idwc|icdw|dividend|divdend|\bdiv\b"
+    r"|income\s+distribution|capital\s+withdrawal"
+)
+_IDCW_RE = re.compile(_IDCW_PATTERN, re.IGNORECASE)
+
+# "Dividend Yield" is a fund MANDATE, not an option token: without stripping
+# it first, every growth plan in the Dividend Yield category trips the
+# 'dividend' token and is misclassified IDCW (the whole category was silently
+# excluded from the ranked universe). Polars' rust regex has no lookahead, so
+# both call sites strip-then-match instead of using (?!\s+yield).
+_DIVIDEND_YIELD_PATTERN = r"dividend[\s-]*yield"
+_DIVIDEND_YIELD_RE = re.compile(_DIVIDEND_YIELD_PATTERN, re.IGNORECASE)
+
+# Every token that marks an explicit option in a scheme name. A name carrying
+# NONE of these is a candidate for the single-option GROWTH default below.
+# (?i) inline flag so the same pattern works in polars' rust-regex engine.
+_ANY_OPTION_TOKEN_PATTERN = (
+    rf"(?i){_IDCW_PATTERN}|growth|cumulative|bonus|payout|reinvest"
+)
+
+
 def _classify_plan_option(scheme_name: str) -> tuple[str, str]:
     name_lc = scheme_name.lower()
     plan = "UNKNOWN"
@@ -127,11 +156,58 @@ def _classify_plan_option(scheme_name: str) -> tuple[str, str]:
     elif "regular" in name_lc:
         plan = "REGULAR"
     option = "UNKNOWN"
-    if "idcw" in name_lc or "dividend" in name_lc:
+    opt_name = _DIVIDEND_YIELD_RE.sub("", name_lc)
+    if _IDCW_RE.search(opt_name):
         option = "IDCW"
-    elif "growth" in name_lc:
+    elif "growth" in opt_name:
+        option = "GROWTH"
+    elif "cumulative" in opt_name:
+        # ICICI Pru growth plans are named "Cumulative Option". The IDCW
+        # branch wins first so "Cumulative IDCW" oddities keep IDCW.
         option = "GROWTH"
     return plan, option
+
+
+def _apply_single_option_default(df: pl.DataFrame) -> pl.DataFrame:
+    """Default token-less UNKNOWN options to GROWTH for single-option funds.
+
+    Some AMCs list their sole plan with no option token at all (e.g.
+    "Samco Mid Cap Fund - Direct Plan" — the growth plan, and the only one).
+    Within a (base_fund_id, plan_type) group: a row whose option is UNKNOWN,
+    whose name carries no option token, and that has no sibling with a
+    resolved option IS the fund's single (growth) option. A resolved
+    GROWTH/IDCW sibling means genuine ambiguity — keep UNKNOWN.
+    """
+    has_resolved_sibling = (
+        (pl.col("option_type") != "UNKNOWN").any().over("base_fund_id", "plan_type")
+    )
+    no_option_token = ~(
+        pl.col("scheme_name")
+        .str.replace_all(f"(?i){_DIVIDEND_YIELD_PATTERN}", "")
+        .str.contains(_ANY_OPTION_TOKEN_PATTERN)
+    )
+    return df.with_columns(
+        pl.when(
+            (pl.col("option_type") == "UNKNOWN")
+            & no_option_token
+            & ~has_resolved_sibling
+        )
+        .then(pl.lit("GROWTH"))
+        .otherwise(pl.col("option_type"))
+        .alias("option_type")
+    )
+
+
+def _direct_unknown_rankable(df: pl.DataFrame) -> pl.DataFrame:
+    """Active DIRECT schemes in a rankable category still carrying UNKNOWN
+    option — each is silently excluded from the ranked universe, so this
+    listing is the recurring tripwire for AMFI option-naming drift."""
+    return df.filter(
+        pl.col("is_active")
+        & (pl.col("plan_type") == "DIRECT")
+        & (pl.col("option_type") == "UNKNOWN")
+        & pl.col("canonical_category").is_not_null()
+    ).select("scheme_code", "scheme_name")
 
 
 # Closed-ended and interval schemes are excluded from the equity universe: they
@@ -208,6 +284,7 @@ def build() -> pl.DataFrame:
         )
 
     df = pl.DataFrame(rows)
+    df = _apply_single_option_default(df)
 
     # Compute inception_date and last_seen_date from nav_daily history (Postgres-side
     # aggregation; pulling 30M+ NAV rows into the process just to GROUP BY is wasteful).
@@ -243,6 +320,18 @@ def build() -> pl.DataFrame:
         pl.col("inception_date").cast(pl.Date),
         pl.col("last_seen_date").cast(pl.Date),
     )
+
+    # Sanity reconciliation: any active DIRECT scheme in a rankable category
+    # whose option is still UNKNOWN is silently outside the ranked universe.
+    # Expected near-zero after the cumulative/spelled-out-IDCW/single-option
+    # fixes; growth here means AMFI option-naming drift.
+    unknown_direct = _direct_unknown_rankable(df)
+    if unknown_direct.height:
+        log.warning(
+            "scheme_master.direct_unknown_option",
+            count=unknown_direct.height,
+            schemes=[f"{code}: {name}" for code, name in unknown_direct.rows()],
+        )
 
     w.upsert_scheme_master(df)
     log.info("scheme_master.built", rows=df.height)

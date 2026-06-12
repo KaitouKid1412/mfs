@@ -156,3 +156,117 @@ def test_match_empty_input_returns_none():
 def test_match_empty_candidates_returns_none():
     r = match_one("HDFC Flexi Cap Fund", {})
     assert r.matched_scheme_code is None
+
+
+# ---------------------------------------------------------------------------
+# match_one — collision resolution: unique best with margin; ambiguity → skip
+# (B5: subset-name poaching, discriminator tokens, margin requirement)
+# ---------------------------------------------------------------------------
+
+
+def test_subset_name_against_superset_only_candidate_is_rejected():
+    """'ABC Mid Cap Fund' with only the LARGE AND MID CAP sibling present
+    token-set-scores 100 (subset tokens) but must NOT poach onto it."""
+    sm = pl.DataFrame([
+        _sm_row("L1", "ABC Large and Mid Cap Fund - Direct Plan - Growth", amc="abc"),
+    ])
+    idx = build_candidate_index(sm, "abc")
+    r = match_one("ABC Mid Cap Fund", idx)
+    assert r.matched_scheme_code is None
+    assert r.ambiguous is True
+
+
+def test_exact_canonical_equality_beats_superset_sibling():
+    """With BOTH siblings present, the exact-equality fast path wins."""
+    sm = pl.DataFrame([
+        _sm_row("L1", "ABC Large and Mid Cap Fund - Direct Plan - Growth", amc="abc"),
+        _sm_row("M1", "ABC Mid Cap Fund - Direct Plan - Growth", amc="abc"),
+    ])
+    idx = build_candidate_index(sm, "abc")
+    r = match_one("ABC Mid Cap Fund", idx)
+    assert r.matched_scheme_code == "M1"
+    assert r.ambiguous is False
+
+
+def test_motilal_multi_factor_fof_does_not_poach_multi_cap():
+    """Regression for the confirmed April-2026 contamination: the Multi
+    Factor Passive FoF's true target (154239) is absent from the
+    DIRECT+GROWTH index, and its printed name scored 92.3 against the
+    Multi Cap Fund — the FACTOR/PASSIVE discriminator tokens must veto it."""
+    sm = pl.DataFrame([
+        _sm_row(
+            "152651",
+            "Motilal Oswal Multi Cap Fund - Direct Plan - Growth",
+            amc="motilal_oswal",
+        ),
+        _sm_row(
+            "127042",
+            "Motilal Oswal Midcap Fund - Direct Plan - Growth",
+            amc="motilal_oswal",
+        ),
+    ])
+    idx = build_candidate_index(sm, "motilal_oswal")
+    r = match_one("Motilal Oswal Multi Factor Passive Fund of Funds", idx)
+    assert r.matched_scheme_code is None
+    assert r.ambiguous is True
+
+
+def test_nifty_next_50_does_not_poach_nifty_50():
+    """Plain ratio is too high (~90) for the subset rule here; the NEXT
+    discriminator token is what must block the match."""
+    sm = pl.DataFrame([
+        _sm_row("N1", "ABC Nifty 50 Index Fund - Direct Plan - Growth", amc="abc"),
+    ])
+    idx = build_candidate_index(sm, "abc")
+    r = match_one("ABC Nifty Next 50 Index Fund", idx)
+    assert r.matched_scheme_code is None
+    assert r.ambiguous is True
+
+
+def test_nifty_next_50_matches_its_own_master_row():
+    sm = pl.DataFrame([
+        _sm_row("N1", "ABC Nifty 50 Index Fund - Direct Plan - Growth", amc="abc"),
+        _sm_row("N2", "ABC Nifty Next 50 Index Fund - Direct Plan - Growth", amc="abc"),
+    ])
+    idx = build_candidate_index(sm, "abc")
+    assert match_one("ABC Nifty Next 50 Index Fund", idx).matched_scheme_code == "N2"
+    assert match_one("ABC Nifty 50 Index Fund", idx).matched_scheme_code == "N1"
+
+
+def test_no_unique_best_within_margin_is_ambiguous():
+    """Two superset siblings whose plain ratios differ by <5 points: the
+    winner would hinge on noise, so the matcher must skip, not guess."""
+    sm = pl.DataFrame([
+        _sm_row("B1", "ABC Bluechip Equity Fund - Direct Plan - Growth", amc="abc"),
+        _sm_row("B2", "ABC Bluechip Value Fund - Direct Plan - Growth", amc="abc"),
+    ])
+    idx = build_candidate_index(sm, "abc")
+    r = match_one("ABC Bluechip Fund", idx)
+    assert r.matched_scheme_code is None
+    assert r.ambiguous is True
+
+
+def test_ambiguous_rejection_logs_loud_warning():
+    from structlog.testing import capture_logs
+
+    sm = pl.DataFrame([
+        _sm_row("L1", "ABC Large and Mid Cap Fund - Direct Plan - Growth", amc="abc"),
+    ])
+    idx = build_candidate_index(sm, "abc")
+    with capture_logs() as logs:
+        match_one("ABC Mid Cap Fund", idx)
+    events = [e for e in logs if e["event"] == "scheme_match.ambiguous"]
+    assert len(events) == 1
+    assert events[0]["log_level"] == "warning"
+    assert events[0]["top_candidates"]  # candidates listed for diagnosis
+
+
+def test_below_threshold_rejection_is_not_flagged_ambiguous():
+    """A nothing-like-it name is a plain no-match, not an ambiguity."""
+    sm = pl.DataFrame([
+        _sm_row("A1", "HDFC Flexi Cap Fund - Direct Plan - Growth"),
+    ])
+    idx = build_candidate_index(sm, "hdfc")
+    r = match_one("Completely Unrelated Fund Name XYZ", idx)
+    assert r.matched_scheme_code is None
+    assert r.ambiguous is False

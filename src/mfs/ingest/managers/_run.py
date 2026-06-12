@@ -145,11 +145,18 @@ def run_for_amc(
     ptr_records = list(adapter.parse_ptr(pdf, ym))
     log.info("ptr.parsed", amc=amc_slug, n_records=len(ptr_records))
 
-    # Step 4: resolve names to scheme_codes.
-    matched_holdings = _resolve_holdings(holding_records, candidates, amc_slug, ym)
-    matched_ptr = _resolve_ptr(ptr_records, candidates, amc_slug, ym)
+    # Step 4: resolve names to scheme_codes. Cross-name collisions (two
+    # printed names → one scheme_code) are resolved by match score inside the
+    # resolvers; parse order never decides data ownership.
+    matched_holdings = _resolve_holdings(
+        holding_records, candidates, amc_slug, ym, match_threshold,
+    )
+    matched_ptr = _resolve_ptr(ptr_records, candidates, amc_slug, ym, match_threshold)
 
-    # Step 4.5: dedupe by PK to avoid Postgres CardinalityViolation.
+    # Step 4.5: dedupe by PK to avoid Postgres CardinalityViolation. After the
+    # score-based collision resolution above this only fires when ONE printed
+    # name legitimately repeats in the parse output (e.g. the same security at
+    # two table depths) — identical-key repeats, not cross-scheme collisions.
     matched_holdings = _dedupe_by_keys(
         matched_holdings, ("scheme_code", "security_name", "as_of_month"),
     )
@@ -203,11 +210,47 @@ def run_for_amc(
     }
 
 
+def _winners_by_code(
+    matches: dict[str, MatchResult],
+    amc_slug: str,
+    signal: str,
+) -> set[str]:
+    """Resolve two-printed-names → one-scheme_code collisions by match score.
+
+    Mirrors the holdings orchestrator's rule (holdings/_run.py): when two
+    similarly-named printed schemes fuzzy-match the SAME scheme_code, keep
+    ONLY the highest-scoring printed name — otherwise both signals get
+    written to one scheme_code (e.g. two funds' portfolios summing to ~200%,
+    or one fund's PTR decided by parse order). The loser is dropped entirely
+    (its real scheme just isn't in scheme_master) and logged loudly.
+    """
+    best_for_code: dict[str, tuple[float, str]] = {}
+    dropped: list[str] = []
+    for printed, mr in matches.items():
+        if mr.matched_scheme_code is None:
+            continue
+        prev = best_for_code.get(mr.matched_scheme_code)
+        if prev is None or mr.score > prev[0]:
+            if prev is not None:
+                dropped.append(prev[1])
+            best_for_code[mr.matched_scheme_code] = (mr.score, printed)
+        else:
+            dropped.append(printed)
+    if dropped:
+        log.warning(
+            "managers.match_collision_dropped",
+            amc=amc_slug, signal=signal,
+            n_dropped=len(dropped), names=dropped[:10],
+        )
+    return {printed for _, printed in best_for_code.values()}
+
+
 def _resolve_holdings(
     records: list,
     candidates: dict[str, dict],
     amc_slug: str,
     ym: str,
+    match_threshold: int = DEFAULT_THRESHOLD,
 ) -> list[dict]:
     """Resolve printed scheme names → scheme_codes for holdings. Rows with
     no ISIN are dropped (per the Phase 2.2 locked decision)."""
@@ -216,19 +259,26 @@ def _resolve_holdings(
     from mfs.schemas import ParsedHoldingRecord  # local import to avoid cycle
     now = datetime.utcnow()
     as_of_month = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
+    # Pass 1: match every distinct printed name once, then keep only the
+    # best-scoring printed name per scheme_code (see _winners_by_code).
     cache: dict[str, MatchResult] = {}
+    for rec in records:
+        if not isinstance(rec, ParsedHoldingRecord) or not rec.isin:
+            continue
+        if rec.scheme_name_printed not in cache:
+            cache[rec.scheme_name_printed] = match_one(
+                rec.scheme_name_printed, candidates, threshold=match_threshold,
+            )
+    winners = _winners_by_code(cache, amc_slug, signal="holdings")
     out: list[dict] = []
     for rec in records:
         if not isinstance(rec, ParsedHoldingRecord):
             continue
         if not rec.isin:
             continue  # skip ISIN-less rows
-        mr = cache.get(rec.scheme_name_printed)
-        if mr is None:
-            mr = match_one(rec.scheme_name_printed, candidates)
-            cache[rec.scheme_name_printed] = mr
-        if mr.matched_scheme_code is None:
-            continue
+        if rec.scheme_name_printed not in winners:
+            continue  # unmatched, or a lower-scoring duplicate for its code
+        mr = cache[rec.scheme_name_printed]
         out.append({
             "scheme_code": mr.matched_scheme_code,
             "isin": rec.isin,
@@ -247,6 +297,7 @@ def _resolve_ptr(
     candidates: dict[str, dict],
     amc_slug: str,
     ym: str,
+    match_threshold: int = DEFAULT_THRESHOLD,
 ) -> list[dict]:
     """Resolve printed scheme names → scheme_codes for PTR records."""
     if not records:
@@ -254,17 +305,24 @@ def _resolve_ptr(
     from mfs.schemas import ParsedPtrRecord
     now = datetime.utcnow()
     as_of_default = date(int(ym.split("-")[0]), int(ym.split("-")[1]), 1)
+    # Pass 1: match every distinct printed name once, then keep only the
+    # best-scoring printed name per scheme_code (see _winners_by_code).
     cache: dict[str, MatchResult] = {}
+    for rec in records:
+        if not isinstance(rec, ParsedPtrRecord):
+            continue
+        if rec.scheme_name_printed not in cache:
+            cache[rec.scheme_name_printed] = match_one(
+                rec.scheme_name_printed, candidates, threshold=match_threshold,
+            )
+    winners = _winners_by_code(cache, amc_slug, signal="ptr")
     out: list[dict] = []
     for rec in records:
         if not isinstance(rec, ParsedPtrRecord):
             continue
-        mr = cache.get(rec.scheme_name_printed)
-        if mr is None:
-            mr = match_one(rec.scheme_name_printed, candidates)
-            cache[rec.scheme_name_printed] = mr
-        if mr.matched_scheme_code is None:
-            continue
+        if rec.scheme_name_printed not in winners:
+            continue  # unmatched, or a lower-scoring duplicate for its code
+        mr = cache[rec.scheme_name_printed]
         # Adapters sourcing PTR from a less-frequent document (e.g. quant's
         # abridged annual report) stamp the record's true period-end; everything
         # else falls back to the run's data month.

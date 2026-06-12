@@ -24,8 +24,32 @@ from dataclasses import dataclass
 import polars as pl
 from rapidfuzz import fuzz, process
 
+from mfs.utils.logging import get_logger
+
+log = get_logger(__name__)
+
 # Default acceptance threshold. token_set_ratio is generous; <85 is suspicious.
 DEFAULT_THRESHOLD = 85
+
+# Discriminator tokens that mark structurally different products (index /
+# factor / passive / FoF / ETF variants of an active sibling). A printed name
+# carrying one of these tokens must never fuzzy-match a candidate key that
+# lacks it: token_set_ratio scores subset names at 100, so "Multi Factor
+# Passive Fund of Funds" would otherwise poach onto "Multi Cap Fund", and
+# "Nifty Next 50" onto "Nifty 50" (the plain-ratio guards can't catch the
+# latter — the strings differ by one short token).
+DISCRIMINATOR_TOKENS = frozenset({"FOF", "PASSIVE", "FACTOR", "ETF", "INDEX", "NEXT"})
+
+# Minimum plain-ratio lead the best candidate must hold over the runner-up
+# when several candidates tie on token_set_ratio. Below this the pick would
+# hinge on noise — ambiguous, so we skip rather than guess (fail-fast).
+_MIN_RATIO_MARGIN = 5
+
+# token_set_ratio == 100 with a plain ratio below this floor (and no exact
+# canonical equality) means one name's tokens are a strict subset of the
+# other's — a sibling poach (e.g. "X Mid Cap Fund" onto "X LARGE AND MID CAP
+# FUND"), not a genuine match.
+_SUBSET_POACH_RATIO_FLOOR = 80
 
 # Adapter slugs are short identifiers ('absl', 'nippon') but scheme_master's
 # `amc_code` column is the long-form slug derived from the AMC name (e.g.
@@ -130,12 +154,19 @@ def canonicalize(name: str) -> str:
 
 @dataclass
 class MatchResult:
-    """One fuzzy-match attempt result."""
+    """One fuzzy-match attempt result.
+
+    ``ambiguous=True`` means a candidate cleared the score threshold but the
+    match was rejected as unsafe (no unique best within margin, subset-name
+    poach, or a missing discriminator token) — the caller must skip the
+    scheme, never guess.
+    """
 
     printed_name: str
     matched_scheme_code: str | None
     matched_scheme_name: str | None
     score: float
+    ambiguous: bool = False
 
 
 def build_candidate_index(
@@ -188,18 +219,33 @@ def match_one(
 ) -> MatchResult:
     """Match one printed scheme name against the AMC's candidate index.
 
-    Uses ``token_set_ratio`` as the primary scorer (forgiving of word order
-    and casing differences), then breaks ties with ``ratio`` (Levenshtein)
-    which penalizes length differences. The tie-breaker is critical for
-    subset names — without it, "Bank of India MID CAP FUND" would tie at
-    score 100 against both "Bank of India MID CAP FUND" and "Bank of India
-    LARGE AND MID CAP FUND" (the smaller token set is a subset of the
-    larger), and dict iteration order would decide the winner. With it,
-    the exact match wins because ``ratio`` rewards equal length.
+    Exact canonical equality always wins immediately. Otherwise the
+    ``token_set_ratio`` top candidates (forgiving of word order and casing)
+    are re-ranked by plain ``ratio`` (Levenshtein, penalizes length
+    differences), and the winner must be UNIQUE-WITH-MARGIN: clear the
+    runner-up's plain ratio by >= ``_MIN_RATIO_MARGIN`` points. Any of the
+    following rejects the match as ambiguous (``MatchResult.ambiguous=True``,
+    logged at WARNING so the skip is loud — fail-fast, no guessing):
+
+      - no unique best within the plain-ratio margin;
+      - token_set_ratio == 100 with plain ratio < ``_SUBSET_POACH_RATIO_FLOOR``
+        (the smaller token set is a subset of the larger — e.g. "Bank of
+        India MID CAP FUND" against "Bank of India LARGE AND MID CAP FUND");
+      - the printed name carries a ``DISCRIMINATOR_TOKENS`` member the
+        matched key lacks (e.g. "Multi Factor Passive Fund of Funds" must
+        not resolve to "Multi Cap Fund", "Nifty Next 50" not to "Nifty 50").
     """
     canon_in = canonicalize(printed_name)
     if not canon_in or not candidates:
         return MatchResult(printed_name, None, None, 0.0)
+    # Exact canonical equality wins immediately — a literal name match can
+    # never be ambiguous, and adapter-level disambiguation rewrites (kotak,
+    # dsp, motilal_oswal) rely on this to land on their intended sibling.
+    exact = candidates.get(canon_in)
+    if exact is not None:
+        return MatchResult(
+            printed_name, exact["scheme_code"], exact["scheme_name"], 100.0
+        )
     keys = list(candidates.keys())
     # Get top candidates by token_set_ratio (score_cutoff for early-exit).
     results = process.extract(
@@ -210,20 +256,48 @@ def match_one(
     top_score = results[0][1]
     if top_score < threshold:
         return MatchResult(printed_name, None, None, float(top_score))
-    # Tie-break: among candidates within 2 points of top_score, pick the
-    # one with the highest plain ratio (Levenshtein on the full strings).
-    # This selects exact-length matches over subset-of-longer-name matches.
-    tied = [(k, s) for k, s, _ in results if s >= top_score - 2]
-    if len(tied) > 1:
-        tied.sort(
-            key=lambda ks: (fuzz.ratio(canon_in, ks[0]), ks[1]),
-            reverse=True,
+    # Contenders: candidates within 2 points of top_score, re-ranked by
+    # plain ratio (Levenshtein on the full strings), which rewards equal
+    # length over subset-of-longer-name candidates.
+    contenders = sorted(
+        (
+            (k, s, fuzz.ratio(canon_in, k))
+            for k, s, _ in results
+            if s >= top_score - 2
+        ),
+        key=lambda t: (t[2], t[1]),
+        reverse=True,
+    )
+    best_key, best_score, best_ratio = contenders[0]
+
+    def _ambiguous(reason: str) -> MatchResult:
+        log.warning(
+            "scheme_match.ambiguous",
+            printed=printed_name,
+            reason=reason,
+            top_candidates=[
+                {"key": k, "token_set": float(s), "ratio": round(r, 1)}
+                for k, s, r in contenders
+            ],
         )
-    matched_key, score = tied[0]
-    info = candidates[matched_key]
+        return MatchResult(printed_name, None, None, float(top_score), ambiguous=True)
+
+    if (
+        len(contenders) > 1
+        and best_ratio - contenders[1][2] < _MIN_RATIO_MARGIN
+    ):
+        return _ambiguous("no_unique_best_within_margin")
+    if best_score == 100 and best_ratio < _SUBSET_POACH_RATIO_FLOOR:
+        return _ambiguous("subset_name_poach")
+    missing = (set(canon_in.split()) & DISCRIMINATOR_TOKENS) - set(best_key.split())
+    if missing:
+        return _ambiguous(
+            "discriminator_tokens_missing:" + ",".join(sorted(missing))
+        )
+    info = candidates[best_key]
     return MatchResult(
         printed_name,
         info["scheme_code"],
         info["scheme_name"],
-        float(score),
+        float(best_score),
     )
