@@ -88,7 +88,7 @@ from mfs import paths
 from mfs.db import queries as q
 from mfs.ingest.holdings._generic import GenericHoldingsAdapter, parse_sebi_excel
 from mfs.ingest.holdings._registry import register_adapter
-from mfs.ingest.managers._scheme_match import (
+from mfs.ingest._scheme_match import (
     build_candidate_index,
     canonicalize,
     match_one,

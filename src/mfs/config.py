@@ -159,6 +159,15 @@ class Settings(BaseSettings):
     config_path: Path = REPO_ROOT / "configs" / "pipeline.yaml"
     benchmarks_csv: Path = REPO_ROOT / "configs" / "benchmarks.csv"
     thresholds_yaml: Path = REPO_ROOT / "configs" / "category_thresholds.yaml"
+    # C2: thread-pool width for the per-AMC ingest orchestrators (managers +
+    # holdings run_all). Each in-flight task targets ONE distinct AMC host and
+    # per-AMC downloads stay serial inside run_for_amc, so per-host concurrency
+    # remains 1. MFS_INGEST_WORKERS=1 restores serial behavior for debugging.
+    ingest_workers: int = 6
+    # C3: thread-pool width for the per-ticker benchmark TRI ingest. ALL
+    # tickers hit the same host (niftyindices.com), so this stays small to
+    # bound NSE load. MFS_BENCHMARK_WORKERS=1 forces serial.
+    benchmark_workers: int = 3
 
 
 @lru_cache(maxsize=1)

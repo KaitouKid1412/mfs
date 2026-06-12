@@ -24,13 +24,14 @@ from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.errors import IngestError
 from mfs.ingest import _parse_cache
-from mfs.ingest.managers._registry import get_adapter, registered_adapters
-from mfs.ingest.managers._scheme_match import (
+from mfs.ingest._common import _dedupe_by_keys, _default_data_month, run_all_isolated
+from mfs.ingest._scheme_match import (
     DEFAULT_THRESHOLD,
     MatchResult,
     build_candidate_index,
     match_one,
 )
+from mfs.ingest.managers._registry import get_adapter, registered_adapters
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -42,41 +43,6 @@ log = get_logger(__name__)
 # while a percent-vs-fraction flip (0.09 → 9.14) is always caught.
 PTR_FLIP_RATIO = 5.0
 PTR_FLIP_ABS = 0.5
-
-
-def _dedupe_by_keys(rows: list[dict], key_cols: tuple[str, ...]) -> list[dict]:
-    """Drop later rows whose key tuple already appeared earlier in `rows`.
-
-    Postgres' ``ON CONFLICT DO UPDATE`` cannot affect the same destination
-    row twice in a single INSERT, so any in-batch PK collision raises
-    ``CardinalityViolation``. Adapters sometimes produce these when two
-    slightly different printed scheme names fuzzy-match to the same
-    ``scheme_code`` for the same security/month — we keep the first
-    occurrence rather than silently merging values.
-    """
-    seen: set[tuple] = set()
-    out: list[dict] = []
-    n_drops = 0
-    for r in rows:
-        k = tuple(r.get(c) for c in key_cols)
-        if k in seen:
-            n_drops += 1
-            continue
-        seen.add(k)
-        out.append(r)
-    if n_drops:
-        log.info("ingest.dedupe", n_dropped=n_drops, keys=list(key_cols))
-    return out
-
-
-def _default_data_month(today: date | None = None) -> str:
-    """Return YYYY-MM for the most recent complete month (AMFI publishes by the
-    10th of the next month, so 'previous calendar month' is a safe default).
-    """
-    d = today or date.today()
-    if d.month == 1:
-        return f"{d.year - 1:04d}-12"
-    return f"{d.year:04d}-{d.month - 1:02d}"
 
 
 def _advisory_statement_check(pdf: Path, ym: str, amc_slug: str) -> dict:
@@ -237,8 +203,11 @@ def run_for_amc(
     # two table depths) — identical-key repeats, not cross-scheme collisions.
     matched_holdings = _dedupe_by_keys(
         matched_holdings, ("scheme_code", "security_name", "as_of_month"),
+        amc=amc_slug,
     )
-    matched_ptr = _dedupe_by_keys(matched_ptr, ("scheme_code", "as_of_month"))
+    matched_ptr = _dedupe_by_keys(
+        matched_ptr, ("scheme_code", "as_of_month"), amc=amc_slug,
+    )
 
     # Step 4.6 / Step 5: write each table. Holdings (factsheet path) is a plain
     # idempotent upsert. PTR is authoritative per (source_amc, as_of_month): we
@@ -561,29 +530,13 @@ def run_all(
     slugs = registered_adapters()
     if not slugs:
         raise IngestError("No factsheet adapters registered.")
-    results: dict[str, dict] = {}
-    failed: list[str] = []
-    for slug in slugs:
-        try:
-            results[slug] = run_for_amc(
-                slug, ym=ym, match_threshold=match_threshold, force=force,
-            )
-        except Exception as e:  # noqa: BLE001 — isolate one AMC; never crash the stage
-            failed.append(slug)
-            results[slug] = {
-                "amc_slug": slug, "ym": ym,
-                "error": str(e), "error_type": type(e).__name__,
-                "rows_written_holdings": 0, "rows_written_ptr": 0,
-            }
-            log.error("managers.amc_failed", amc=slug,
-                      err=str(e), err_type=type(e).__name__)
-    if failed:
-        log.warning("managers.run_all.partial",
-                    n_failed=len(failed), n_total=len(slugs), failed=failed)
-    if len(failed) == len(slugs):
-        raise IngestError(
-            f"All {len(slugs)} factsheet adapters failed — systemic network/config "
-            f"issue, not per-AMC. Refusing to proceed silently. "
-            f"First error: {results[slugs[0]].get('error')}"
-        )
-    return results
+    return run_all_isolated(
+        "managers",
+        slugs,
+        lambda slug: run_for_amc(
+            slug, ym=ym, match_threshold=match_threshold, force=force,
+        ),
+        ym=ym,
+        error_zero_fields=("rows_written_holdings", "rows_written_ptr"),
+        adapter_kind="factsheet",
+    )

@@ -410,6 +410,20 @@ def has_factsheet_rows(amc_slug: str, as_of_month: date) -> bool:
     return bool(p)
 
 
+def has_holdings_rows(amc_slug: str, as_of_month: date) -> bool:
+    """True if this AMC already has holdings rows for the given month.
+    Used by the holdings parse-skip (C5): a skip is only safe when the prior
+    ingest is actually present in the DB. Mirrors ``has_factsheet_rows`` but
+    checks only holdings_monthly (the holdings path never writes PTR)."""
+    with connect() as c:
+        h = c.execute(
+            "SELECT 1 FROM holdings_monthly "
+            "WHERE source_amc = %s AND as_of_month = %s LIMIT 1",
+            (amc_slug, as_of_month),
+        ).fetchone()
+    return bool(h)
+
+
 def benchmark_latest_by_ticker() -> dict[str, date]:
     """Per-ticker MAX(date) in benchmark_daily — the incremental-ingest cursor.
     A ticker absent from the result has no rows yet (needs a full backfill)."""

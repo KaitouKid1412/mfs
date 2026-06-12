@@ -99,31 +99,14 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-import pdfplumber
-
 from mfs.errors import IngestError
+from mfs.ingest._common import MONTH_NAMES, parse_ptr_pages, publish_ym
 from mfs.ingest.managers._base import ManagerAdapter
 from mfs.ingest.managers._registry import register_adapter
 from mfs.schemas import ParsedHoldingRecord, ParsedPtrRecord
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
-
-
-_MONTH_NAMES = (
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +118,11 @@ def _publish_ym(data_ym: str) -> tuple[int, int]:
 
     Canara Robeco uploads each issue to ``/wp-content/uploads/{YYYY}/{MM}/``
     where the path reflects the **publish** month, e.g. the April-2026
-    factsheet lives under ``2026/05/``.
+    factsheet lives under ``2026/05/``. Thin tuple-shaped wrapper over the
+    shared ``mfs.ingest._common.publish_ym``.
     """
-    y, m = map(int, data_ym.split("-"))
-    if m == 12:
-        return y + 1, 1
-    return y, m + 1
+    y, m = publish_ym(data_ym).split("-")
+    return int(y), int(m)
 
 
 _LISTING_URL = "https://www.canararobeco.com/documents/news-insights/factsheets/"
@@ -170,7 +152,7 @@ def _resolve_factsheet_url(ym: str) -> str:
     import httpx
 
     y, m = map(int, ym.split("-"))
-    month_name = _MONTH_NAMES[m - 1]
+    month_name = MONTH_NAMES[m - 1]
     try:
         with httpx.Client(
             timeout=60.0,
@@ -341,25 +323,14 @@ class CanaraRobecoAdapter(ManagerAdapter):
     # -------------------------------------------------------------------
 
     def parse_ptr(self, pdf_path: Path, ym: str) -> Iterable[ParsedPtrRecord]:
-        import logging as _logging
-        _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                scheme = _scheme_name_from_page(text)
-                if not scheme:
-                    continue
-                ptr_value = _extract_ptr(text)
-                if ptr_value is None:
-                    continue
-                # Fail-fast: drop NaN / non-positive.
-                if ptr_value != ptr_value or ptr_value <= 0:
-                    continue
-                yield ParsedPtrRecord(
-                    scheme_name_printed=scheme,
-                    ptr=ptr_value,
-                    source_amc=self.amc_slug,
-                )
+        # _extract_ptr returns the "times" convention directly == a fraction,
+        # the unit parse_ptr_pages requires.
+        return parse_ptr_pages(
+            pdf_path,
+            scheme_name_fn=_scheme_name_from_page,
+            ptr_extract_fn=_extract_ptr,
+            amc_slug=self.amc_slug,
+        )
 
     # -------------------------------------------------------------------
     # Holdings — deferred to the parallel ISIN-tagged Excel path.

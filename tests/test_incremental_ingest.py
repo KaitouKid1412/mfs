@@ -388,3 +388,87 @@ def test_holdings_force_false_serves_cache_without_download(monkeypatch, tmp_pat
     assert res["rows_written"] == 6
     names = written[0]["security_name"].to_list()
     assert all(n.startswith("OldCo") for n in names)   # cached bytes parsed
+
+
+# ---------------------------------------------------------------------------
+# C3: ingest_all_known parallelizes over tickers (ThreadPool, 3 workers) while
+# preserving per-ticker failure aggregation and the equity-failure IngestError.
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+_C3_START = date(2026, 5, 1)  # explicit start → no DB watermark query
+
+
+def test_ingest_all_known_covers_every_ticker(monkeypatch):
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def fake_ingest(ticker, start=None, end=None, **kw):
+        with lock:
+            seen.append(ticker)
+        return 7
+
+    monkeypatch.setattr(benchmarks, "ingest_ticker", fake_ingest)
+    out = benchmarks.ingest_all_known(start=_C3_START)
+    assert set(out) == set(benchmarks.NSE_INDEX_NAME_MAP)
+    assert set(seen) == set(benchmarks.NSE_INDEX_NAME_MAP)
+    assert all(n == 7 for n in out.values())
+
+
+def test_ingest_all_known_aggregates_every_equity_failure(monkeypatch):
+    tickers = list(benchmarks.NSE_INDEX_NAME_MAP)
+    bad = {tickers[0], tickers[3]}
+
+    def fake_ingest(ticker, start=None, end=None, **kw):
+        if ticker in bad:
+            raise RuntimeError(f"NSE choked on {ticker}")
+        return 5
+
+    monkeypatch.setattr(benchmarks, "ingest_ticker", fake_ingest)
+    with pytest.raises(IngestError) as ei:
+        benchmarks.ingest_all_known(start=_C3_START)
+    msg = str(ei.value)
+    assert "2 ticker(s) failed" in msg
+    for t in bad:
+        assert t in msg  # BOTH failures listed — raise waits for the pool
+
+
+def test_ingest_all_known_is_concurrent(monkeypatch):
+    """Passes only if ≥2 tickers are in flight at once (3-worker pool)."""
+    barrier = threading.Barrier(2, timeout=5)
+    released = {"n": 0}
+    lock = threading.Lock()
+
+    def fake_ingest(ticker, start=None, end=None, **kw):
+        # Only the first two participants need to rendezvous; later tickers
+        # pass straight through so the run completes quickly.
+        with lock:
+            released["n"] += 1
+            n = released["n"]
+        if n <= 2:
+            barrier.wait()
+        return 1
+
+    monkeypatch.setattr(benchmarks, "ingest_ticker", fake_ingest)
+    out = benchmarks.ingest_all_known(start=_C3_START)
+    assert all(n == 1 for n in out.values())
+
+
+def test_non_nse_mapped_zero_rows_is_not_an_equity_failure(monkeypatch):
+    """A hybrid/manual-CSV ticker (empty NSE mapping) returning 0 rows stays
+    exempt from the equity-failure aggregation (existing exemption)."""
+    monkeypatch.setattr(
+        benchmarks, "NSE_TRI_MAP",
+        {"EQ TRI": ("EQ", "Eq Index"), "HYBRID TRI": ("", "")},
+    )
+    monkeypatch.setattr(
+        benchmarks, "NSE_INDEX_NAME_MAP", {"EQ TRI": "Eq Index", "HYBRID TRI": ""},
+    )
+
+    def fake_ingest(ticker, start=None, end=None, **kw):
+        return 0 if ticker == "HYBRID TRI" else 9
+
+    monkeypatch.setattr(benchmarks, "ingest_ticker", fake_ingest)
+    out = benchmarks.ingest_all_known(start=_C3_START)  # must NOT raise
+    assert out == {"EQ TRI": 9, "HYBRID TRI": 0}

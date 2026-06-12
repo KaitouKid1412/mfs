@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -161,7 +162,11 @@ def fetch_tri_window(trading_name_upper: str, long_name: str, start: date, end: 
         "Origin": "https://www.niftyindices.com",
         "X-Requested-With": "XMLHttpRequest",
     }
-    with httpx.Client(timeout=s.http_timeout, headers=headers, follow_redirects=True) as c:
+    # C3: explicit per-phase timeouts instead of the blanket 60s — a hung NSE
+    # read fails into the tenacity retry in ≤30s, bounding the per-window
+    # worst case that produced the audit's 33.8-min benchmark stage.
+    timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+    with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as c:
         try:
             r = c.post(NIFTY_TRI_URL, content=body)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
@@ -423,25 +428,60 @@ def ingest_all_known(
     mapping in NSE_TRI_MAP) returns 0 rows after retries. Hybrid/multi-asset
     tickers with empty mappings are exempt — by design they require manual CSVs
     and are reported as empty with the `benchmark.empty` warning only.
+
+    Concurrency (C3): tickers run on a ThreadPool of
+    ``settings.benchmark_workers`` (env ``MFS_BENCHMARK_WORKERS``, default 3 —
+    every ticker hits the same niftyindices.com host, so the pool stays small
+    to bound NSE load; 1 forces serial). tenacity already retries 429/5xx per
+    window. The aggregate IngestError is raised only after ALL tickers finish
+    (same message format, every failed equity ticker listed); per-ticker DB
+    upserts are thread-safe (fresh per-call connections, disjoint ticker PK
+    ranges). Aggregation is deterministic in NSE_INDEX_NAME_MAP order.
     """
     out: dict[str, int] = {}
     equity_failures: list[str] = []
-    # Prefetch per-ticker watermarks once so each ticker doesn't re-query.
+    # Prefetch per-ticker watermarks once, BEFORE the pool starts, so each
+    # ticker doesn't re-query.
     latest_map = None if start is not None else q.benchmark_latest_by_ticker()
     cfg = get_pipeline_config()
-    for ticker in NSE_INDEX_NAME_MAP:
-        has_nse_mapping = bool(NSE_TRI_MAP.get(ticker, ("", ""))[0])
+    tickers = list(NSE_INDEX_NAME_MAP)
+    if not tickers:
+        return out
+
+    def _one(ticker: str) -> int:
         t_start = start or _resolve_start(ticker, cfg, full=full, latest_map=latest_map)
-        try:
-            n = ingest_ticker(ticker, start=t_start, end=end)
-        except Exception as e:  # noqa: BLE001
-            log.error("benchmark.failed", ticker=ticker, err=str(e))
+        return ingest_ticker(ticker, start=t_start, end=end)
+
+    n_workers = min(max(1, int(get_settings().benchmark_workers)), len(tickers))
+    outcomes: dict[str, int | Exception] = {}
+    if n_workers == 1:
+        for ticker in tickers:
+            try:
+                outcomes[ticker] = _one(ticker)
+            except Exception as e:  # noqa: BLE001 — per-ticker isolation; aggregate below
+                outcomes[ticker] = e
+    else:
+        with ThreadPoolExecutor(
+            max_workers=n_workers, thread_name_prefix="bench-ingest"
+        ) as pool:
+            futures = {t: pool.submit(_one, t) for t in tickers}
+            for ticker, fut in futures.items():
+                try:
+                    outcomes[ticker] = fut.result()
+                except Exception as e:  # noqa: BLE001 — per-ticker isolation; aggregate below
+                    outcomes[ticker] = e
+
+    for ticker in tickers:
+        has_nse_mapping = bool(NSE_TRI_MAP.get(ticker, ("", ""))[0])
+        o = outcomes[ticker]
+        if isinstance(o, Exception):
+            log.error("benchmark.failed", ticker=ticker, err=str(o))
             out[ticker] = 0
             if has_nse_mapping:
-                equity_failures.append(f"{ticker}: {e}")
+                equity_failures.append(f"{ticker}: {o}")
             continue
-        out[ticker] = n
-        if n == 0 and has_nse_mapping:
+        out[ticker] = o
+        if o == 0 and has_nse_mapping:
             equity_failures.append(f"{ticker}: ingest returned 0 rows")
     if equity_failures:
         raise IngestError(

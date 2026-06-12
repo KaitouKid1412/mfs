@@ -77,7 +77,6 @@ from __future__ import annotations
 
 import base64
 import json
-import logging
 import re
 import secrets
 import time
@@ -86,21 +85,14 @@ import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
 
-import pdfplumber
-
 from mfs.errors import IngestError
+from mfs.ingest._common import MONTH_NAMES, parse_ptr_pages
 from mfs.ingest.managers._base import ManagerAdapter
 from mfs.ingest.managers._registry import register_adapter
 from mfs.schemas import ParsedHoldingRecord, ParsedPtrRecord
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
-
-
-_MONTH_NAMES = (
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +109,7 @@ _API_BASE = "https://itiamc.com/jeeth/api/v1/catalog"
 # the ``fileName`` field in the documentList payload.
 def _filename_month_label(ym: str) -> str:
     y, m = map(int, ym.split("-"))
-    return f"{_MONTH_NAMES[m - 1]} {y}"
+    return f"{MONTH_NAMES[m - 1]} {y}"
 
 
 def _aes_encrypt(plaintext: str) -> str:
@@ -273,6 +265,17 @@ _PTR_SENTINEL_RE = re.compile(
 )
 
 
+def _extract_ptr(text: str) -> float | None:
+    """Return PTR as a fraction (ITI prints the fraction directly) or None."""
+    m = _PTR_RE.search(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
 def _scheme_name_from_page(text: str) -> str | None:
     """Return the printed scheme name, or None for non-scheme pages.
 
@@ -342,33 +345,17 @@ class ItiAdapter(ManagerAdapter):
     # ----------------------------------------------------------------------
 
     def parse_ptr(self, pdf_path: Path, ym: str) -> Iterable[ParsedPtrRecord]:
-        logging.getLogger("pdfminer").setLevel(logging.ERROR)
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                scheme = _scheme_name_from_page(text)
-                if not scheme:
-                    continue
-                # Drop newly-launched-scheme sentinels silently (the
-                # footnote says "Portfolio turnover ratio not provided.
-                # Since the scheme has not completed one year").
-                if _PTR_SENTINEL_RE.search(text):
-                    continue
-                m = _PTR_RE.search(text)
-                if not m:
-                    continue
-                try:
-                    ptr_value = float(m.group(1))
-                except ValueError:
-                    continue
-                # Fail-fast: drop NaN / non-positive.
-                if ptr_value != ptr_value or ptr_value <= 0:
-                    continue
-                yield ParsedPtrRecord(
-                    scheme_name_printed=scheme,
-                    ptr=ptr_value,
-                    source_amc=self.amc_slug,
-                )
+        # skip_page_re drops newly-launched-scheme sentinels silently (the
+        # footnote says "Portfolio turnover ratio not provided. Since the
+        # scheme has not completed one year"). _extract_ptr returns ITI's
+        # printed fraction directly — the unit parse_ptr_pages requires.
+        return parse_ptr_pages(
+            pdf_path,
+            scheme_name_fn=_scheme_name_from_page,
+            ptr_extract_fn=_extract_ptr,
+            amc_slug=self.amc_slug,
+            skip_page_re=_PTR_SENTINEL_RE,
+        )
 
     # ----------------------------------------------------------------------
     # Holdings — deferred. ITI's portfolio tables are two-column with

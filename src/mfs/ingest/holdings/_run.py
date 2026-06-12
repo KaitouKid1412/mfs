@@ -23,23 +23,18 @@ from mfs import paths
 from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.errors import IngestError, StatementDateMismatchError
-from mfs.ingest.holdings._generic import artifact_statement_months
-from mfs.ingest.holdings._registry import get_adapter, registered_adapters
-from mfs.ingest.managers._scheme_match import (
+from mfs.ingest import _parse_cache
+from mfs.ingest._common import _dedupe_by_keys, _default_data_month, run_all_isolated
+from mfs.ingest._scheme_match import (
     DEFAULT_THRESHOLD,
     build_candidate_index,
     match_one,
 )
+from mfs.ingest.holdings._generic import artifact_statement_months
+from mfs.ingest.holdings._registry import get_adapter, registered_adapters
 from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
-
-
-def _default_data_month(today: date | None = None) -> str:
-    d = today or date.today()
-    if d.month == 1:
-        return f"{d.year - 1:04d}-12"
-    return f"{d.year:04d}-{d.month - 1:02d}"
 
 
 # --- Per-portfolio sanity gate (B3) ----------------------------------------
@@ -164,6 +159,13 @@ def run_for_amc(
     refused so a partial re-run can't silently delete previously-good
     schemes; force replaces the partition anyway, loudly. Deletion is
     scoped to ``ym`` only — historical months are never re-fetched.
+
+    Default runs are incremental (C5): when the fetched artifact set and the
+    match universe are byte-identical to the last successful ingest and the
+    DB already holds the rows, the parse loop AND the per-month
+    DELETE+reinsert are skipped (``skipped=True`` in the result) — discovery
+    and the cached fetches still run, so late-published schemes are detected.
+    ``force`` bypasses the skip (unified --full semantics).
     """
     adapter = get_adapter(amc_slug)
     ym = ym or _default_data_month()
@@ -234,12 +236,14 @@ def run_for_amc(
             amc=amc_slug, n_dropped=len(collisions), names=collisions[:10],
         )
 
+    # Fetch loop (C5): download every winner's Excel BEFORE parsing — fetch is
+    # disk-cached unconditionally (holdings/_generic.py), so on an unchanged
+    # month this is pure cache reads. Downloading only matched schemes saves
+    # bandwidth on ETFs/FoFs that aren't ranked.
+    fetched: list[tuple[str, Path]] = []
     for scheme_name_printed, url in urls.items():
         if scheme_name_printed not in winners:
             continue  # unmatched, or a lower-scoring duplicate for its code
-        scheme_code = name_to_code[scheme_name_printed]
-        # Download + parse Excel only for matched schemes (saves bandwidth on
-        # ETFs/FoFs that aren't ranked).
         excel_filename = f"{scheme_name_printed}.xlsx"
         if force:
             # B9: --full re-downloads this data month's artifacts — evict the
@@ -257,6 +261,48 @@ def run_for_amc(
                 amc=amc_slug, scheme=scheme_name_printed, url=url, err=str(e),
             )
             continue
+        fetched.append((scheme_name_printed, excel_path))
+
+    # Incremental parse-skip (C5, behavioral parity with the managers path):
+    # if the artifact SET (every winner's printed name + Excel bytes) AND the
+    # match universe are identical to the last successful ingest, and the DB
+    # already holds those rows, re-parsing + the DELETE+reinsert of this
+    # (source_amc, month) partition is a provable no-op — skip both. The win
+    # is the churn (the ~96k-row DELETE window), not the parse CPU. `force`
+    # (--full) always re-parses; discovery HTTP above is NEVER skipped, so
+    # late-published schemes within a month still surface (their entry changes
+    # the artifact-set fingerprint and triggers a full re-parse).
+    universe_fp = _parse_cache.fingerprint(
+        f"{name}={info['scheme_code']}" for name, info in candidates.items()
+    )
+    artifact_set_fp = _parse_cache.fingerprint(
+        f"{printed}:{_parse_cache.sha256_file(path)}" for printed, path in fetched
+    )
+    marker_dir = paths.holdings_excel_raw(amc_slug, ym, "x").parent
+    if (
+        not force
+        and fetched
+        and _parse_cache.should_skip_parse_dir(
+            marker_dir, artifact_set_fp, universe_fp,
+            db_has_rows=q.has_holdings_rows(amc_slug, as_of_month),
+        )
+    ):
+        log.info("holdings.run.skip_unchanged", amc=amc_slug, ym=ym)
+        return {
+            "amc_slug": amc_slug,
+            "ym": ym,
+            "n_schemes_discovered": len(urls),
+            "n_schemes_parsed": 0,
+            "n_records": 0,
+            "rows_written": 0,
+            "skipped": True,
+            "unmatched_schemes": unmatched,
+            "weight_sum_skipped_schemes": [],
+            "too_few_holdings_skipped_schemes": [],
+        }
+
+    for scheme_name_printed, excel_path in fetched:
+        scheme_code = name_to_code[scheme_name_printed]
         n_excels_parsed += 1
         try:
             # Central statement-date screen (B2): EVERY adapter — including
@@ -333,23 +379,10 @@ def run_for_amc(
     # (scheme_code, security_name, as_of_month); Postgres' ON CONFLICT
     # DO UPDATE can't touch the same row twice in one INSERT. Keep the
     # first occurrence — order is parser output order (stable).
-    seen: set[tuple] = set()
-    deduped_rows: list[dict] = []
-    n_dropped = 0
-    for r in matched_rows:
-        k = (r["scheme_code"], r["security_name"], r["as_of_month"])
-        if k in seen:
-            n_dropped += 1
-            continue
-        seen.add(k)
-        deduped_rows.append(r)
-    if n_dropped:
-        log.info(
-            "holdings.dedupe",
-            amc=amc_slug, n_dropped=n_dropped,
-            n_kept=len(deduped_rows),
-        )
-    matched_rows = deduped_rows
+    matched_rows = _dedupe_by_keys(
+        matched_rows, ("scheme_code", "security_name", "as_of_month"),
+        amc=amc_slug,
+    )
 
     # Idempotency: a successful run of an AMC is authoritative for that AMC's
     # rows in this month. Delete ALL existing (source_amc, as_of_month) rows
@@ -397,6 +430,15 @@ def run_for_amc(
             n_written = w.upsert_holdings(pl.DataFrame(matched_rows), conn=conn)
     else:
         n_written = 0
+    # Record this successful ingest so a byte-identical re-run (same artifact
+    # set + same match universe) can skip parse + DELETE/reinsert next time
+    # (C5). Written only AFTER the rows are committed — a crash before here
+    # leaves no marker, so the next run re-parses (managers-path parity).
+    if n_written:
+        _parse_cache.write_dir_marker(
+            marker_dir, artifact_set_fp, universe_fp,
+            {"ym": ym, "n_rows": n_written, "n_schemes": len(incoming_schemes)},
+        )
     log.info(
         "holdings.run.done",
         amc=amc_slug, ym=ym,
@@ -442,27 +484,10 @@ def run_all(ym: str | None = None, force: bool = False) -> dict[str, dict]:
     slugs = registered_adapters()
     if not slugs:
         raise IngestError("No holdings adapters registered.")
-    results: dict[str, dict] = {}
-    failed: list[str] = []
-    for slug in slugs:
-        try:
-            results[slug] = run_for_amc(slug, ym=ym, force=force)
-        except Exception as e:  # noqa: BLE001 — isolate one AMC; never crash the stage
-            failed.append(slug)
-            results[slug] = {
-                "amc_slug": slug, "ym": ym,
-                "error": str(e), "error_type": type(e).__name__,
-                "rows_written": 0,
-            }
-            log.error("holdings.amc_failed", amc=slug,
-                      err=str(e), err_type=type(e).__name__)
-    if failed:
-        log.warning("holdings.run_all.partial",
-                    n_failed=len(failed), n_total=len(slugs), failed=failed)
-    if len(failed) == len(slugs):
-        raise IngestError(
-            f"All {len(slugs)} holdings adapters failed — systemic network/config "
-            f"issue, not per-AMC. Refusing to proceed silently. "
-            f"First error: {results[slugs[0]].get('error')}"
-        )
-    return results
+    return run_all_isolated(
+        "holdings",
+        slugs,
+        lambda slug: run_for_amc(slug, ym=ym, force=force),
+        ym=ym,
+        error_zero_fields=("rows_written",),
+    )

@@ -59,11 +59,12 @@ Layout findings driving the parser
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pdfplumber
 
+from mfs.ingest._common import MONTH_NAMES, parse_ptr_pages, publish_ym
 from mfs.ingest.managers._base import ManagerAdapter
 from mfs.ingest.managers._registry import register_adapter
 from mfs.schemas import ParsedHoldingRecord, ParsedPtrRecord
@@ -76,24 +77,11 @@ log = get_logger(__name__)
 # URL helpers
 # ---------------------------------------------------------------------------
 
-_MONTH_NAMES_LIST = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-]
-
-
-def _publish_ym(data_ym: str) -> str:
-    """data month YYYY-MM → publish month YYYY-MM (data + 1, with year rollover)."""
-    y, m = map(int, data_ym.split("-"))
-    if m == 12:
-        return f"{y + 1:04d}-01"
-    return f"{y:04d}-{m + 1:02d}"
-
 
 def _data_month_name(data_ym: str) -> str:
     """data month YYYY-MM → MonthName (e.g. 'April')."""
     _, m = data_ym.split("-")
-    return _MONTH_NAMES_LIST[int(m) - 1]
+    return MONTH_NAMES[int(m) - 1]
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +132,36 @@ _PTR_TEXT_RE = re.compile(
     r"Equity\s+Turnover\s+(\d+(?:\.\d+)?)\s*%",
     re.IGNORECASE,
 )
+
+
+def _extract_ptr_text(text: str) -> float | None:
+    """Strategy 1 (fast path): text regex. Returns a FRACTION (9.14% → 0.0914)
+    per the parse_ptr_pages unit convention, or None on miss."""
+    m = _PTR_TEXT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)) / 100.0
+    except ValueError:
+        return None
+
+
+def _ptr_word_fallback(page, text: str) -> float | None:
+    """Strategy 2: word-position fallback when the label is present on the
+    page but extract_text didn't capture the value cleanly (column bleed).
+
+    Relaxed gating: pages where extract_text mangles the PTR line still
+    typically retain the word 'Turnover' somewhere. ``_find_ptr_via_words``
+    bails quickly when the left-column 'Equity'/'Turnover' anchor isn't
+    present (e.g. on debt pages that legitimately omit the block) so the
+    cost is minimal. Returns a fraction (percent / 100) or None.
+    """
+    if "Turnover" not in text:
+        return None
+    val = _find_ptr_via_words(page)
+    if val is None:
+        return None
+    return val / 100.0
 
 
 def _find_ptr_via_words(page) -> float | None:
@@ -216,7 +234,7 @@ class HdfcAdapter(ManagerAdapter):
         ``files.hdfcfund.com/s3fs-public/<publish_ym>/`` with a filename
         encoding the data month name + data year.
         """
-        publish = _publish_ym(ym)
+        publish = publish_ym(ym)
         month_name = _data_month_name(ym)
         data_year = ym.split("-")[0]
         return (
@@ -229,53 +247,22 @@ class HdfcAdapter(ManagerAdapter):
     # -------------------------------------------------------------------
 
     def parse_ptr(self, pdf_path: Path, ym: str) -> Iterable[ParsedPtrRecord]:
-        import logging as _logging
-        _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                scheme = _scheme_name_from_page(text)
-                if not scheme:
-                    continue
-                # Strategy 1: text regex (fast path).
-                ptr_value: float | None = None
-                m = _PTR_TEXT_RE.search(text)
-                if m:
-                    try:
-                        ptr_value = float(m.group(1))
-                    except ValueError:
-                        ptr_value = None
-                # Strategy 2: word-position fallback if the label is present
-                # on the page but extract_text didn't capture the value
-                # cleanly (column bleed).
-                if ptr_value is None and "Turnover" in text:
-                    # Relaxed gating: pages where extract_text mangles the
-                    # PTR line still typically retain the word 'Turnover'
-                    # somewhere. The word-position fallback bails quickly
-                    # when the left-column 'Equity'/'Turnover' anchor
-                    # isn't present (e.g. on debt pages that legitimately
-                    # omit the block) so the cost is minimal.
-                    ptr_value = _find_ptr_via_words(page)
-                if ptr_value is None:
-                    continue
-                # Drop NaN / non-positive — HDFC prints a real percent or
-                # omits the block entirely; no zero-PTR scheme exists.
-                if ptr_value != ptr_value or ptr_value <= 0:
-                    continue
-                # Convert percent → fraction.
-                yield ParsedPtrRecord(
-                    scheme_name_printed=scheme,
-                    ptr=ptr_value / 100.0,
-                    source_amc=self.amc_slug,
-                )
+        # Both extractors convert HDFC's printed percent to the fraction the
+        # parse_ptr_pages unit convention requires (9.14% → 0.0914).
+        return parse_ptr_pages(
+            pdf_path,
+            scheme_name_fn=_scheme_name_from_page,
+            ptr_extract_fn=_extract_ptr_text,
+            amc_slug=self.amc_slug,
+            page_fallback_fn=_ptr_word_fallback,
+        )
 
     # ------------------------------------------------------------------
     # Holdings extraction (preserved from Phase 2.2.C)
     # ------------------------------------------------------------------
 
     def parse_holdings(self, pdf_path: Path, ym: str) -> Iterable[ParsedHoldingRecord]:
-        import logging as _logging
-        _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
+        # PDF-parser log noise is silenced at mfs.ingest._common import time.
         with pdfplumber.open(pdf_path) as pdf:
             for page_idx, page in enumerate(pdf.pages):
                 yield from self._parse_page_holdings(page, page_idx + 1)
