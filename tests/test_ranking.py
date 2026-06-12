@@ -394,8 +394,14 @@ def test_stage2_style_drift_acts_as_a_penalty():
     assert scored["scheme_code"][0] == "A"
 
 
-def test_stage2_style_drift_null_does_not_penalize():
+def test_stage2_style_drift_null_costs_fixed_penalty_in_live_cohort():
+    """D3 (A2-4): a null style_drift in a cohort where the metric is live
+    (2/3 disclosed) no longer rides free — it costs exactly the calibrated
+    missing-disclosure penalty (z contribution stays 0)."""
     import math
+
+    from mfs.config import get_pipeline_config
+
     df = pl.DataFrame([
         _row("A", style_drift_3y=None, active_share_median_1y=0.5,
              ptr_latest=0.5, aum_impact_cost_days=1.0),
@@ -406,14 +412,24 @@ def test_stage2_style_drift_null_does_not_penalize():
     ])
     z = zscore_within_category(df)
     scored = composite_score_stage2(z)
-    a = scored.filter(pl.col("scheme_code") == "A").row(0, named=True)
-    assert a["composite_score"] is not None
-    assert not math.isnan(a["composite_score"])
+    by = {r["scheme_code"]: r for r in scored.iter_rows(named=True)}
+    pen = float(get_pipeline_config().soft_penalties.missing_disclosure.penalty)
+    a = by["A"]["composite_score"]
+    b = by["B"]["composite_score"]
+    c = by["C"]["composite_score"]
+    assert a is not None and not math.isnan(a)
+    # B and C carry symmetric ±z style terms, so their mean is the
+    # no-style-term baseline shared by all three funds; A sits exactly the
+    # missing-disclosure penalty below it.
+    assert abs(a - ((b + c) / 2 - pen)) < 1e-9
+    # Missing sits between the well-behaved and the worst discloser here.
+    assert c > a > b
 
 
 def test_stage2_aum_impact_penalty_above_threshold():
     """A scheme with high aum_impact_cost_days (>5) should rank below a peer
-    with low impact cost, all else equal."""
+    with low impact cost, all else equal (A2-6 log ramp: pen(15) ≈ 0.0119,
+    pen(1) = 0)."""
     df = pl.DataFrame([
         _row("A", aum_impact_cost_days=15.0,
              active_share_median_1y=0.6, style_drift_3y=0.1, ptr_latest=0.5),
@@ -425,3 +441,33 @@ def test_stage2_aum_impact_penalty_above_threshold():
     a = scored.filter(pl.col("scheme_code") == "A").row(0, named=True)["composite_score"]
     b = scored.filter(pl.col("scheme_code") == "B").row(0, named=True)["composite_score"]
     assert b > a
+
+
+def _aum_only_composite(days):
+    """Single-fund cohort: every z is 0 and every other penalty is dead, so
+    the composite equals minus the AUM-impact penalty exactly."""
+    df = pl.DataFrame([_row("A", aum_impact_cost_days=days)])
+    z = zscore_within_category(df)
+    return composite_score_stage2(z).row(0, named=True)["composite_score"]
+
+
+def test_stage2_aum_impact_log_curve_pinned_values():
+    """A2-6: penalty = max_pen * clip(ln(days/5)/ln(500/5), 0, 1)."""
+    import math
+
+    max_pen = 0.05
+    denom = math.log(500.0 / 5.0)
+    assert abs(_aum_only_composite(5.0) - 0.0) < 1e-12          # at threshold
+    assert abs(_aum_only_composite(10.0) - (-max_pen * math.log(2.0) / denom)) < 1e-9
+    assert abs(_aum_only_composite(500.0) - (-max_pen)) < 1e-12  # saturation
+    assert abs(_aum_only_composite(924.0) - (-max_pen)) < 1e-12  # capped
+    assert abs(_aum_only_composite(None) - 0.0) < 1e-12          # null → 0 here (D3 covers it)
+
+
+def test_stage2_aum_impact_log_curve_monotone_over_observed_range():
+    """10d / 79d (Small Cap pool median) / 163d (p95) must carry strictly
+    increasing penalties — the old linear ramp flat-capped all of them."""
+    p10 = -_aum_only_composite(10.0)
+    p79 = -_aum_only_composite(79.0)
+    p163 = -_aum_only_composite(163.0)
+    assert 0 < p10 < p79 < p163 < 0.05

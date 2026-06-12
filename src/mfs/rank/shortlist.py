@@ -15,7 +15,7 @@ from mfs import paths
 from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.rank.filters import apply_hard_filters, split_core_complete
-from mfs.rank.score import composite_score_stage1
+from mfs.rank.score import STAGE1_WEIGHT_TO_COL, composite_score_stage1
 from mfs.rank.zscore import zscore_within_category
 from mfs.utils.logging import get_logger
 
@@ -72,8 +72,9 @@ EXCLUDED_OUTPUT_COLS = [
 ]
 
 # D2 run history: flat z-score columns mirrored from the stage CSVs into the
-# rank_history table. The first eight are Stage 1's; the last two are the
-# Phase 2 z-scores Stage 2 adds when it re-z-scores the survivor pool.
+# rank_history table. The first eight are Stage 1's full-universe z-scores
+# (carried unchanged into Stage 2 since A2-5); the last two are the Phase 2
+# z-scores Stage 2 computes within the per-category pool.
 RANK_HISTORY_Z_COLS = [
     "z_ret_3y_median",
     "z_ret_3y_p25",
@@ -544,8 +545,10 @@ def rank_deep(
     Stage 1: load computed_metrics, hard-filter, z-score, ``composite_score_stage1``,
     dedupe; write ``<as_of>/stage1/``.
     Stage 2: take top ``pool_size`` per category from Stage 1, run Phase 2
-    compute on just those schemes (unless ``skip_phase2_compute=True``), then
-    re-z-score and re-composite with Stage 2 weights; write ``<as_of>/stage2/``.
+    compute on just those schemes (unless ``skip_phase2_compute=True``), carry
+    Stage 1's full-universe z-scores, z-score the Phase 2 metrics within each
+    pool and re-composite with Stage 2 weights (D3: disclosure nulls are
+    flagged + penalized, never dropped); write ``<as_of>/stage2/``.
     Stage 3: iterative pairwise-overlap drop on Stage 2 survivors; write
     ``<as_of>/stage3/``.
 
@@ -600,10 +603,21 @@ def rank_deep(
             candidates_with_phase2 = candidates_with_phase2.join(
                 sa, on="scheme_code", how="left",
             )
-        # Re-score with Stage 1 weights so stage2.apply_stage2 has the
-        # ``composite_score_stage1`` it needs for pool ranking.
-        zscored = zscore_within_category(candidates_with_phase2)
-        scored_pool = composite_score_stage1(zscored)
+        # A2-5: carry Stage 1's full-universe z-scores + composite into the
+        # pool instead of re-z-scoring the range-restricted top-20 cohort
+        # (which both distorted z statistics and made stage1_rank disagree
+        # with the universe composite). The raw Phase 2 metric columns come
+        # from the reload above; their z-scores are computed inside
+        # stage2.apply_stage2 within the per-category pool — the maximal
+        # cohort where those metrics exist.
+        carried_cols = [
+            c for c in ("scheme_code", *STAGE1_WEIGHT_TO_COL.values(), "composite_score")
+            if c in scored_stage1.columns
+        ]
+        carried = scored_stage1.select(carried_cols).unique(
+            subset=["scheme_code"], keep="first",
+        )
+        scored_pool = candidates_with_phase2.join(carried, on="scheme_code", how="left")
         aum_map = _build_aum_map(scored_pool, as_of=as_of)
         stage2_result = stage2_mod.run(
             scored_pool, aum_map, out_dir,

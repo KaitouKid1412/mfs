@@ -79,7 +79,7 @@ If `pyproject.toml` is missing → STOP (wrong directory). If `uv` is missing �
 - **compute phase1** — Performance & Consistency metrics for every eligible Direct+Growth scheme. CPU-bound; benign statsmodels RuntimeWarnings ("divide by zero", "degrees of freedom") appear — mention once, ignore.
 - **rank-deep** — the production ranking, three stages (Phase 2 compute runs internally on the Stage-1 pool):
   - **Stage 1** — Phase-1-only composite, hard filters + D2 core-metric gate (funds missing any core Stage-1 metric are hard-dropped, never scored as average), per-category ranking. → `<as_of>/stage1/`, including `excluded.csv` (always written; one row per dropped fund with `exclusion_reason` — `INSUFFICIENT_HISTORY | MISSING_CORE_METRIC:<name> | STALE_NAV | FILTER:<name>` — and `missing_core_metrics`).
-  - **Stage 2** — take top-20/category, drop funds missing a **required Phase-2 metric** (`style_drift_3y`, `ptr_latest`, `aum_impact_cost_days`), re-rank with Stage-2 weights, keep top-5. **`active_share` is NOT required** (it's a soft signal, currently null universe-wide until ≥3 months of holdings+constituents accumulate). → `<as_of>/stage2/` with `coverage.csv` + `dropped.csv`.
+  - **Stage 2** — take top-20/category, re-rank with Stage-2 weights, keep top-5. **D3: nobody is dropped for a missing Phase-2 disclosure metric** (`ptr_latest`, `style_drift_3y`, `aum_impact_cost_days`, `active_share_median_1y`) — the fund is flagged (`partial_disclosure_flag` + `missing_disclosures` columns), its missing positive weight is renormalized, and a calibrated fixed penalty applies per missing metric that is live in its category pool (`soft_penalties.missing_disclosure` in pipeline.yaml). `active_share` is renormalize-only while null universe-wide (until ≥3 months of holdings+constituents accumulate). → `<as_of>/stage2/` with `coverage.csv` (`n_partial_disclosure` per category) + a vestigial header-only `dropped.csv`.
   - **Stage 3** — iterative pairwise portfolio-overlap **DROP** (cross-category): repeatedly drop the worse-ranked fund of the highest-overlap pair >30% until none remain. → `<as_of>/stage3/` with `dropped.csv` (each drop names the kept fund + shared holdings) + `overlap_pairs.csv`. **Note: this DROPS funds — it is not informational.**
 
 ## Post-run review (after `mfs pipeline` succeeds)
@@ -91,7 +91,7 @@ If `pyproject.toml` is missing → STOP (wrong directory). If `uv` is missing �
    echo "latest run: $AS"
    column -t -s, data/output/shortlist/$AS/stage2/coverage.csv | head -30
    echo "--- stage1 excluded (hard-filter + D2 core-metric drops) ---"; column -t -s, data/output/shortlist/$AS/stage1/excluded.csv | head -20
-   echo "--- stage2 data-drops (missing required Phase-2 metric) ---"; column -t -s, data/output/shortlist/$AS/stage2/dropped.csv | head
+   echo "--- stage2 partial-disclosure flags (D3 soft-neutral; dropped.csv is header-only by design) ---"; column -t -s, data/output/shortlist/$AS/stage2/coverage.csv | awk 'NR==1 || $0 ~ /partial/' | head
    echo "--- stage3 overlap drops (dropped -> kept) ---"; column -t -s, data/output/shortlist/$AS/stage3/dropped.csv | head -40
    ```
 3. Structural sanity-check on the Stage-1 outputs (these ARE parquet files; the per-table data is in Postgres):
@@ -142,7 +142,7 @@ print("computed:",m.height," after data-quality:",d.height)
 PY
 ```
 
-If Stage 2 is near-empty, the usual cause is **missing Phase-2 data**, NOT filters — i.e. `ingest holdings` / `ingest amfi-aum` / `ingest managers` / `ingest bhavcopy` didn't populate, so `ptr_latest` / `aum_impact_cost_days` are null and Stage 2's completeness filter drops everyone. Check `stage2/dropped.csv`'s `missing_metrics` column. Re-run the missing ingest stage. Only relax filters (via `AskUserQuestion`, unless `--no-rank-ask`) if the funnel shows a metric floor is the culprit — and **announce any `configs/pipeline.yaml` change before making it** (since A2-1 the yaml `filters:` block IS the live floors — `filters.py` reads it directly, so a yaml edit changes hard-filtering on the next run).
+If Stage 2 looks degraded, the usual cause is **missing Phase-2 data**, NOT filters — i.e. `ingest holdings` / `ingest amfi-aum` / `ingest managers` / `ingest bhavcopy` didn't populate, so `ptr_latest` / `aum_impact_cost_days` are null. Since D3 nobody is *dropped* for that — affected funds carry `partial_disclosure_flag=true` + a `missing_disclosures` column and a fixed composite penalty instead (`stage2/dropped.csv` is vestigial, always header-only). Check `n_partial_disclosure` in `stage2/coverage.csv` and the `missing_disclosures` column in the stage-2 CSVs. Re-run the missing ingest stage. Only relax filters (via `AskUserQuestion`, unless `--no-rank-ask`) if the funnel shows a metric floor is the culprit — and **announce any `configs/pipeline.yaml` change before making it** (since A2-1 the yaml `filters:` block IS the live floors — `filters.py` reads it directly, so a yaml edit changes hard-filtering on the next run).
 
 ## Diagnose-and-halt playbook
 

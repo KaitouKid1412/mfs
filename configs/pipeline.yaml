@@ -120,5 +120,26 @@ soft_penalties:
     enabled: true
     max_penalty: 0.05
     threshold_days: 5.0    # days-to-liquidate above 5 begins the ramp
+    # A2-6: log-scale ramp — penalty = max_penalty *
+    # clip(ln(days/threshold_days)/ln(saturation_days/threshold_days), 0, 1).
+    # Calibrated vs the survivor distribution (median ~13d / Small Cap median
+    # 79d / p95 163d / max 924d): 10d -> ~0.0075, 79d -> ~0.030,
+    # 163d -> ~0.038, >=500d -> 0.05 (cap).
+    saturation_days: 500
+  missing_disclosure:
+    enabled: true
+    # D3 (A2-4): fixed penalty applied once per missing *live* disclosure
+    # metric (ptr_latest / style_drift_3y / aum_impact_cost_days /
+    # active_share_median_1y once it activates) — soft-neutral replacement for
+    # the old hard drop. CALIBRATION (2026-06-13, on the live 2026-06-12
+    # rank_history partition; re-derive after any recompute):
+    #   SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY pen)
+    #          FILTER (WHERE pen > 0)
+    #   FROM (SELECT LEAST(0.05, GREATEST(0, (ptr_latest - 1.5)/1.5) * 0.05)
+    #                AS pen
+    #         FROM rank_history
+    #         WHERE as_of_date = '2026-06-12' AND stage = 2 AND included) t;
+    #   -> 0.025667 (6 of 114 survivors penalized) -> round(., 3) = 0.026.
+    penalty: 0.026
 
 pipeline_version: "v2.3.0-phase2.3a"

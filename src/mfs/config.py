@@ -120,13 +120,30 @@ class PtrPenalty(BaseModel):
 class AumImpactCostPenalty(BaseModel):
     """Soft-penalty curve for AUM Impact Cost (days-to-liquidate).
 
-    Mirrors PtrPenalty but on a days scale: the ramp begins at
-    ``threshold_days`` and caps at ``max_penalty``. Null impact-cost → exempt
-    (the row didn't reach Stage 2 anyway if Phase 2.3.C couldn't measure it).
+    A2-6: log-scale ramp (replaces the linear ramp that saturated at ~10
+    days against a Small Cap pool median of 79):
+
+        penalty(days) = max_penalty × clip(ln(days / threshold_days)
+                                           / ln(saturation_days / threshold_days), 0, 1)
+
+    for days > threshold_days, else 0. Null impact-cost → 0 here (D3's
+    missing-disclosure penalty covers the null instead).
     """
     enabled: bool = True
     max_penalty: float = 0.05
     threshold_days: float = 5.0
+    saturation_days: float = 500.0
+
+
+class MissingDisclosurePenalty(BaseModel):
+    """D3 (A2-4): fixed penalty applied once per missing *live* disclosure
+    metric (PTR / style-drift / AUM-impact / active-share once it activates)
+    instead of hard-dropping the fund at Stage 2. Calibrated to the median
+    non-zero PTR penalty among stage-2 survivors so missing scores like
+    average-bad, never better than disclosed-bad. The yaml value is the
+    calibrated source of truth; this default mirrors it."""
+    enabled: bool = True
+    penalty: float = 0.026
 
 
 class SoftPenaltiesConfig(BaseModel):
@@ -136,6 +153,9 @@ class SoftPenaltiesConfig(BaseModel):
     """
     ptr: PtrPenalty = Field(default_factory=PtrPenalty)
     aum_impact_cost: AumImpactCostPenalty = Field(default_factory=AumImpactCostPenalty)
+    missing_disclosure: MissingDisclosurePenalty = Field(
+        default_factory=MissingDisclosurePenalty
+    )
 
 
 class PipelineConfig(BaseModel):

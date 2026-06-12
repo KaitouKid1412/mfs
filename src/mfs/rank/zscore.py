@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import polars as pl
 
@@ -34,13 +36,22 @@ def _zscore_one(arr: np.ndarray) -> np.ndarray:
     return clipped
 
 
-def zscore_within_category(df: pl.DataFrame) -> pl.DataFrame:
+def zscore_within_category(
+    df: pl.DataFrame, metrics: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """Z-score ``metrics`` (default: all ``Z_METRICS``) within each category.
+
+    ``metrics`` restricts which columns are (re)computed — A2-5: Stage 2
+    carries Stage 1's full-universe Phase-1 z-scores and re-z-scores only the
+    pool-scoped Phase 2 metrics, so it must not clobber the carried columns.
+    """
     if df.is_empty():
         return df
+    targets = Z_METRICS if metrics is None else tuple(metrics)
     # Skip metrics that aren't materialized in the input frame. Phase 2 columns
     # (active_share_median_1y, style_drift_3y) may be absent on early test
     # fixtures or during Phase 2.0 when the ingestion stages haven't shipped yet.
-    present = [m for m in Z_METRICS if m in df.columns]
+    present = [m for m in targets if m in df.columns]
     if not present:
         return df
     result_cols: dict[str, list[float]] = {f"z_{m}": [0.0] * df.height for m in present}
