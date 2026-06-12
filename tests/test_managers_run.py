@@ -48,13 +48,13 @@ def _holding(name: str, security: str, weight: float) -> ParsedHoldingRecord:
 def test_ptr_collision_keeps_higher_score_not_parse_order():
     # Lower-scoring (typo) name parses FIRST; the exact name must still win.
     records = [
-        _ptr("ABC Flexi Cap Fundd", 99.0),
-        _ptr("ABC Flexi Cap Fund", 42.0),
+        _ptr("ABC Flexi Cap Fundd", 9.9),
+        _ptr("ABC Flexi Cap Fund", 4.2),
     ]
     out = _resolve_ptr(records, _CANDIDATES, _AMC, _YM)
     assert len(out) == 1
     assert out[0]["scheme_code"] == "F1"
-    assert out[0]["ptr"] == 42.0
+    assert out[0]["ptr"] == 4.2
     assert out[0]["as_of_month"] == date(2026, 4, 1)
 
 
@@ -62,8 +62,8 @@ def test_ptr_collision_loser_is_logged_loudly():
     from structlog.testing import capture_logs
 
     records = [
-        _ptr("ABC Flexi Cap Fundd", 99.0),
-        _ptr("ABC Flexi Cap Fund", 42.0),
+        _ptr("ABC Flexi Cap Fundd", 9.9),
+        _ptr("ABC Flexi Cap Fund", 4.2),
     ]
     with capture_logs() as logs:
         _resolve_ptr(records, _CANDIDATES, _AMC, _YM)
@@ -90,9 +90,9 @@ def test_match_threshold_is_passed_through():
     # threshold=99 rejects the ~97-scoring typo name (previously the
     # parameter was dead and DEFAULT_THRESHOLD always applied); the exact
     # name still matches via canonical equality.
-    records = [_ptr("ABC Flexi Cap Fundd", 99.0), _ptr("ABC Flexi Cap Fund", 42.0)]
+    records = [_ptr("ABC Flexi Cap Fundd", 9.9), _ptr("ABC Flexi Cap Fund", 4.2)]
     out = _resolve_ptr(records, _CANDIDATES, _AMC, _YM, match_threshold=99)
-    assert [r["ptr"] for r in out] == [42.0]
+    assert [r["ptr"] for r in out] == [4.2]
 
     holdings = [_holding("ABC Flexi Cap Fundd", "Poacher Security A", 50.0)]
     assert _resolve_holdings(holdings, _CANDIDATES, _AMC, _YM, match_threshold=99) == []

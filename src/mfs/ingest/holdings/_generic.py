@@ -458,7 +458,10 @@ class GenericHoldingsAdapter(HoldingsAdapter):
         out = paths.holdings_excel_raw(self.amc_slug, ym, scheme_filename)
         if out.exists():
             return out
-        return download_to(url, out)
+        # expect='excel' validates magic bytes (xlsx zip OR legacy OLE2 .xls)
+        # before caching; an HTML error/WAF page served as 200 raises
+        # IngestError and is never written.
+        return download_to(url, out, expect="excel")
 
     def parse_excel(
         self, excel_path: Path, scheme_name_printed: str, ym: str,

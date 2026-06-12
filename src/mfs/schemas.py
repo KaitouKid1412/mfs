@@ -3,13 +3,21 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class NavDaily(BaseModel):
+    """One (scheme_code, nav_date) NAV row.
+
+    nav must be strictly positive: AMFI publishes 0.00000 for segregated /
+    wound-up plans, and a zero NAV poisons log-return math downstream
+    (log(0) = -inf). Enforced at parse time in ingest.amfi_nav and by the
+    chk_nav_positive CHECK in schema.sql; this model documents the contract
+    (it is not instantiated on the hot ingest path).
+    """
     scheme_code: str
     nav_date: date
-    nav: float
+    nav: float = Field(gt=0)
     isin_growth: Optional[str] = None
     isin_idcw: Optional[str] = None
     scheme_name: Optional[str] = None
@@ -79,13 +87,19 @@ class Holding(BaseModel):
     optional and gets backfilled at compute time by joining against
     index_constituents_monthly on normalized security_name.
 
-    weight_pct is in percent (0-100). instrument_type is the normalized
-    section label from the AMC factsheet.
+    weight_pct is in percent (0-100). Bounds allow small negatives (shorts /
+    derivatives margin) and modest >100 leverage: ge=-5, le=110. Anything
+    outside is a parse/unit error, not a portfolio. instrument_type is the
+    normalized section label from the AMC factsheet.
+
+    NOTE: this model is currently declarative only — the holdings write path
+    builds dicts/DataFrames directly and never instantiates it. Runtime
+    enforcement happens on ParsedHoldingRecord (adapter output).
     """
     scheme_code: str
     security_name: str
     as_of_month: date
-    weight_pct: float
+    weight_pct: float = Field(ge=-5, le=110)
     isin: Optional[str] = None
     instrument_type: str
     source_amc: str
@@ -97,10 +111,14 @@ class ParsedHoldingRecord(BaseModel):
 
     `security_name` is required; `isin` is optional and usually absent because
     factsheet portfolios don't print ISINs.
+
+    weight_pct bounds (B14): ge=-5 (shorts / derivatives margin), le=110
+    (modest leverage). A value outside this band means the adapter picked up
+    a wrong column or a non-percent unit — refuse at parse rather than store.
     """
     scheme_name_printed: str
     security_name: str
-    weight_pct: float
+    weight_pct: float = Field(ge=-5, le=110)
     isin: Optional[str] = None
     instrument_type: str
     source_amc: str
@@ -119,18 +137,29 @@ class PortfolioTurnover(BaseModel):
     """One (scheme, as_of_month) PTR row.
 
     ptr is stored as a fraction: a fund with 127% turnover has ptr=1.27.
+    Plausibility bounds (B14): gt=0, le=25 (2500% annualized — beyond any
+    real fund; a higher value means a percent-vs-fraction unit flip).
+
+    NOTE: this model is currently declarative only — the PTR write path
+    builds dicts/DataFrames directly and never instantiates it. Runtime
+    enforcement happens on ParsedPtrRecord (adapter output).
     """
     scheme_code: str
     as_of_month: date
-    ptr: float
+    ptr: float = Field(gt=0, le=25)
     source_amc: str
     computed_at: datetime
 
 
 class ParsedPtrRecord(BaseModel):
-    """Adapter output for one (scheme, ptr) pair before scheme_code matching."""
+    """Adapter output for one (scheme, ptr) pair before scheme_code matching.
+
+    ptr is a FRACTION (127% turnover -> 1.27). Bounds (B14): gt=0, le=25 —
+    a value above 25 (2500%) is a percent value leaking through without the
+    /100 conversion; refuse at parse rather than store a 100x-wrong PTR.
+    """
     scheme_name_printed: str
-    ptr: float
+    ptr: float = Field(gt=0, le=25)
     source_amc: str
     # Optional period stamp. Monthly-factsheet adapters leave this None and the
     # orchestrator stamps the run's data month. Adapters that source PTR from a

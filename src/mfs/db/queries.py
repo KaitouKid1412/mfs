@@ -9,6 +9,7 @@ Each function is a thin wrapper around `psycopg.connect().execute()` followed by
 from __future__ import annotations
 
 from datetime import date
+from typing import NamedTuple
 
 import polars as pl
 
@@ -274,7 +275,7 @@ def latest_ptr_date() -> date | None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2.3: stock ADV / AUM / stress test readers
+# Phase 2.3: stock ADV / AUM readers
 # ---------------------------------------------------------------------------
 
 
@@ -527,3 +528,256 @@ def rank_history_dates() -> list[date]:
             "SELECT DISTINCT as_of_date FROM rank_history ORDER BY as_of_date"
         ).fetchall()
     return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# F-3: CLI diagnostics readers (status / db coverage / missing-data / validate)
+#
+# Pure read-side functions returning structured rows — no typer, no printing.
+# The CLI commands are thin formatters over these.
+# ---------------------------------------------------------------------------
+
+
+# Per-table date column used for row-count + date-bound diagnostics. Also the
+# allowlist guarding the f-string table interpolation below.
+_TABLE_DATE_COLUMNS: dict[str, str] = {
+    "nav_daily": "nav_date",
+    "benchmark_daily": "date",
+    "risk_free_daily": "date",
+    "scheme_master": "last_seen_date",
+    "computed_metrics": "as_of_date",
+    "fund_log_returns": "date",
+}
+
+#: Tables reported by `mfs status` / `mfs db status`, in display order.
+STATUS_TABLES: list[str] = list(_TABLE_DATE_COLUMNS)
+
+
+def table_bounds(table: str) -> tuple[int, date | None, date | None]:
+    """(row_count, min_date, max_date) for one of the STATUS_TABLES."""
+    col = _TABLE_DATE_COLUMNS[table]  # KeyError on unknown table by design
+    with connect() as c:
+        n, mn, mx = c.execute(
+            f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {table}"
+        ).fetchone()
+    return n, mn, mx
+
+
+def table_count(table: str) -> int:
+    """Row count for one of the STATUS_TABLES."""
+    if table not in _TABLE_DATE_COLUMNS:
+        raise KeyError(table)
+    with connect() as c:
+        return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def trading_calendar_bounds(since: date) -> tuple[int, date | None, date | None]:
+    """(count, first, last) of NIFTY 50 TRI trading days on/after ``since`` —
+    the reference calendar for the coverage diagnostics."""
+    with connect() as c:
+        n, mn, mx = c.execute(
+            "SELECT COUNT(*), MIN(date), MAX(date) FROM benchmark_daily "
+            "WHERE ticker = 'NIFTY 50 TRI' AND date >= %s",
+            (since,),
+        ).fetchone()
+    return n, mn, mx
+
+
+def benchmark_gap_report(
+    since: date,
+) -> list[tuple[str, int, int, int, date | None, date | None]]:
+    """Per benchmark ticker: (ticker, expected, actual, missing, first, last)
+    vs the NIFTY 50 TRI trading calendar since ``since``. Worst gaps first."""
+    with connect() as c:
+        return c.execute(
+            """
+            WITH cal AS (
+                SELECT date FROM benchmark_daily
+                WHERE ticker = 'NIFTY 50 TRI' AND date >= %s
+            ),
+            tickers AS (SELECT DISTINCT ticker FROM benchmark_daily)
+            SELECT t.ticker,
+                   (SELECT COUNT(*) FROM cal) AS expected,
+                   COUNT(bd.date) AS actual,
+                   (SELECT COUNT(*) FROM cal) - COUNT(bd.date) AS missing,
+                   MIN(bd.date) AS first_day, MAX(bd.date) AS last_day
+            FROM tickers t
+            CROSS JOIN cal c
+            LEFT JOIN benchmark_daily bd
+              ON bd.ticker = t.ticker AND bd.date = c.date
+            GROUP BY t.ticker
+            ORDER BY missing DESC, t.ticker;
+            """,
+            (since,),
+        ).fetchall()
+
+
+class RiskFreeGapReport(NamedTuple):
+    """Risk-free trading-day coverage vs the NIFTY 50 TRI calendar."""
+
+    rf_min: date
+    rf_max: date
+    #: Calendar days before the first rf observation (necessarily unfilled).
+    n_pre: int
+    #: Calendar days on/after rf_min with no rf row (should be empty —
+    #: forward-fill at ingest should cover every trading day).
+    missing_dates: list[date]
+
+
+def risk_free_gap_report(since: date) -> RiskFreeGapReport | None:
+    """Risk-free coverage vs the trading calendar since ``since``.
+    None when risk_free_daily is empty."""
+    with connect() as c:
+        rf_min, rf_max = c.execute(
+            "SELECT MIN(date), MAX(date) FROM risk_free_daily"
+        ).fetchone()
+        if rf_min is None:
+            return None
+        missing = c.execute(
+            """
+            SELECT c.date FROM (
+                SELECT date FROM benchmark_daily
+                WHERE ticker = 'NIFTY 50 TRI' AND date >= %s
+            ) c
+            LEFT JOIN risk_free_daily rf ON rf.date = c.date
+            WHERE c.date >= %s AND rf.date IS NULL
+            ORDER BY c.date
+            """,
+            (since, rf_min),
+        ).fetchall()
+        n_pre = c.execute(
+            "SELECT COUNT(*) FROM benchmark_daily "
+            "WHERE ticker = 'NIFTY 50 TRI' AND date >= %s AND date < %s",
+            (since, rf_min),
+        ).fetchone()[0]
+    return RiskFreeGapReport(rf_min, rf_max, n_pre, [r[0] for r in missing])
+
+
+def nav_coverage_report(
+    since: date, rankable_categories: list[str], min_inception_year: int,
+) -> list[tuple]:
+    """Per active rankable Direct+Growth scheme (inception year >=
+    ``min_inception_year``): (scheme_code, scheme_name, inception_date,
+    last_seen_date, expected_days, actual_days, missing_days) vs the NIFTY 50
+    TRI trading calendar since ``since``. Worst coverage first."""
+    with connect() as c:
+        return c.execute(
+            """
+            WITH cal AS (
+                SELECT date FROM benchmark_daily
+                WHERE ticker = 'NIFTY 50 TRI' AND date >= %s
+            ),
+            eligible AS (
+                SELECT scheme_code, scheme_name, inception_date, last_seen_date
+                FROM scheme_master
+                WHERE is_active
+                  AND plan_type = 'DIRECT'
+                  AND option_type = 'GROWTH'
+                  AND canonical_category = ANY(%s)
+                  AND EXTRACT(YEAR FROM inception_date) >= %s
+            ),
+            expected AS (
+                SELECT e.scheme_code,
+                       COUNT(*) AS expected_days
+                FROM eligible e
+                JOIN cal c ON c.date >= e.inception_date
+                          AND c.date <= LEAST(e.last_seen_date, (SELECT MAX(date) FROM cal))
+                GROUP BY e.scheme_code
+            ),
+            actual AS (
+                SELECT n.scheme_code, COUNT(*) AS actual_days
+                FROM nav_daily n
+                JOIN cal c ON c.date = n.nav_date
+                WHERE n.scheme_code IN (SELECT scheme_code FROM eligible)
+                GROUP BY n.scheme_code
+            )
+            SELECT e.scheme_code, e.scheme_name,
+                   e.inception_date, e.last_seen_date,
+                   COALESCE(exp.expected_days, 0) AS expected_days,
+                   COALESCE(act.actual_days, 0) AS actual_days,
+                   COALESCE(exp.expected_days, 0) - COALESCE(act.actual_days, 0) AS missing_days
+            FROM eligible e
+            LEFT JOIN expected exp ON exp.scheme_code = e.scheme_code
+            LEFT JOIN actual   act ON act.scheme_code = e.scheme_code
+            ORDER BY missing_days DESC, e.scheme_code
+            """,
+            (since, list(rankable_categories), min_inception_year),
+        ).fetchall()
+
+
+def benchmark_inventory(
+    since: date,
+) -> list[tuple[str, int, date | None, date | None]]:
+    """Per benchmark ticker since ``since``: (ticker, rows, first, last)."""
+    with connect() as c:
+        return c.execute(
+            "SELECT ticker, COUNT(*), MIN(date), MAX(date) "
+            "FROM benchmark_daily WHERE date >= %s GROUP BY ticker ORDER BY ticker",
+            (since,),
+        ).fetchall()
+
+
+def nav_per_scheme_inventory(
+    since: date,
+) -> list[tuple[str, date, date, int, int]]:
+    """Per scheme with any NAV since ``since``: (scheme_code, first, last,
+    observed_days, expected_bdays) where expected_bdays approximates business
+    days in the scheme's own [first, last] window."""
+    with connect() as c:
+        return c.execute(
+            """
+            SELECT scheme_code, MIN(nav_date), MAX(nav_date), COUNT(DISTINCT nav_date),
+                   CAST((MAX(nav_date) - MIN(nav_date)) / 7.0 * 5 AS INT) AS expected_bdays
+            FROM nav_daily WHERE nav_date >= %s GROUP BY scheme_code
+            """,
+            (since,),
+        ).fetchall()
+
+
+#: Minimum NIFTY 50 TRI CAGR (fraction) below which the series is suspected
+#: of being a price-return (PR) index rather than total-return (TRI).
+TRI_SANITY_MIN_CAGR = 0.10
+
+
+class TriCagrSanity(NamedTuple):
+    """NIFTY 50 TRI CAGR over [start_date, end_date]; ok=False → SUSPECT."""
+
+    cagr: float
+    start_date: date
+    end_date: date
+    ok: bool
+
+
+def tri_cagr_sanity(start: date) -> TriCagrSanity | None:
+    """CAGR of NIFTY 50 TRI from its first close on/after ``start`` to its
+    latest close, classified against TRI_SANITY_MIN_CAGR. None when there is
+    no TRI history on/after ``start``."""
+    with connect() as c:
+        row = c.execute(
+            "SELECT MIN(close), MAX(close), MIN(date), MAX(date) "
+            "FROM benchmark_daily WHERE ticker = 'NIFTY 50 TRI' AND date >= %s",
+            (start,),
+        ).fetchone()
+        if not row or row[0] is None:
+            return None
+        _, _, d_start, d_end = row
+        # Need the start close (not min), so query the boundary closes
+        start_close = c.execute(
+            "SELECT close FROM benchmark_daily WHERE ticker = 'NIFTY 50 TRI' "
+            "AND date = %s", (d_start,),
+        ).fetchone()[0]
+        end_close = c.execute(
+            "SELECT close FROM benchmark_daily WHERE ticker = 'NIFTY 50 TRI' "
+            "AND date = %s", (d_end,),
+        ).fetchone()[0]
+    years = (d_end - d_start).days / 365.25
+    cagr = (end_close / start_close) ** (1 / years) - 1
+    return TriCagrSanity(cagr, d_start, d_end, cagr > TRI_SANITY_MIN_CAGR)
+
+
+def nav_table_counts() -> tuple[int, int]:
+    """(total_rows, distinct_schemes) in nav_daily."""
+    with connect() as c:
+        return c.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT scheme_code) FROM nav_daily"
+        ).fetchone()

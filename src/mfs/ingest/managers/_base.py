@@ -53,7 +53,9 @@ class ManagerAdapter(ABC):
 
         Override when the AMC needs referer chains, form posts, etc.
         Re-uses an existing cached PDF unconditionally — delete the file to
-        force a re-fetch.
+        force a re-fetch. The payload's magic bytes are validated before
+        caching (``expect='pdf'``): a WAF/SPA HTML shell served as 200
+        raises ``IngestError`` and is never written.
         """
         from mfs import paths
         from mfs.io.http import download_to
@@ -62,7 +64,7 @@ class ManagerAdapter(ABC):
         if out.exists():
             return out
         url = self.build_url(ym)
-        return download_to(url, out)
+        return download_to(url, out, expect="pdf")
 
     def parse_holdings(self, pdf_path: Path, ym: str) -> Iterable[ParsedHoldingRecord]:
         """Extract one (scheme, isin, weight) row per portfolio line. Default

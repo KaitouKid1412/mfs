@@ -15,6 +15,17 @@ CREATE TABLE IF NOT EXISTS nav_daily (
     PRIMARY KEY (scheme_code, nav_date)
 );
 
+-- A1-1: zero/negative NAVs are rejected at ingest (amfi_nav.parse_amfi_text
+-- skips them) and refused at the DB boundary by this CHECK. Added NOT VALID
+-- so `mfs db init` can run BEFORE the legacy zero-NAV rows are deleted (the
+-- constraint still applies to all NEW writes immediately). After the cleanup
+-- DELETE, run:
+--   ALTER TABLE nav_daily VALIDATE CONSTRAINT chk_nav_positive;
+-- Note: re-running db init re-creates the constraint as NOT VALID; new writes
+-- stay checked either way — re-VALIDATE to re-assert the whole-table guarantee.
+ALTER TABLE nav_daily DROP CONSTRAINT IF EXISTS chk_nav_positive;
+ALTER TABLE nav_daily ADD CONSTRAINT chk_nav_positive CHECK (nav > 0) NOT VALID;
+
 CREATE TABLE IF NOT EXISTS benchmark_daily (
     ticker          TEXT             NOT NULL,
     date            DATE             NOT NULL,

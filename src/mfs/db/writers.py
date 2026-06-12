@@ -448,7 +448,7 @@ def upsert_portfolio_turnover(df: pl.DataFrame, conn: psycopg.Connection | None 
 
 
 # ---------------------------------------------------------------------------
-# Phase 2.3: stock ADV / AUM / stress test
+# Phase 2.3: stock ADV / AUM
 # ---------------------------------------------------------------------------
 
 

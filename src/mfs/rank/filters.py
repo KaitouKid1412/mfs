@@ -28,12 +28,9 @@ INFO_RATIO_FLOOR = -1.00             # was 0.20
 R_SQUARED_BAND = (0.40, 1.00)        # was (0.70, 0.98); upper bound removed for index funds
 BETA_BAND_GENERIC = (0.30, 1.70)     # was per-category tight bands
 
-# Phase 2.3.F: SEBI stress test hard filter. Applies ONLY to Mid Cap and
-# Small Cap funds (the categories where SEBI's March 2024 mandate applies);
-# pass-through for everything else. Drop schemes where the most recent
-# days-to-liquidate-50 disclosure exceeds the threshold.
-# Stress test filter removed when manager-tenure and stress-test extraction
-# were retired (user verifies these manually for Stage 2 survivors).
+# The Phase 2.3.F SEBI stress-test hard filter was removed when manager-tenure
+# and stress-test extraction were retired (user verifies these manually for
+# Stage 2 survivors).
 
 
 def _exclusion_reason_expr(rankable: set[str]) -> pl.Expr:

@@ -87,6 +87,7 @@ offsets (name=2, ISIN=3, weight=8).
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import re
 import time
@@ -98,12 +99,14 @@ import httpx
 import openpyxl
 
 from mfs import paths
+from mfs.errors import IngestError
 from mfs.ingest.holdings._generic import (
     GenericHoldingsAdapter,
     classify_section,
     is_isin,
 )
 from mfs.ingest.holdings._registry import register_adapter
+from mfs.io.content_check import sniff_kind
 from mfs.schemas import ParsedHoldingRecord
 from mfs.utils.logging import get_logger
 
@@ -152,6 +155,34 @@ _COL_WEIGHT = 8
 # better to spend seconds retrying than silently lose a ranked scheme).
 _MAX_RETRIES = 20
 _RETRY_SLEEP_S = 1.5
+
+# --- Absent-month probe + TTL'd negative cache (B11) ------------------------
+#
+# The generous per-scheme retry budget above is correct for a PUBLISHED month
+# (real flakiness needs it) but pathological for an UNPUBLISHED one: during
+# the first ~10 days of a month every one of ~120 schemes burns the full
+# 20 x 1.5s budget — ~2.6h of guaranteed-dead retries per run. Before building
+# any download URL, discovery probes whether the month exists at all: TWO
+# stable flagship fund codes (two, so one delisted fund can't false-negative)
+# each get a SMALL folderlist budget. The transient-400 flakiness self-heals
+# within seconds, so 5 attempts x 1.5s per code is ample for a published
+# month; a truly absent month 400s deterministically on every attempt. If
+# BOTH probes exhaust their budget, we write a TTL'd negative-cache marker
+# (data/raw/holdings/kotak/<ym>/.month_absent, ISO-8601 UTC timestamp inside)
+# and raise IngestError — the holdings orchestrator's per-AMC isolation
+# records the gap and the run continues (no half-data: the AMC is skipped
+# entirely). While the marker is younger than the TTL, subsequent runs raise
+# immediately with ZERO HTTP calls; an older marker is deleted and the month
+# re-probed, so a newly published month is picked up at most ~a day late and
+# the marker clears itself naturally.
+_PROBE_RETRIES = 5
+_NEG_CACHE_TTL_H = 20.0
+_ABSENT_MARKER_NAME = ".month_absent"
+# Flagship codes preferred for the probe (Flexicap and Large & Midcap —
+# long-lived open-end equity funds verified to publish a Consolidated
+# portfolio every month). If either is missing from the catalog we fall back
+# to the catalog's first codes in deterministic (fund-name-sorted) order.
+_PROBE_PREFERRED_CODES = ("SEF", "KOP")
 
 # Closed-end series schemes — Fixed Maturity Plans ("Kotak FMP Series 237",
 # "Kotak Fixed Maturity Plan Series 330") and the legacy "Kotak India Growth
@@ -215,6 +246,36 @@ def _year(ym: str) -> str:
     return ym.split("-", 1)[0]
 
 
+def _absent_marker_path(ym: str) -> Path:
+    """TTL'd negative-cache marker for an unpublished data month."""
+    return paths.raw_dir() / "holdings" / "kotak" / ym / _ABSENT_MARKER_NAME
+
+
+def _absent_marker_age_hours(marker: Path) -> float | None:
+    """Age of the marker in hours, or None if it doesn't exist.
+
+    The marker body is the ISO-8601 UTC timestamp written at probe time; an
+    unparseable body (manual tampering, partial write) is treated as expired
+    so we re-probe rather than trusting a corrupt marker.
+    """
+    try:
+        text = marker.read_text().strip()
+    except OSError:
+        return None
+    try:
+        written = _dt.datetime.fromisoformat(text)
+    except ValueError:
+        return float("inf")
+    if written.tzinfo is None:
+        written = written.replace(tzinfo=_dt.timezone.utc)
+    age = _dt.datetime.now(_dt.timezone.utc) - written
+    return age.total_seconds() / 3600.0
+
+
+def _month_not_published_error(ym: str) -> IngestError:
+    return IngestError(f"kotak: month {ym} not yet published (probe negative)")
+
+
 def _get_json(client: httpx.Client, url: str) -> dict | None:
     """GET a Kotak portfolio JSON endpoint, retrying through the prodtest
     host's transient failures.
@@ -268,12 +329,20 @@ class KotakHoldingsAdapter(GenericHoldingsAdapter):
         than per-scheme folderlist drill-downs (which are slow + flaky). A
         scheme with no portfolio for this month simply 400s at download time
         (after retries) and is skipped by the orchestrator — so we do not
-        gate here, which keeps the full catalog in the matchable set.
+        gate per scheme, which keeps the full catalog in the matchable set.
+
+        We DO gate on the month existing at all: an unpublished month would
+        otherwise burn the full per-scheme retry budget ~120 times (~2.6h of
+        dead retries). See ``_probe_month_published`` and the negative-cache
+        notes at ``_PROBE_RETRIES``. A fresh ``.month_absent`` marker raises
+        ``IngestError`` immediately, with zero HTTP traffic.
         """
+        self._check_absent_marker(ym)
         year = _year(ym)
         month = _month_name(ym)
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
             funds = self._all_funds(client)
+            self._probe_month_published(client, funds, ym, year, month)
         out: dict[str, str] = {}
         for fund_name, code in funds.items():
             out.setdefault(fund_name, self._download_url(code, year, month))
@@ -282,6 +351,85 @@ class KotakHoldingsAdapter(GenericHoldingsAdapter):
             ym=ym, year=year, month=month, n_schemes=len(out),
         )
         return out
+
+    # ------------------------------------------------------------------
+    # Absent-month probe + negative cache (B11)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_absent_marker(ym: str) -> None:
+        """Raise immediately (zero HTTP) while a young negative-cache marker
+        exists; delete an expired marker so the month is re-probed."""
+        marker = _absent_marker_path(ym)
+        age_h = _absent_marker_age_hours(marker)
+        if age_h is None:
+            return
+        if age_h < _NEG_CACHE_TTL_H:
+            log.info(
+                "holdings.kotak.month_absent_cached",
+                ym=ym, marker=str(marker), age_hours=round(age_h, 2),
+            )
+            raise _month_not_published_error(ym)
+        marker.unlink(missing_ok=True)
+        log.info("holdings.kotak.month_absent_marker_expired", ym=ym)
+
+    def _probe_month_published(
+        self,
+        client: httpx.Client,
+        funds: dict[str, str],
+        ym: str,
+        year: str,
+        month: str,
+    ) -> None:
+        """Probe two stable fund codes' Consolidated leaves for this month.
+
+        One probe succeeding proves the month is published (we return and
+        the normal per-scheme path runs with its generous retry budget).
+        BOTH probes exhausting their SMALL budget means the month is not
+        published: write the TTL'd marker and raise ``IngestError`` so the
+        orchestrator records the gap and skips kotak entirely this run.
+        """
+        codes: list[str] = [
+            c for c in _PROBE_PREFERRED_CODES if c in funds.values()
+        ]
+        for name in sorted(funds):
+            if len(codes) >= 2:
+                break
+            if funds[name] not in codes:
+                codes.append(funds[name])
+        if not codes:
+            return  # empty catalog: nothing to probe (discovery yields {})
+
+        for code in codes[:2]:
+            leaf_url = f"{_API}/folderlist?scheme={self._path(code, year, month)}"
+            for attempt in range(_PROBE_RETRIES):
+                client.cookies.clear()  # re-route off any stuck LB backend
+                try:
+                    r = client.get(leaf_url)
+                except httpx.HTTPError:
+                    r = None
+                if r is not None and r.status_code == 200:
+                    try:
+                        obj = json.loads(r.text)
+                    except (json.JSONDecodeError, ValueError):
+                        obj = None
+                    files = (obj or {}).get("dataList") or []
+                    if files and files[0]:
+                        # Month is published; clear any leftover marker.
+                        _absent_marker_path(ym).unlink(missing_ok=True)
+                        return
+                if attempt < _PROBE_RETRIES - 1:
+                    time.sleep(_RETRY_SLEEP_S)
+
+        marker = _absent_marker_path(ym)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(_dt.datetime.now(_dt.timezone.utc).isoformat())
+        log.warning(
+            "holdings.kotak.month_absent",
+            ym=ym, probed_codes=codes[:2],
+            ttl_hours=_NEG_CACHE_TTL_H, marker=str(marker),
+        )
+        raise _month_not_published_error(ym)
 
     def _all_funds(self, client: httpx.Client) -> dict[str, str]:
         """Enumerate {FundName: FundCode} via schemesearch.
@@ -424,9 +572,11 @@ class KotakHoldingsAdapter(GenericHoldingsAdapter):
             dr = client.get(download_url)
         except httpx.HTTPError:
             return None
-        # downloadfile returns the raw xlsx (PK zip magic); a JSON error body
-        # would not start with PK.
-        if dr.status_code == 200 and dr.content[:2] == b"PK":
+        # downloadfile returns the raw xlsx (PK\x03\x04 zip magic). Anything
+        # else — a JSON error body, an HTML challenge/WAF page served as 200 —
+        # counts as a FAILED attempt (the outer loop retries) and is never
+        # written to the cache (B1 content validation).
+        if dr.status_code == 200 and sniff_kind(dr.content) == "xlsx_zip":
             return dr.content
         return None
 

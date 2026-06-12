@@ -1,11 +1,17 @@
 """Trust Mutual Fund (TRUSTMF) — combined factsheet PTR adapter.
 
-Status as of 2026-05 build: **BLOCKED on download** — see "Download wall"
-below. The parser below is written and registered so the adapter is ready
-the moment the PDF can be fetched (e.g. via an authenticated/browser fetch
-path), but it cannot be calibrated against the real 2026-04 file yet
-because every programmatic request for the PDF is intercepted by the
-trustmf.com WAF.
+Status as of 2026-06 (Phase 6 B12): **ACTIVE but known-blocked on
+download** — see "Download wall" below. The adapter is registered via the
+package's pkgutil auto-import and runs in every ``run_all``; ``fetch()``
+fails LOUDLY with ``IngestError`` (the WAF serves an HTML shell, which B1
+content validation rejects before caching), so the gap is recorded as a
+per-AMC failure rather than hidden by dormancy. The slug is listed in the
+``_KNOWN_BLOCKED`` ledger (``mfs.ingest.managers``) so run summaries can
+distinguish this known wall from a new regression. The parser is written
+and ready the moment the PDF can be fetched (e.g. via an
+authenticated/browser fetch path), but it cannot be calibrated against the
+real 2026-04 file yet because every programmatic request for the PDF is
+intercepted by the trustmf.com WAF.
 
 Scheme-master linkage
 ---------------------

@@ -1,5 +1,13 @@
 """JioBlackRock Mutual Fund — factsheet PTR adapter.
 
+Status as of 2026-06 (Phase 6 B12): **ACTIVE but known-blocked on
+auto-download** — the adapter is registered via the package's pkgutil
+auto-import and runs in every ``run_all``. Unless an operator has dropped
+the resolved PDF into the cache (see "URL / fetch" below), ``fetch()``
+raises ``IngestError`` and the gap is recorded as a per-AMC failure. The
+slug is listed in the ``_KNOWN_BLOCKED`` ledger (``mfs.ingest.managers``)
+so run summaries can distinguish this known auth wall from a regression.
+
 JioBlackRock is a 50:50 JV between Jio Financial Services and BlackRock
 (SEBI final approval May 2025; first NFOs from Aug 2025). It publishes a
 single combined monthly "Factsheet" PDF covering all live schemes.

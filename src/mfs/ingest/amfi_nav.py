@@ -93,11 +93,16 @@ def parse_amfi_text(content: str) -> Iterator[dict]:
 
     Field separator is `;`. The file starts with a header row that tells us the column
     layout; both the daily NAVAll and the bulk-history endpoint are supported.
+
+    Rows with a non-positive NAV are skipped (AMFI publishes 0.00000 for
+    segregated/wound-up plans; log(0) would poison downstream return math) and
+    counted — one warning is emitted per parse when any were dropped.
     """
     current_amc: str | None = None
     current_category: str | None = None
     layout: dict[str, int] | None = None
     expected_cols: int = 0
+    n_nonpositive: int = 0
 
     for raw in io.StringIO(content):
         line = raw.rstrip("\n").rstrip("\r")
@@ -124,6 +129,9 @@ def parse_amfi_text(content: str) -> Iterator[dict]:
                     continue
                 if nav is None or nav_date is None:
                     continue
+                if nav <= 0:
+                    n_nonpositive += 1
+                    continue
                 yield {
                     "scheme_code": scheme_code,
                     "isin_growth": isin_growth_v if isin_growth_v and isin_growth_v != "-" else None,
@@ -144,6 +152,8 @@ def parse_amfi_text(content: str) -> Iterator[dict]:
         elif s and not s[0].isdigit() and len(s) > 4 and ";" not in s and "|" not in s:
             if re.fullmatch(r"[A-Za-z0-9 .,&'()\-]+", s):
                 current_amc = s
+    if n_nonpositive:
+        log.warning("amfi_nav.nonpositive_nav_skipped", n=n_nonpositive)
 
 
 def parse_to_dataframe(content: str) -> pl.DataFrame:

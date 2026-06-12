@@ -7,6 +7,7 @@ from datetime import date
 import typer
 
 from mfs import paths
+from mfs.db.queries import TRI_SANITY_MIN_CAGR
 from mfs.utils.logging import configure_logging, get_logger
 
 app = typer.Typer(help="Indian mutual fund evaluation pipeline.")
@@ -528,24 +529,16 @@ def rank_deep_cmd(
 def status_cmd():
     """Print row counts + date bounds per table."""
     configure_logging()
-    from mfs.db.connection import connect, get_dsn
+    from mfs.db import queries as q
+    from mfs.db.connection import get_dsn
 
     typer.echo(f"DSN: {get_dsn()}")
-    queries = [
-        ("nav_daily",        "SELECT COUNT(*), MIN(nav_date), MAX(nav_date) FROM nav_daily"),
-        ("benchmark_daily",  "SELECT COUNT(*), MIN(date), MAX(date) FROM benchmark_daily"),
-        ("risk_free_daily",  "SELECT COUNT(*), MIN(date), MAX(date) FROM risk_free_daily"),
-        ("scheme_master",    "SELECT COUNT(*), MIN(last_seen_date), MAX(last_seen_date) FROM scheme_master"),
-        ("computed_metrics", "SELECT COUNT(*), MIN(as_of_date), MAX(as_of_date) FROM computed_metrics"),
-        ("fund_log_returns", "SELECT COUNT(*), MIN(date), MAX(date) FROM fund_log_returns"),
-    ]
-    with connect() as c:
-        for name, q in queries:
-            try:
-                n, mn, mx = c.execute(q).fetchone()
-                typer.echo(f"  {name:18s}: {n:>10} rows  [{mn} .. {mx}]")
-            except Exception as e:  # noqa: BLE001
-                typer.echo(f"  {name:18s}: <error: {e}>")
+    for name in q.STATUS_TABLES:
+        try:
+            n, mn, mx = q.table_bounds(name)
+            typer.echo(f"  {name:18s}: {n:>10} rows  [{mn} .. {mx}]")
+        except Exception as e:  # noqa: BLE001
+            typer.echo(f"  {name:18s}: <error: {e}>")
     # Output is files, not parquet — show what's on disk
     n_categories = 0
     out = paths.output_dir() / "shortlist"
@@ -624,188 +617,95 @@ def db_coverage(
     """
     configure_logging()
     from datetime import date as _date
-    from mfs.db.connection import connect
+    from mfs.db import queries as q
 
     since_d = _date.fromisoformat(since)
 
-    with connect() as c:
-        # Build the trading calendar (NIFTY 50 TRI dates since `since`)
-        cal_count = c.execute(
-            "SELECT COUNT(*) FROM benchmark_daily "
-            "WHERE ticker = 'NIFTY 50 TRI' AND date >= %s",
-            (since_d,),
-        ).fetchone()[0]
-        cal_bounds = c.execute(
-            "SELECT MIN(date), MAX(date) FROM benchmark_daily "
-            "WHERE ticker = 'NIFTY 50 TRI' AND date >= %s",
-            (since_d,),
-        ).fetchone()
+    # Reference trading calendar (NIFTY 50 TRI dates since `since`)
+    cal_count, cal_min, cal_max = q.trading_calendar_bounds(since_d)
+    typer.echo(
+        f"Reference calendar: {cal_count} NIFTY 50 TRI trading days, "
+        f"{cal_min} → {cal_max}"
+    )
+    typer.echo("=" * 80)
+
+    # --- Benchmarks ---
+    typer.echo("\n[BENCHMARKS] Days missing per ticker vs trading calendar:")
+    for ticker, exp, actual, miss, first, last in q.benchmark_gap_report(since_d):
+        flag = "OK " if miss == 0 else "GAP"
         typer.echo(
-            f"Reference calendar: {cal_count} NIFTY 50 TRI trading days, "
-            f"{cal_bounds[0]} → {cal_bounds[1]}"
+            f"  [{flag}] {ticker:38s}  expected={exp}  actual={actual}  "
+            f"missing={miss}  ({first} → {last})"
         )
-        typer.echo("=" * 80)
 
-        # --- Benchmarks ---
-        typer.echo("\n[BENCHMARKS] Days missing per ticker vs trading calendar:")
-        rows = c.execute(
-            """
-            WITH cal AS (
-                SELECT date FROM benchmark_daily
-                WHERE ticker = 'NIFTY 50 TRI' AND date >= %s
-            ),
-            tickers AS (SELECT DISTINCT ticker FROM benchmark_daily)
-            SELECT t.ticker,
-                   (SELECT COUNT(*) FROM cal) AS expected,
-                   COUNT(bd.date) AS actual,
-                   (SELECT COUNT(*) FROM cal) - COUNT(bd.date) AS missing,
-                   MIN(bd.date) AS first_day, MAX(bd.date) AS last_day
-            FROM tickers t
-            CROSS JOIN cal c
-            LEFT JOIN benchmark_daily bd
-              ON bd.ticker = t.ticker AND bd.date = c.date
-            GROUP BY t.ticker
-            ORDER BY missing DESC, t.ticker;
-            """,
-            (since_d,),
-        ).fetchall()
-        for ticker, exp, actual, miss, first, last in rows:
-            flag = "OK " if miss == 0 else "GAP"
-            typer.echo(
-                f"  [{flag}] {ticker:38s}  expected={exp}  actual={actual}  "
-                f"missing={miss}  ({first} → {last})"
-            )
-
-        # --- Risk-free ---
-        typer.echo("\n[RISK-FREE] Trading-day coverage:")
-        rf_min, rf_max = c.execute(
-            "SELECT MIN(date), MAX(date) FROM risk_free_daily"
-        ).fetchone()
-        if rf_min is None:
-            typer.echo("  No risk-free data.")
-        else:
-            # Days in calendar from rf_min onwards that have no rf row
-            missing_rf_dates = c.execute(
-                """
-                SELECT c.date FROM (
-                    SELECT date FROM benchmark_daily
-                    WHERE ticker = 'NIFTY 50 TRI' AND date >= %s
-                ) c
-                LEFT JOIN risk_free_daily rf ON rf.date = c.date
-                WHERE c.date >= %s AND rf.date IS NULL
-                ORDER BY c.date
-                """,
-                (since_d, rf_min),
-            ).fetchall()
-            typer.echo(
-                f"  Earliest observation: {rf_min}, latest: {rf_max}"
-            )
-            n_pre = c.execute(
-                "SELECT COUNT(*) FROM benchmark_daily "
-                "WHERE ticker = 'NIFTY 50 TRI' AND date >= %s AND date < %s",
-                (since_d, rf_min),
-            ).fetchone()[0]
-            typer.echo(
-                f"  Trading days {since_d}..{rf_min - _date.resolution} (before rf): "
-                f"{n_pre} unfilled"
-            )
-            typer.echo(
-                f"  Trading days {rf_min}..today with no rf row "
-                f"(should be 0 — forward-fill should cover all): "
-                f"{len(missing_rf_dates)}"
-            )
-            for d in missing_rf_dates[:10]:
-                typer.echo(f"    {d[0]}")
-
-        # --- NAVs (per scheme, only rankable Direct+Growth) ---
+    # --- Risk-free ---
+    typer.echo("\n[RISK-FREE] Trading-day coverage:")
+    rf = q.risk_free_gap_report(since_d)
+    if rf is None:
+        typer.echo("  No risk-free data.")
+    else:
         typer.echo(
-            f"\n[NAV] Active rankable Direct+Growth schemes "
-            f"(inception ≥ {nav_min_inception_year}):"
+            f"  Earliest observation: {rf.rf_min}, latest: {rf.rf_max}"
         )
-        # Use the rankable categories list from thresholds yaml
-        from mfs.config import get_thresholds
-        rankable = get_thresholds().get("rankable_categories", [])
-        if not rankable:
-            typer.echo("  (no rankable_categories configured)")
-        else:
-            results = c.execute(
-                """
-                WITH cal AS (
-                    SELECT date FROM benchmark_daily
-                    WHERE ticker = 'NIFTY 50 TRI' AND date >= %s
-                ),
-                eligible AS (
-                    SELECT scheme_code, scheme_name, inception_date, last_seen_date
-                    FROM scheme_master
-                    WHERE is_active
-                      AND plan_type = 'DIRECT'
-                      AND option_type = 'GROWTH'
-                      AND canonical_category = ANY(%s)
-                      AND EXTRACT(YEAR FROM inception_date) >= %s
-                ),
-                expected AS (
-                    SELECT e.scheme_code,
-                           COUNT(*) AS expected_days
-                    FROM eligible e
-                    JOIN cal c ON c.date >= e.inception_date
-                              AND c.date <= LEAST(e.last_seen_date, (SELECT MAX(date) FROM cal))
-                    GROUP BY e.scheme_code
-                ),
-                actual AS (
-                    SELECT n.scheme_code, COUNT(*) AS actual_days
-                    FROM nav_daily n
-                    JOIN cal c ON c.date = n.nav_date
-                    WHERE n.scheme_code IN (SELECT scheme_code FROM eligible)
-                    GROUP BY n.scheme_code
-                )
-                SELECT e.scheme_code, e.scheme_name,
-                       e.inception_date, e.last_seen_date,
-                       COALESCE(exp.expected_days, 0) AS expected_days,
-                       COALESCE(act.actual_days, 0) AS actual_days,
-                       COALESCE(exp.expected_days, 0) - COALESCE(act.actual_days, 0) AS missing_days
-                FROM eligible e
-                LEFT JOIN expected exp ON exp.scheme_code = e.scheme_code
-                LEFT JOIN actual   act ON act.scheme_code = e.scheme_code
-                ORDER BY missing_days DESC, e.scheme_code
-                """,
-                (since_d, list(rankable), nav_min_inception_year),
-            ).fetchall()
-            total = len(results)
-            perfect = sum(1 for r in results if r[6] == 0)
-            within_5 = sum(1 for r in results if r[6] <= 5)
-            within_30 = sum(1 for r in results if r[6] <= 30)
-            typer.echo(f"  Total eligible schemes: {total}")
-            typer.echo(f"    100% coverage (0 days missing):  {perfect}")
-            typer.echo(f"    ≤5 days missing:                  {within_5}")
-            typer.echo(f"    ≤30 days missing:                 {within_30}")
-            typer.echo(f"    >30 days missing:                 {total - within_30}")
-            typer.echo(f"\n  Top {nav_show_top} schemes with the most missing trading days:")
-            for r in results[:nav_show_top]:
-                code, name, incep, last, exp, act, miss = r
-                typer.echo(
-                    f"    {code:>8}  {(name or '')[:60]:60s}  "
-                    f"incep={incep}  last={last}  "
-                    f"expected={exp:5d}  actual={act:5d}  missing={miss}"
-                )
+        typer.echo(
+            f"  Trading days {since_d}..{rf.rf_min - _date.resolution} (before rf): "
+            f"{rf.n_pre} unfilled"
+        )
+        typer.echo(
+            f"  Trading days {rf.rf_min}..today with no rf row "
+            f"(should be 0 — forward-fill should cover all): "
+            f"{len(rf.missing_dates)}"
+        )
+        for d in rf.missing_dates[:10]:
+            typer.echo(f"    {d}")
+
+    # --- NAVs (per scheme, only rankable Direct+Growth) ---
+    typer.echo(
+        f"\n[NAV] Active rankable Direct+Growth schemes "
+        f"(inception ≥ {nav_min_inception_year}):"
+    )
+    # Use the rankable categories list from thresholds yaml
+    from mfs.config import get_thresholds
+    rankable = get_thresholds().get("rankable_categories", [])
+    if not rankable:
+        typer.echo("  (no rankable_categories configured)")
+    else:
+        results = q.nav_coverage_report(
+            since_d, list(rankable), nav_min_inception_year
+        )
+        total = len(results)
+        perfect = sum(1 for r in results if r[6] == 0)
+        within_5 = sum(1 for r in results if r[6] <= 5)
+        within_30 = sum(1 for r in results if r[6] <= 30)
+        typer.echo(f"  Total eligible schemes: {total}")
+        typer.echo(f"    100% coverage (0 days missing):  {perfect}")
+        typer.echo(f"    ≤5 days missing:                  {within_5}")
+        typer.echo(f"    ≤30 days missing:                 {within_30}")
+        typer.echo(f"    >30 days missing:                 {total - within_30}")
+        typer.echo(f"\n  Top {nav_show_top} schemes with the most missing trading days:")
+        for r in results[:nav_show_top]:
+            code, name, incep, last, exp, act, miss = r
+            typer.echo(
+                f"    {code:>8}  {(name or '')[:60]:60s}  "
+                f"incep={incep}  last={last}  "
+                f"expected={exp:5d}  actual={act:5d}  missing={miss}"
+            )
 
 
 @db_app.command("status")
 def db_status():
     """Show current DB name and row counts per table."""
     configure_logging()
-    from mfs.db.connection import connect, get_dsn
+    from mfs.db import queries as q
+    from mfs.db.connection import get_dsn
 
     typer.echo(f"DSN: {get_dsn()}")
-    with connect() as c:
-        for tbl in [
-            "nav_daily", "benchmark_daily", "risk_free_daily",
-            "scheme_master", "computed_metrics", "fund_log_returns",
-        ]:
-            try:
-                n = c.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-                typer.echo(f"  {tbl:20s}: {n} rows")
-            except Exception as e:  # noqa: BLE001
-                typer.echo(f"  {tbl:20s}: <error: {e}>")
+    for tbl in q.STATUS_TABLES:
+        try:
+            n = q.table_count(tbl)
+            typer.echo(f"  {tbl:20s}: {n} rows")
+        except Exception as e:  # noqa: BLE001
+            typer.echo(f"  {tbl:20s}: <error: {e}>")
 
 
 @app.command("coverage")
@@ -859,7 +759,7 @@ def missing_data_cmd(
     import polars as pl
 
     from mfs import paths
-    from mfs.db.connection import connect
+    from mfs.db import queries as q
 
     since_d = _date.fromisoformat(since)
     today = _date.today()
@@ -878,65 +778,53 @@ def missing_data_cmd(
     )
     typer.echo("=" * 78)
 
-    with connect() as c:
-        # --- Benchmarks ---
-        typer.echo("\n[BENCHMARKS — TRI series]")
-        rows = c.execute(
-            "SELECT ticker, COUNT(*), MIN(date), MAX(date) "
-            "FROM benchmark_daily WHERE date >= %s GROUP BY ticker ORDER BY ticker",
-            (since_d,),
-        ).fetchall()
-        if not rows:
-            typer.echo("  (no benchmark data)")
-        for ticker, n, first, last in rows:
-            missing = expected_bdays - n
-            typer.echo(
-                f"  {ticker:38s}  rows={n:5d}  first={first}  last={last}  "
-                f"~bdays missing={missing if missing > 0 else 0}"
-            )
+    # --- Benchmarks ---
+    typer.echo("\n[BENCHMARKS — TRI series]")
+    rows = q.benchmark_inventory(since_d)
+    if not rows:
+        typer.echo("  (no benchmark data)")
+    for ticker, n, first, last in rows:
+        missing = expected_bdays - n
+        typer.echo(
+            f"  {ticker:38s}  rows={n:5d}  first={first}  last={last}  "
+            f"~bdays missing={missing if missing > 0 else 0}"
+        )
 
-        # --- Risk-free ---
-        typer.echo("\n[RISK-FREE — 91-day T-bill cut-off]")
-        scraped = paths.raw_dir() / "fbil_tbill" / "rbi_scraped_91d_tbill.csv"
-        if scraped.exists():
-            obs = pl.read_csv(scraped, schema_overrides={"date": pl.Date}).filter(
-                pl.col("date") >= since_d
-            ).sort("date")
-            typer.echo(
-                f"  Real auction observations since {since_d}: {obs.height} "
-                f"(expected ~{(today - since_d).days // 7})"
-            )
-            dates = obs["date"].to_list()
-            gaps = [(a, b, (b - a).days) for a, b in zip(dates, dates[1:]) if (b - a).days > 14]
-            typer.echo(f"  Forward-fill stretches >14 days: {len(gaps)}")
-            for a, b, d in gaps:
-                typer.echo(f"    {a} .. {b}  ({d} days)")
-        else:
-            typer.echo("  (scraped CSV missing — re-run `mfs ingest tbill`)")
+    # --- Risk-free ---
+    typer.echo("\n[RISK-FREE — 91-day T-bill cut-off]")
+    scraped = paths.raw_dir() / "fbil_tbill" / "rbi_scraped_91d_tbill.csv"
+    if scraped.exists():
+        obs = pl.read_csv(scraped, schema_overrides={"date": pl.Date}).filter(
+            pl.col("date") >= since_d
+        ).sort("date")
+        typer.echo(
+            f"  Real auction observations since {since_d}: {obs.height} "
+            f"(expected ~{(today - since_d).days // 7})"
+        )
+        dates = obs["date"].to_list()
+        gaps = [(a, b, (b - a).days) for a, b in zip(dates, dates[1:]) if (b - a).days > 14]
+        typer.echo(f"  Forward-fill stretches >14 days: {len(gaps)}")
+        for a, b, d in gaps:
+            typer.echo(f"    {a} .. {b}  ({d} days)")
+    else:
+        typer.echo("  (scraped CSV missing — re-run `mfs ingest tbill`)")
 
-        # --- NAVs ---
-        typer.echo(f"\n[NAV — per scheme since {since_d}]")
-        per_scheme = c.execute(
-            """
-            SELECT scheme_code, MIN(nav_date), MAX(nav_date), COUNT(DISTINCT nav_date),
-                   CAST((MAX(nav_date) - MIN(nav_date)) / 7.0 * 5 AS INT) AS expected_bdays
-            FROM nav_daily WHERE nav_date >= %s GROUP BY scheme_code
-            """,
-            (since_d,),
-        ).fetchall()
-        if not per_scheme:
-            typer.echo("  (no NAV data)")
-        else:
-            total_schemes = len(per_scheme)
-            worst = [(sc, mn, mx, n, exp - n) for sc, mn, mx, n, exp in per_scheme if exp - n > 30]
-            typer.echo(f"  Total schemes with any NAV since {since_d}: {total_schemes}")
-            typer.echo(f"  Schemes with >30 missing business days within their active window: {len(worst)}")
-            worst.sort(key=lambda r: -r[4])
-            typer.echo(f"  Top {nav_per_scheme_top} schemes by missing days:")
-            for sc, mn, mx, n, miss in worst[:nav_per_scheme_top]:
-                typer.echo(
-                    f"    {sc:>8}  first={mn}  last={mx}  observed={n:5d}  ~missing={miss}"
-                )
+    # --- NAVs ---
+    typer.echo(f"\n[NAV — per scheme since {since_d}]")
+    per_scheme = q.nav_per_scheme_inventory(since_d)
+    if not per_scheme:
+        typer.echo("  (no NAV data)")
+    else:
+        total_schemes = len(per_scheme)
+        worst = [(sc, mn, mx, n, exp - n) for sc, mn, mx, n, exp in per_scheme if exp - n > 30]
+        typer.echo(f"  Total schemes with any NAV since {since_d}: {total_schemes}")
+        typer.echo(f"  Schemes with >30 missing business days within their active window: {len(worst)}")
+        worst.sort(key=lambda r: -r[4])
+        typer.echo(f"  Top {nav_per_scheme_top} schemes by missing days:")
+        for sc, mn, mx, n, miss in worst[:nav_per_scheme_top]:
+            typer.echo(
+                f"    {sc:>8}  first={mn}  last={mx}  observed={n:5d}  ~missing={miss}"
+            )
 
     # --- AMFI backfill windows that failed ---
     failures_log = paths.raw_dir() / "amfi_nav_history" / "_missing_windows.txt"
@@ -946,41 +834,31 @@ def missing_data_cmd(
             typer.echo(f"  {line}")
 
 
-@app.command("validate")
+@app.command(
+    "validate",
+    help=(
+        "Data quality report: TRI sanity (Nifty 50 TRI CAGR since 2010 must "
+        f"exceed {TRI_SANITY_MIN_CAGR:.0%} or the series is flagged SUSPECT), "
+        "NAV counts."
+    ),
+)
 def validate_cmd():
-    """Data quality report: TRI sanity (Nifty 50 CAGR > 12% since 2010), NAV counts."""
+    """Thin formatter over ``mfs.db.queries.tri_cagr_sanity`` /
+    ``nav_table_counts``; the SUSPECT threshold is
+    ``mfs.db.queries.TRI_SANITY_MIN_CAGR`` (also rendered in --help)."""
     configure_logging()
     from datetime import date as _date
-    from mfs.db.connection import connect
+    from mfs.db import queries as q
 
-    with connect() as c:
-        row = c.execute(
-            "SELECT MIN(close), MAX(close), MIN(date), MAX(date) "
-            "FROM benchmark_daily WHERE ticker = 'NIFTY 50 TRI' AND date >= %s",
-            (_date(2010, 1, 1),),
-        ).fetchone()
-        if row and row[0] is not None:
-            mn, mx, d_start, d_end = row
-            # Need the start close (not min), so query the boundary closes
-            start_close = c.execute(
-                "SELECT close FROM benchmark_daily WHERE ticker = 'NIFTY 50 TRI' "
-                "AND date = %s", (d_start,),
-            ).fetchone()[0]
-            end_close = c.execute(
-                "SELECT close FROM benchmark_daily WHERE ticker = 'NIFTY 50 TRI' "
-                "AND date = %s", (d_end,),
-            ).fetchone()[0]
-            years = (d_end - d_start).days / 365.25
-            cagr = (end_close / start_close) ** (1 / years) - 1
-            status = "OK" if cagr > 0.10 else "SUSPECT (PR not TRI?)"
-            typer.echo(f"NIFTY 50 TRI CAGR since 2010: {cagr*100:.2f}%  [{status}]")
-        else:
-            typer.echo("WARN: no Nifty 50 TRI history since 2010")
+    res = q.tri_cagr_sanity(_date(2010, 1, 1))
+    if res is not None:
+        status = "OK" if res.ok else "SUSPECT (PR not TRI?)"
+        typer.echo(f"NIFTY 50 TRI CAGR since 2010: {res.cagr*100:.2f}%  [{status}]")
+    else:
+        typer.echo("WARN: no Nifty 50 TRI history since 2010")
 
-        n, n_schemes = c.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT scheme_code) FROM nav_daily"
-        ).fetchone()
-        typer.echo(f"NAV daily: {n} rows across {n_schemes} schemes")
+    n, n_schemes = q.nav_table_counts()
+    typer.echo(f"NAV daily: {n} rows across {n_schemes} schemes")
 
 
 @app.command("pipeline")

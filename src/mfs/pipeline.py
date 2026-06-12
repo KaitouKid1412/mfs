@@ -11,19 +11,59 @@ stdout/stderr split is preserved exactly.
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any, Callable
 
 from mfs.errors import CoverageError, IngestError, PipelineError
+from mfs.utils.logging import get_logger
 
 if TYPE_CHECKING:
     from mfs.coverage import CoverageReport
+
+log = get_logger("mfs.pipeline")
 
 
 def _default_echo(message: str = "", *, err: bool = False) -> None:
     """Stdout/stderr-aware default for ``echo`` (mirrors typer.echo's split)."""
     print(message, file=sys.stderr if err else sys.stdout)
+
+
+def timed_call(
+    name: str,
+    fn: Callable[[], Any],
+    timings: list[tuple[str, float]],
+) -> Any:
+    """Run ``fn()``, appending ``(name, elapsed_seconds)`` to ``timings``.
+
+    The timing record is appended whether ``fn`` returns or raises — a failing
+    stage still shows how long it ran before failing, and the exception
+    propagates unchanged. On success a machine-readable structlog event
+    ``pipeline.stage.done`` is emitted with the stage name and seconds (C1:
+    the measurement basis for the C2-C6 before/after acceptance).
+    """
+    t0 = time.perf_counter()
+    try:
+        result = fn()
+    except BaseException:
+        timings.append((name, time.perf_counter() - t0))
+        raise
+    elapsed = time.perf_counter() - t0
+    timings.append((name, elapsed))
+    log.info("pipeline.stage.done", stage=name, seconds=round(elapsed, 3))
+    return result
+
+
+def render_stage_timings(timings: list[tuple[str, float]]) -> str:
+    """Per-stage wall-clock summary table printed at the end of every run."""
+    width = max([len(n) for n, _ in timings] + [len("TOTAL")])
+    lines = ["", "STAGE TIMING SUMMARY", "-" * (width + 12)]
+    for name, secs in timings:
+        lines.append(f"  {name:<{width}s} {secs:>8.1f}s")
+    lines.append("-" * (width + 12))
+    lines.append(f"  {'TOTAL':<{width}s} {sum(s for _, s in timings):>8.1f}s")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -112,11 +152,12 @@ def run(
     from mfs.rank import shortlist
 
     d = as_of
+    stage_timings: list[tuple[str, float]] = []
 
     def _stage(name: str, fn, *, required: bool = True):
         echo(f"[pipeline] {name} ...")
         try:
-            return fn()
+            result = timed_call(name, fn, stage_timings)
         except (PipelineError, IngestError) as e:
             if required:
                 echo(f"[pipeline] FAIL at {name}:\n{e}", err=True)
@@ -136,6 +177,8 @@ def run(
                 raise PipelineError(f"{name}: {msg}") from e
             echo(f"[pipeline] WARN at {name} (best-effort, continuing):\n{msg}", err=True)
             return None
+        echo(f"[pipeline] {name} done in {stage_timings[-1][1]:.1f}s")
+        return result
 
     gate_reports: list[CoverageReport] = []
 
@@ -144,20 +187,27 @@ def run(
         structlog, so the table isn't flattened into one line), and halt the
         run on a BLOCKING breach. The full report is rendered whether it passes
         or fails — the data-quality posture is never silent."""
-        echo(f"[pipeline] coverage gate {gate} ...")
-        report = coverage.run_gate(gate, as_of=d, raise_on_block=False)
-        echo(coverage.render(report))
-        gate_reports.append(report)
-        if halt_on_block and report.blocking_failures:
-            echo(
-                f"[pipeline] HALTING (exit 2) — Gate {gate} blocking coverage "
-                f"failure; refusing to compute metrics on incomplete inputs.",
-                err=True,
-            )
-            raise CoverageError(
-                f"Gate {gate} blocking coverage failure; refusing to compute "
-                f"metrics on incomplete inputs."
-            )
+        name = f"coverage gate {gate}"
+        echo(f"[pipeline] {name} ...")
+
+        def _run_gate():
+            report = coverage.run_gate(gate, as_of=d, raise_on_block=False)
+            echo(coverage.render(report))
+            gate_reports.append(report)
+            if halt_on_block and report.blocking_failures:
+                echo(
+                    f"[pipeline] HALTING (exit 2) — Gate {gate} blocking coverage "
+                    f"failure; refusing to compute metrics on incomplete inputs.",
+                    err=True,
+                )
+                raise CoverageError(
+                    f"Gate {gate} blocking coverage failure; refusing to compute "
+                    f"metrics on incomplete inputs."
+                )
+            return report
+
+        report = timed_call(name, _run_gate, stage_timings)
+        echo(f"[pipeline] {name} done in {stage_timings[-1][1]:.1f}s")
         return report
 
     # Serialize concurrent pipeline runs with a Postgres advisory lock (released

@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Indian mutual fund evaluation pipeline (NAV-based ranking)"
 requires-python = ">=3.11,<3.15"
 dependencies = [
-  "duckdb~=1.1",
   "polars~=1.20",
   "pyarrow>=17",
   "pandas>=2.2",

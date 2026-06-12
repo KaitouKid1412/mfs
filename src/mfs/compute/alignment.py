@@ -13,9 +13,16 @@ sortino) so units match.
 
 Forward-fill NAV at most 1 day for holiday lag; gaps beyond that stay null.
 
-Data lives in Postgres (see `mfs.db.queries`). Per-scheme fund log returns are
-read from the `fund_log_returns` cache when available, so we don't recompute
-diff(ln NAV) on every metrics run.
+Data lives in Postgres (see `mfs.db.queries`). Fund log returns are computed
+HERE, from the aligned NAV series, on every metrics run — the
+`fund_log_returns` DB table is a write-side cache that no compute code reads.
+
+Non-finite guard: a zero/negative NAV (or corrupt benchmark close / risk-free
+rate) makes log() emit NaN/±inf, and the 1-day shift propagates it to the next
+row too. Downstream `drop_nulls()` calls (sortino, capture, info_ratio, alpha)
+do NOT drop NaN/inf, so a single poisoned row would NaN every rolling metric.
+`align_scheme` therefore nulls out non-finite log-return values — counted and
+logged — so they fall out with the existing null-dropping instead.
 """
 
 from __future__ import annotations
@@ -94,4 +101,25 @@ def align_scheme(scheme_code: str, benchmark_ticker: str) -> pl.DataFrame:
             "bench_log_ret"
         ),
     )
+    # Non-finite guard (A1-1): zero/negative inputs make log() emit NaN/±inf,
+    # which survive downstream drop_nulls() and NaN-poison every rolling
+    # metric. Null them out — counted — so they drop with the existing nulls.
+    log_ret_cols = ("fund_log_ret", "bench_log_ret", "rate_daily_log")
+    n_nonfinite = aligned.select(
+        pl.any_horizontal(
+            [pl.col(c).is_not_null() & ~pl.col(c).is_finite() for c in log_ret_cols]
+        ).sum()
+    ).item()
+    if n_nonfinite:
+        log.warning(
+            "alignment.nonfinite_log_returns_nulled",
+            scheme_code=scheme_code,
+            n_rows=int(n_nonfinite),
+        )
+        aligned = aligned.with_columns(
+            [
+                pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c)
+                for c in log_ret_cols
+            ]
+        )
     return aligned
