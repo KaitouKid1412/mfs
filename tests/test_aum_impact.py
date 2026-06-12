@@ -9,7 +9,6 @@ import polars as pl
 from mfs.compute.aum_impact import (
     ADV_WINDOW_DAYS,
     MIN_HOLDINGS_FOR_IMPACT,
-    TOP_N_ILLIQUID,
     _median_adv,
     aum_impact_cost,
 )

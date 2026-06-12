@@ -166,7 +166,7 @@ def _patch_nav_window(monkeypatch, tmp_path, fresh_text):
         lambda from_s, to_s: tmp_path / f"{from_s}_{to_s}.txt",
     )
     monkeypatch.setattr(amfi_nav, "fetch_window", fake_fetch)
-    monkeypatch.setattr(amfi_nav.w, "upsert_nav_daily", lambda df: None)
+    monkeypatch.setattr(amfi_nav.w, "upsert_nav_daily", lambda df, **kw: None)
     return fetched
 
 
