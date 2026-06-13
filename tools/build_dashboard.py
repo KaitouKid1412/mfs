@@ -92,7 +92,7 @@ TIPS = {
     "stage2_rank": "Rank within the category (1 = best on our score).",
     "scheme_name": "Fund name — Direct plan, Growth option.",
     "composite_score": "Overall ranking score — combines every metric here. Higher = ranked higher.",
-    "top5_hits": "How many past quarters (since 2016) this fund ranked in its category's top-5 on the core composite — a consistency tally. Higher = more consistently strong. Older funds can rack up more, so check Top-5 % too. Survivorship-biased; blank for always-small categories where 'top-5' isn't selective.",
+    "top5_hits": "Shown as hits / eligible-quarters (e.g. 28 / 33): of the back-tested quarters since 2016 where this fund's category had a meaningful top-5, how many it ranked in the top-5 on the core composite. Higher = more consistently strong; the denominator differs per fund (newer funds have fewer quarters — check Top-5 % for a fair rate). Survivorship-biased; '—' for always-small categories.",
     "top5_pct": "Share of its back-tested quarters the fund was top-5 (a hit-rate — fairer to younger funds than the raw count).",
     "ter_pct": "Annual fee (expense ratio). Lower is better.",
     "aum_crore": "Fund size, in ₹ crore.",
@@ -171,6 +171,7 @@ def _rows(df: pl.DataFrame, cols: list[tuple], with_flags: bool,
         p = persist.get(r.get("scheme_code"))
         rec["top5_hits"] = p["hits"] if p else None
         rec["top5_pct"] = p["pct"] if p else None
+        rec["top5_q"] = p["q"] if p else None  # denominator (eligible quarters)
         if with_flags:
             rec["flags"] = _flags(r)
         out.append(rec)
@@ -453,6 +454,10 @@ function render(){
   // body
   document.getElementById('body').innerHTML = rows.map(r=>'<tr>'+cols.map(c=>{
     if(c.kind==='flags') return `<td class="lft">${flagHtml(r.flags)}</td>`;
+    if(c.k==='top5_hits'){           // show "hits / eligible-quarters"; sort by hits
+      const h=r.top5_hits;
+      return `<td>${(h===null||h===undefined)?'<span class="mut">—</span>':h+' <span class="mut">/ '+r.top5_q+'</span>'}</td>`;
+    }
     const [txt,cls,_n]=fmt(r[c.k],c.kind);
     let extra=cls; const lft=(c.kind==='text')?'lft':'';
     if(c.k==='alpha_3y_annualized'&&typeof r[c.k]==='number') extra=r[c.k]>=0?'pos':'neg';
