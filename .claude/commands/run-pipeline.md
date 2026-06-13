@@ -17,10 +17,10 @@ There is one end-to-end runner: **`uv run mfs pipeline`**. It orchestrates, in o
 ```
 ingest navs (incremental) → ingest benchmarks → ingest tbill → build scheme-master
   → COVERAGE GATE A (BLOCKING: NAV/benchmark/risk-free/scheme_master)
-  → ingest amfi-aum → ingest managers (PTR) → ingest bhavcopy → ingest holdings
+  → ingest amfi-aum → ingest amfi-ter → ingest managers (PTR) → ingest bhavcopy → ingest holdings
   → derive constituents (latest month, from tracker holdings — required)
   → ingest constituents (derived CSVs, best-effort)
-  → COVERAGE GATE B (ADVISORY: holdings/PTR/AAUM/constituents/stock-ADV)
+  → COVERAGE GATE B (ADVISORY: holdings/PTR/AAUM/TER/constituents/stock-ADV)
   → freshness gate → compute phase1 → rank-deep (stage 1 + 2 + 3)
 ```
 
@@ -72,6 +72,7 @@ If `pyproject.toml` is missing → STOP (wrong directory). If `uv` is missing �
 - **ingest tbill** — scrapes weekly 91-day T-bill cut-off press releases from RBI (`BS_PressReleaseDisplay.aspx`), then forward-fills to daily. ~10 s warm, up to ~25 min cold. Raises `IngestError` if >5% of prids fail after retries, or if the latest auction is older than `max_rf_lag_days`.
 - **build scheme-master** — derives the canonical scheme dimension from today's NAVAll + NAV history. ~5 s, ~14k rows. (Closed-ended/interval and non-equity are excluded; only Direct+Growth with a benchmark are ranked → ~664 funds.)
 - **ingest amfi-aum** — one GET to AMFI's quarterly per-scheme Average AUM endpoint; covers all schemes in one shot (`source_amc='amfi_aaum'`). The pipeline auto-selects the latest quarter. (Manual form: `uv run mfs ingest amfi-aum --quarter Q4-2026`, where Q4-2026 = Jan–Mar 2026.)
+- **ingest amfi-ter** — AMFI's monthly direct-plan Total Expense Ratio disclosure (`/api/populate-te-rdata-revised`, one request set per month, all AMCs) → `scheme_ter_monthly`. Deduped to each scheme's month-end prevailing direct TER and name-matched to Direct+Growth scheme_master via the shared fuzzy matcher (~91% rankable coverage). Defaults to the latest **complete** month (skips the partial current month). **Advisory** (`required=False`): a fetch miss is reported in Gate B but never halts the run — TER is a `ter_pct` display column + a deterministic Stage-2 tiebreaker (lower TER breaks an exact composite tie), NOT a composite-weighted term. Manual: `uv run mfs ingest ter --month MM-YYYY`.
 - **ingest managers** — runs every registered factsheet adapter (41 AMCs). Each downloads the latest monthly factsheet PDF and extracts **PTR** (+ factsheet-path holdings without ISIN). NOTE: this produces **Portfolio Turnover Ratio, not manager tenure** — manager-tenure and stress-test extraction were retired. ~10–30 s per AMC.
 - **ingest bhavcopy** — NSE daily bhavcopy for the last ~75 days → `stock_adv_daily` (per-ISIN turnover + close), feeding the 60-day median ADV used by AUM Impact Cost. Symbol→ISIN map (`EQUITY_L.csv`) refreshes weekly.
 - **ingest constituents** — benchmark index constituent weights from manual CSVs (`data/raw/index_constituents/manual/<ticker>/<YYYY-MM>.csv`). **Best-effort** — no-ops cleanly if absent. Feeds Active Share only.
