@@ -107,3 +107,95 @@ in benchmarks.csv; second discontinuity is acceptable for n=4 funds).
    `uv run python tools/benchmark_fit.py report` shows Value >= ~0.85 and
    Energy >= ~0.80 (or still flagged low-confidence by D4 if not).
 4. Re-run the Energy refit vs NIFTY Commodities TRI (command above).
+
+---
+
+## C3 close-out (Phase 7, 2026-06-13) — Commodities re-fit + low-confidence review
+
+NIFTY Commodities TRI is now ingested (2013-01-01 .. 2026-06-12, 3329 rows).
+Re-ran the Energy refit and reviewed every category still flagged
+`benchmark_fit_low_confidence` at `computed_metrics` as_of **2026-06-13**.
+**Decision: NO further remaps** — each flagged category keeps its incumbent
+benchmark with a documented acceptance (no candidate is a *clearly* better fit,
+and where one is marginally higher on raw R² the beta evidence makes it
+structurally wrong). Energy is no longer flagged (0.812 ≥ 0.80).
+
+### Energy — Commodities re-fit (the D5 open follow-up)
+
+    uv run python tools/benchmark_fit.py refit --category Energy \
+        --candidates 'NIFTY Infrastructure TRI,NIFTY Commodities TRI,NIFTY Energy TRI,NIFTY 500 TRI'
+
+| candidate                | n_regressable | median R² | median beta | median alpha (ann) |
+|--------------------------|---------------|-----------|-------------|--------------------|
+| NIFTY Infrastructure TRI | 4             | **0.8119**| 0.927       | +0.054             |
+| NIFTY 500 TRI            | 4             | 0.7810    | 1.032       | +0.083             |
+| NIFTY Commodities TRI    | 4             | 0.7701    | 0.813       | +0.094             |
+| NIFTY Energy TRI         | 4             | 0.6479    | 0.674       | +0.122             |
+
+**Outcome: keep Energy → NIFTY Infrastructure TRI.** Commodities TRI (0.770)
+did NOT beat the D5-adopted Infrastructure TRI (0.812), so the D5 mapping
+stands and the spec's "remap again if Commodities beats 0.812" condition is not
+met. Energy now sits at 0.812 and is no longer low-confidence.
+
+### Remaining low-confidence categories (median R² < 0.80) — all accepted
+
+Report at as_of 2026-06-13 flagged three: MNC (0.774), Equity Savings (0.775),
+Infrastructure (0.780). Refit evidence below.
+
+**MNC — keep NIFTY MNC TRI (documented acceptance).**
+
+| candidate               | median R² | median beta |
+|-------------------------|-----------|-------------|
+| NIFTY MNC TRI (incumbent)| **0.774**| 0.750       |
+| NIFTY 500 TRI           | 0.714     | 0.672       |
+| NIFTY India Consumption TRI | 0.663 | 0.674       |
+| NIFTY 100 TRI           | 0.646     | 0.657       |
+
+The incumbent is the best available fit and the purpose-built index; every
+broad/thematic alternative is materially worse. MNC is a genuinely niche
+multinational-tilted category (n=5–7) with no better-fitting published index.
+Accept the residual low-confidence flag.
+
+**Infrastructure — keep NIFTY Infrastructure TRI (documented acceptance).**
+
+| candidate                  | median R² | median beta |
+|----------------------------|-----------|-------------|
+| NIFTY Infrastructure TRI (incumbent)| **0.7805**| 0.885 |
+| NIFTY 500 TRI              | 0.7800    | 1.025       |
+| NIFTY India Manufacturing TRI | 0.7691 | 0.963       |
+| NIFTY Commodities TRI      | 0.7540    | 0.751       |
+| NIFTY PSE TRI              | 0.6780    | 0.611       |
+
+Incumbent is (marginally) the best fit. NIFTY 500 TRI ties on R² (0.780) but a
+broad-market remap would strip the thematic meaning the category exists to
+express and push beta to ~1.0. No *clearly* better fit; accept the flag.
+
+**Equity Savings — keep NIFTY Equity Savings TRI (documented acceptance).**
+
+| candidate                 | median R² | median beta |
+|---------------------------|-----------|-------------|
+| NIFTY 100 TRI             | 0.8005    | 0.306       |
+| NIFTY 50 Hybrid 50:50 TRI | 0.7754    | 0.616       |
+| NIFTY 50 Hybrid 65:35 TRI | 0.7754    | 0.474       |
+| NIFTY Equity Savings TRI (incumbent)| 0.7754| 1.027 |
+
+This is the one case where the mechanical "highest R²" rule and the right
+answer diverge. NIFTY 100 TRI scores marginally higher (0.801 vs 0.775) **but
+its beta is 0.31** — i.e. it regresses the fund's ~30% net-equity sleeve and
+dumps the entire debt + arbitrage sleeve return into the intercept. Alpha
+measured that way would systematically report the debt/arbitrage *yield* as
+manager "skill" — the inverse of the Value mis-fit the audit caught. The NIFTY
+Equity Savings TRI already embeds the ~35/30/35 equity/arbitrage/debt structure,
+so alpha against it is true selection skill; its lower R² reflects per-fund
+variation in that mix, not a wrong index. Keep the incumbent; accept the flag.
+(If a future operator prefers raw fit over structural correctness, NIFTY 100 TRI
+is the documented alternative.)
+
+### Acceptance
+
+`benchmark_fit.py report` at 2026-06-13 shows no *un-reviewed* low-confidence
+category: Energy resolved (remapped in D5, Commodities ruled out here), and
+MNC / Infrastructure / Equity Savings each carry a documented acceptance above.
+No `configs/benchmarks.csv` ticker changes in this close-out (comment row only),
+so no scheme-master rebuild or recompute was required and there is no new
+history discontinuity.
