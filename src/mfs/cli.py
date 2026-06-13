@@ -543,6 +543,86 @@ def rank_deep_cmd(
     )
 
 
+@app.command("report")
+def report_cmd(
+    as_of: str | None = typer.Option(
+        None, help="Run date YYYY-MM-DD; default = the latest run dir under "
+        "data/output/shortlist."
+    ),
+    run_dir: str | None = typer.Option(
+        None, "--run-dir", help="Explicit run directory path (overrides --as-of)."
+    ),
+    skip_young: bool = typer.Option(
+        False, "--skip-young",
+        help="Skip the young-funds DB query — render a fully file-based "
+        "(offline) report.",
+    ),
+):
+    """Render a shortlist run dir into a plain-language REPORT.md (E4/E5/E6).
+
+    Per-category picks with ISINs, explained metrics, liquidity and
+    drawdown context, plus the exception sections (exclusions, partial
+    disclosure, overlap breaches, index-wins verdicts, young funds) and
+    the static guidance (taxes/lock-ins, switch hysteresis, cadence,
+    scope, glossary). File-based except the optional young-funds query.
+    """
+    configure_logging()
+    from pathlib import Path
+
+    from mfs.rank import report as report_mod
+
+    if run_dir:
+        target = Path(run_dir)
+    elif as_of:
+        target = paths.shortlist_dir(as_of)
+    else:
+        base = paths.output_dir() / "shortlist"
+        runs = (
+            sorted((p for p in base.iterdir() if p.is_dir()), key=lambda p: p.name)
+            if base.exists() else []
+        )
+        if not runs:
+            typer.echo(
+                "ERROR: no run dirs under data/output/shortlist; "
+                "pass --as-of or --run-dir.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        target = runs[-1]
+    if not target.is_dir():
+        typer.echo(f"ERROR: no shortlist run dir at {target}", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        report_as_of = date.fromisoformat(target.name)
+    except ValueError:
+        report_as_of = _parse_date(as_of) or date.today()
+
+    young = None
+    if not skip_young:
+        from mfs.db import queries as q
+
+        try:
+            young = q.young_rankable_schemes(report_as_of)
+        except Exception as e:  # noqa: BLE001
+            typer.echo(
+                f"WARN: young-funds DB query failed ({e}); the report will "
+                "note the section as not queried.",
+                err=True,
+            )
+
+    out = report_mod.build_report(target, as_of=report_as_of, young_funds=young)
+    n_sections = sum(
+        1 for line in out.read_text(encoding="utf-8").splitlines()
+        if line.startswith("## ")
+    )
+    n_young = young.height if young is not None else 0
+    typer.echo(
+        f"report written: {out} ({n_sections} sections, "
+        f"{n_young} young funds listed)"
+    )
+
+
 @shortlist_app.command("diff")
 def shortlist_diff_cmd(
     run1: str = typer.Argument(

@@ -124,6 +124,74 @@ def scheme_master(
     return pl.DataFrame(rows, schema=schema, orient="row")
 
 
+#: E5 'young funds — not yet eligible': eligibility window in years. A fund
+#: younger than this cannot be ranked (insufficient rolling-return history),
+#: so the report lists it as not-yet-eligible rather than rejected.
+YOUNG_FUND_MIN_YEARS = 3
+
+
+def _years_before(as_of: date, years: int) -> date:
+    """``as_of`` minus N calendar years (Feb 29 clamps to Feb 28)."""
+    try:
+        return as_of.replace(year=as_of.year - years)
+    except ValueError:
+        return as_of.replace(year=as_of.year - years, day=28)
+
+
+def young_rankable_filter(
+    sm: pl.DataFrame,
+    as_of: date,
+    rankable_categories: list[str],
+    min_years: int = YOUNG_FUND_MIN_YEARS,
+) -> pl.DataFrame:
+    """Pure polars filter behind ``young_rankable_schemes`` — unit-testable
+    without a DB.
+
+    Keeps schemes in a rankable category whose ``inception_date`` falls
+    inside the trailing ``min_years`` window (too young to rank), excluding
+    legacy ``*_bonus`` option rows. ``plan_type``/``option_type``/
+    ``is_active`` are enforced only when those columns are present, so
+    frames pre-filtered by the SQL wrapper pass through unchanged.
+    """
+    if sm.is_empty():
+        return sm
+    cutoff = _years_before(as_of, min_years)
+    expr = (
+        pl.col("canonical_category").is_in(rankable_categories)
+        & pl.col("inception_date").is_not_null()
+        & (pl.col("inception_date") > cutoff)
+    )
+    if "base_fund_id" in sm.columns:
+        expr = expr & ~(
+            pl.col("base_fund_id").str.ends_with("_bonus").fill_null(False)
+        )
+    for col, want in (("plan_type", "DIRECT"), ("option_type", "GROWTH")):
+        if col in sm.columns:
+            expr = expr & (pl.col(col) == want)
+    if "is_active" in sm.columns:
+        expr = expr & pl.col("is_active")
+    return sm.filter(expr).sort(
+        ["canonical_category", "inception_date", "scheme_code"]
+    )
+
+
+def young_rankable_schemes(
+    as_of: date, min_years: int = YOUNG_FUND_MIN_YEARS,
+) -> pl.DataFrame:
+    """Read-only E5 helper: active DIRECT+GROWTH schemes in rankable
+    categories with ``inception_date > as_of - min_years`` — the 'young
+    funds — not yet eligible' list the investor report renders."""
+    from mfs.config import get_thresholds
+
+    sm = scheme_master(plan_type="DIRECT", option_type="GROWTH", is_active=True)
+    if sm.is_empty():
+        return sm
+    cats = list(get_thresholds().get("rankable_categories", []))
+    return young_rankable_filter(
+        sm, as_of=as_of, rankable_categories=cats, min_years=min_years
+    )
+
+
 # Explicit dtypes: the sparse Phase 2 columns can be all-null in the first
 # rows of a partition, which breaks polars' row-orient schema inference
 # (infer_schema_length=100) — never rely on inference for DB reads.
@@ -665,6 +733,33 @@ def table_count(table: str) -> int:
         raise KeyError(table)
     with connect() as c:
         return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+#: Tables whose full row counts go into the run manifest (F-10), plus the
+#: computed_metrics partition at the run's as_of (added by table_counts).
+MANIFEST_COUNT_TABLES: tuple[str, ...] = (
+    "nav_daily",
+    "benchmark_daily",
+    "holdings_monthly",
+    "portfolio_turnover_monthly",
+    "scheme_aum_monthly",
+    "index_constituents_monthly",
+)
+
+
+def table_counts(as_of: date) -> dict[str, int]:
+    """Row counts for the run-provenance manifest (F-10): full counts for
+    each ``MANIFEST_COUNT_TABLES`` input table plus the ``computed_metrics``
+    partition at ``as_of``."""
+    out: dict[str, int] = {}
+    with connect() as c:
+        for table in MANIFEST_COUNT_TABLES:
+            out[table] = c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        out["computed_metrics"] = c.execute(
+            "SELECT COUNT(*) FROM computed_metrics WHERE as_of_date = %s",
+            (as_of,),
+        ).fetchone()[0]
+    return out
 
 
 def trading_calendar_bounds(since: date) -> tuple[int, date | None, date | None]:

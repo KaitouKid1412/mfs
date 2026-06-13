@@ -19,13 +19,14 @@ stamp, never deleted — see ``writers.sync_scheme_master``.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from datetime import date
 
 import polars as pl
 
 from mfs.db import queries as q
 from mfs.db import writers as w
-from mfs.errors import IngestError
+from mfs.errors import IngestError, PipelineError
 from mfs.ingest import amfi_nav
 from mfs.master.benchmark_map import benchmark_for
 from mfs.utils.logging import get_logger
@@ -235,6 +236,69 @@ def _canonical_category(raw: str | None) -> str | None:
     return None
 
 
+# F-12 category-relabel guard: _canonical_category returns None silently for
+# any unmatched AMFI category string, so an AMFI/SEBI relabel (e.g.
+# "Flexi Cap Fund" -> "Flexicap Fund") would silently evaporate a whole
+# canonical category from the ranked universe. The guard halts build() when a
+# category that currently holds at least this many ACTIVE schemes in the DB
+# would drop to zero matches in the new snapshot — halt-and-fix beats ranking
+# a silently shrunken universe (fail-fast invariant). A legitimate category
+# retirement requires updating CATEGORY_RULES, which is the intended response.
+CATEGORY_GUARD_MIN_SCHEMES = 5
+
+
+def _existing_active_category_counts() -> dict[str, int]:
+    """Active-scheme count per canonical_category currently in the DB."""
+    from mfs.db.connection import connect
+
+    with connect() as c:
+        rows = c.execute(
+            "SELECT canonical_category, COUNT(*) FROM scheme_master "
+            "WHERE is_active AND canonical_category IS NOT NULL "
+            "GROUP BY canonical_category"
+        ).fetchall()
+    return {r[0]: int(r[1]) for r in rows}
+
+
+def check_category_disappearance(
+    new_counts: dict[str, int],
+    existing_counts: dict[str, int],
+    unmatched_raw: dict[str, int],
+    threshold: int = CATEGORY_GUARD_MIN_SCHEMES,
+) -> None:
+    """Raise PipelineError if any currently-populated category (>= threshold
+    active schemes in the DB) has zero matches in the new build.
+
+    ``unmatched_raw`` (raw AMFI category string -> scheme count from the new
+    snapshot) is included in the error so the operator can see what the
+    relabeled strings look like and patch CATEGORY_RULES.
+    """
+    vanished = sorted(
+        cat
+        for cat, n in existing_counts.items()
+        if n >= threshold and new_counts.get(cat, 0) == 0
+    )
+    if not vanished:
+        return
+    unmatched_desc = (
+        "; ".join(
+            f"{raw!r} ({n} schemes)"
+            for raw, n in sorted(unmatched_raw.items(), key=lambda kv: -kv[1])
+        )
+        or "<none — categories may have been re-mapped, not just relabeled>"
+    )
+    raise PipelineError(
+        "scheme_master category-relabel guard: categories "
+        f"{vanished} hold >= {threshold} active schemes in "
+        "the DB but matched 0 schemes in the new AMFI snapshot. A SEBI/AMFI "
+        "category relabel would otherwise silently evaporate them from the "
+        "ranked universe. Unmatched raw AMFI category strings in this "
+        f"snapshot: {unmatched_desc}. Fix: extend CATEGORY_RULES in "
+        "src/mfs/master/scheme_master.py (or confirm a genuine category "
+        "retirement) and re-run `mfs build scheme-master`."
+    )
+
+
 def _base_fund_id(scheme_name: str, amc_slug: str) -> str:
     """Strip plan/option tokens to derive a shared id across siblings."""
     s = scheme_name
@@ -258,11 +322,21 @@ def build() -> pl.DataFrame:
     # Derive plan/option/category/amc_slug/base_fund_id per row
     snap_pd = snap.unique("scheme_code", keep="last")
     rows = []
+    # F-12: raw AMFI category strings that matched NO rule (and are not the
+    # deliberately-excluded closed/interval types) — relabel tripwire input.
+    unmatched_raw: Counter[str] = Counter()
     for r in snap_pd.iter_rows(named=True):
         scheme_name = r["scheme_name"] or ""
         amc_name = r["amc_name"] or "Unknown"
         plan, option = _classify_plan_option(scheme_name)
-        canon = _canonical_category(r["amfi_category"])
+        raw_category = r["amfi_category"]
+        canon = _canonical_category(raw_category)
+        if (
+            canon is None
+            and raw_category
+            and not _CLOSED_OR_INTERVAL_RE.search(raw_category)
+        ):
+            unmatched_raw[raw_category] += 1
         # Sub-classify sectoral/thematic funds based on scheme name — with the
         # AMC house name stripped so it can't trigger a sector rule (e.g.
         # "BANK OF INDIA ..." / "Bajaj Finserv ...").
@@ -338,6 +412,31 @@ def build() -> pl.DataFrame:
             count=unknown_direct.height,
             schemes=[f"{code}: {name}" for code, name in unknown_direct.rows()],
         )
+
+    # F-12 category-relabel guard. First surface every unmatched raw AMFI
+    # category string (with scheme counts) at warning level, then halt if a
+    # currently-populated canonical category would vanish from the new build
+    # — TRUNCATE-free diff-sync or not, ranking a silently shrunken universe
+    # violates the fail-fast invariant.
+    if unmatched_raw:
+        log.warning(
+            "scheme_master.unmatched_categories",
+            n_distinct=len(unmatched_raw),
+            n_schemes=sum(unmatched_raw.values()),
+            categories=dict(
+                sorted(unmatched_raw.items(), key=lambda kv: -kv[1])
+            ),
+        )
+    new_counts = {
+        cat: n
+        for cat, n in df.filter(pl.col("canonical_category").is_not_null())
+        .group_by("canonical_category")
+        .len()
+        .iter_rows()
+    }
+    check_category_disappearance(
+        new_counts, _existing_active_category_counts(), dict(unmatched_raw)
+    )
 
     w.sync_scheme_master(df)
     # D2 point-in-time history: record the post-sync state (including

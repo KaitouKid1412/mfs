@@ -1,170 +1,271 @@
 # mfs — Indian Mutual Fund Evaluation Pipeline
 
-Ranks every active Indian mutual fund (Direct Growth plans) within its AMFI equity category
-using rolling risk-adjusted metrics over a 5+ year NAV history. Output is a top-N shortlist
-per category as Parquet + CSV.
+Ranks every active, open-ended Indian mutual fund (Direct + Growth plans)
+within its canonical SEBI category using rolling risk-adjusted NAV metrics
+plus portfolio-disclosure signals (PTR, style drift, AUM impact cost,
+overlap). Postgres-backed, fail-fast, with per-run provenance. Output is a
+staged shortlist per category plus a plain-language report.
 
-## v1 scope (NAV-only filters)
+Accuracy note: this README describes the system as it is, including its
+known weaknesses (see [Known limitations](#known-limitations)). The full
+audit it answers to lives at `docs/audit/2026-06-10_pipeline_audit.md`.
 
-| Metric | What it measures |
-|---|---|
-| Rolling 3Y / 5Y returns | Median + 25th-percentile annualized CAGR across overlapping windows |
-| Jensen's α (3Y) | Excess return after controlling for benchmark exposure |
-| β, R² (3Y) | Benchmark loading and explained-variance fit |
-| Sortino (3Y) | Excess return per unit of downside deviation vs T-bill MAR |
-| Capture up / down / efficiency | Asymmetry of fund response to benchmark up vs down days |
-| Information Ratio (3Y) | Active return per unit of tracking-error |
+## Project invariants
 
-Active Share, ISIN overlap, AUM drag, PTR, stress-test liquidity, manager tenure → v2.
+These override convenience everywhere in the code:
 
-## Setup (one-time)
+1. **Fail-fast ingestion** — the pipeline halts on stale data or scrape
+   failures; it never proceeds with partial inputs.
+2. **No manual data entry, no nullable strict fields** — auto-scrape clean
+   tuples or skip the AMC entirely. Half-data is worse than no data.
+3. **AUM is AMFI-AAUM-only** — `scheme_aum_monthly` CHECK-constrains
+   `source_amc='amfi_aaum'`; the factsheet-AUM path was deleted. Do not add
+   `parse_aum` to adapters.
+4. **Incremental by default, `--full` to force** — one flag meaning
+   re-download AND re-parse AND re-write.
 
-```bash
-uv sync
+## Architecture
+
 ```
-Resolves and installs all Python dependencies declared in `pyproject.toml` into a project-local
-`.venv/`. Pins are captured in `uv.lock`. Run again whenever dependencies change.
-
-## End-to-end pipeline
-
-The flow is **ingest → build → compute → rank**. Each stage writes a Parquet partition that
-the next stage reads, so any stage is independently re-runnable.
-
-### 1. Ingest AMFI NAVs
-
-```bash
-uv run mfs ingest navs --backfill         # first time, ~5-15 min
-uv run mfs ingest navs                    # daily incremental, ~5 sec
+ingest adapters ──> coverage gates ──> Postgres ──> compute ──> rank-deep ──> artifacts
+ (AMFI NAV, NSE      (Gate A blocking,  (schema:     (phase 1     (stage 1/2/3)  (CSV/parquet,
+  TRI, RBI T-bill,    Gate B advisory,   src/mfs/db/  NAV metrics,                manifest.json,
+  ~46 holdings +      freshness gates)   schema.sql)  phase 2                     REPORT.md,
+  ~29 factsheet                                       disclosure                  rank_history)
+  adapters, NSE                                       metrics)
+  bhavcopy, AMFI AAUM)
 ```
-- `--backfill` fetches the full historical NAV series from AMFI's bulk endpoint
-  (`portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx`) in 90-day windows, starting from
-  `configs/pipeline.yaml: ingest.amfi_nav.backfill_start`. Stored at
-  `data/curated/nav_daily/year=YYYY/data.parquet`. Idempotent — dedupes on
-  `(scheme_code, nav_date)` so re-running is safe.
-- Without flags, fetches just today's `NAVAll.txt` and appends to the current year's partition.
 
-### 2. Ingest NSE TRI benchmarks
+Everything stateful lives in Postgres (`mfs db init` creates/migrates the
+schema idempotently): `nav_daily` (~30M rows), `benchmark_daily` (TRI),
+`risk_free_daily`, `scheme_master` (+ `scheme_master_history`),
+`holdings_monthly`, `portfolio_turnover_monthly`, `scheme_aum_monthly`,
+`index_constituents_monthly`, `stock_adv_daily`, `computed_metrics`,
+`rank_history`. Raw downloads (factsheet PDFs, holdings Excels, bhavcopies)
+are cached under `data/raw/` — much of it unrecoverable upstream, hence the
+[backup policy](#ops). Parquet appears only in output artifacts; the
+parquet-era data path is gone.
 
-```bash
-uv run mfs ingest benchmarks              # ~5-10 min for 16y × 9 equity tickers
-```
-POSTs to `niftyindices.com/Backpage.aspx/getTotalReturnIndexString` in 360-day chunks
-(endpoint's per-request cap), parses the wrapped JSON response, and writes one Parquet
-partition per ticker at `data/curated/benchmark_daily/ticker=<slug>/data.parquet`.
-Pre-computes daily log returns alongside the close.
+## The pipeline (`mfs pipeline`)
 
-**Hybrid/Equity Savings indices** (3 of 12 categories) aren't exposed via this endpoint
-— supply them as CSVs at `data/raw/benchmarks/manual/<slug>.csv` with columns
-`date,close` (date in `DD-Mon-YYYY` or `YYYY-MM-DD`). The loader auto-detects column
-variants like `Total Returns Index`. Required slugs for the hybrid indices:
+`mfs pipeline [--as-of YYYY-MM-DD] [--full] [--skip-phase2]
+[--allow-fallback]` runs, under a Postgres advisory lock (one pipeline at a
+time):
 
-| Category | Slug |
-|---|---|
-| Aggressive Hybrid | `nifty_50_hybrid_65_35_tri.csv` |
-| Balanced Advantage | `nifty_50_hybrid_50_50_tri.csv` |
-| Equity Savings | `nifty_equity_savings_tri.csv` |
+1. **ingest navs** (incremental) — AMFI daily NAVs; zero/negative NAVs
+   rejected at ingest (DB CHECK backs it).
+2. **ingest benchmarks** — NSE TRI series per `configs/benchmarks.csv`
+   (incremental tail re-fetch; `--full` re-pulls history), then
+   **synthesize hybrid TRIs** for hybrid categories from equity TRI +
+   91-day T-bill components (see limitations — this biases hybrid alpha).
+3. **ingest tbill** — RBI/FBIL 91-day T-bill auctions → daily risk-free
+   series. `--allow-fallback` substitutes a synthetic 6.5% flat series and
+   is for debugging only.
+4. **build scheme-master** — today's AMFI snapshot → plan/option parsing,
+   canonical categories, benchmark mapping. Diff-sync: departed schemes are
+   kept with `is_active=false` + `departed_at`, never deleted (survivorship
+   containment), and a post-sync snapshot lands in `scheme_master_history`.
+   A **category-relabel guard** halts the build if a canonical category
+   that currently holds ≥5 active schemes would drop to 0 matches (an
+   AMFI/SEBI relabel must not silently evaporate a category).
+5. **Coverage Gate A (BLOCKING)** — NAV / benchmarks / risk-free /
+   scheme_master contracts: emptiness, staleness, history depth, entity
+   coverage, interior NAV-calendar gaps. Any breach halts before the
+   expensive Phase-2 ingest.
+6. **Phase-2 ingest** (skipped by `--skip-phase2`): AMFI quarterly AAUM;
+   factsheet PDFs per AMC (PTR); per-scheme monthly portfolio Excels
+   (holdings with ISINs); NSE bhavcopy (stock ADV). Per-AMC failures are
+   isolated and reported; all-AMCs-failed is systemic and halts.
+7. **derive constituents** — index constituent weights are derived
+   in-pipeline from index-tracker fund holdings for the latest month (D9),
+   then the CSV ingest upserts them (plus any operator backfills).
+8. **Coverage Gate B (ADVISORY)** — holdings / PTR / AAUM / constituents /
+   stock-ADV per-fund coverage: gaps are reported loudly and the affected
+   funds are flagged/penalized downstream, but the run continues.
+9. **freshness check (BLOCKING)** — whole-source staleness thresholds from
+   `configs/pipeline.yaml` (`freshness:`): NAV/benchmarks ≤5 business days,
+   T-bill ≤14 days, holdings/PTR/constituents ≤75 days, stock-ADV ≤10 days,
+   AAUM ≤150 days. The global MAX(date) of a table going dark for more than
+   one publication cycle halts the run; per-fund gaps stay advisory in
+   Gate B.
+10. **compute phase1** — NAV metrics for every eligible scheme.
+11. **rank-deep** — the three-stage ranker (below), which runs Phase-2
+    compute itself, restricted to the Stage-1 candidate pool.
 
-### 3. Ingest risk-free rate
+The coverage summary is printed on every run — success, advisory gaps, or a
+Gate A halt. The pipeline halts at the first required stage that fails; no
+partial or stale data ever reaches compute or ranking.
 
-```bash
-uv run mfs ingest tbill --backfill        # uses a 6.5% flat fallback in v1
-```
-Writes a daily 91-day T-bill series at `data/curated/risk_free_daily/risk_free.parquet`
-with columns `(date, rate_annual, rate_daily)`. Used as MAR in Sortino and as r_f in the
-Jensen's α regression.
-
-**v1 caveat**: ships with a constant 6.5% fallback. Rate-level constants don't bias α
-or β (both sides of the regression shift by the same constant) but Sortino and absolute
-alpha for 2020–2022 windows will be off. Drop a real CSV at
-`data/raw/fbil_tbill/manual/tbill.csv` with columns `date, rate_annual_pct` to replace.
-
-### 4. Build the scheme master
-
-```bash
-uv run mfs build scheme-master            # ~5 sec, ~14k rows
-```
-Pulls today's AMFI NAVAll snapshot and derives the canonical scheme dimension:
-parses scheme names → `plan_type` (DIRECT/REGULAR) + `option_type` (GROWTH/IDCW),
-slugifies AMC names into `amc_code`, maps AMFI category strings to `canonical_category`,
-joins `configs/benchmarks.csv` for `benchmark_ticker`, and computes `inception_date` /
-`last_seen_date` from the NAV history. Output: `data/curated/scheme_master/scheme_master.parquet`.
-
-### 5. Compute metrics
-
-```bash
-uv run mfs compute metrics                # ~5-10 min for ~400 eligible funds
-```
-For every Direct+Growth scheme with a benchmark mapping, aligns NAV onto the master
-trading calendar, then computes every metric in `src/mfs/compute/` (rolling returns,
-Jensen's α, Sortino, capture ratios, Information Ratio, R², β) via 3Y/5Y weekly-step
-windows. Writes one row per scheme to
-`data/metrics/computed_metrics/as_of_date=YYYY-MM-DD/data.parquet`. The partition is
-delete-then-write, so re-running for the same `--as-of` is idempotent.
-
-### 6. Rank and write shortlists
-
-```bash
-uv run mfs rank --top-n 10                # ~1 sec, writes one file per category
-```
-Loads the latest computed_metrics partition, applies hard filters (capture efficiency
-> 1.15, IR > 0.5, R² in [0.70, 0.90], per-category beta band), z-scores remaining
-funds within their `canonical_category`, computes the weighted composite score from
-`pipeline.yaml: composite_weights`, and writes the top-N to
-`data/output/shortlist/<as_of_date>/<category>.{parquet,csv}`.
-
-Flags:
-- `--category "Flexi Cap"` — restrict output to one category
-- `--as-of 2026-05-15` — re-rank a historical computed_metrics partition
-- `--skip-filters` — debug-only; bypass hard filters (useful when benchmarks are stubbed)
-
-## Inspection & diagnostics
-
-```bash
-uv run mfs status                         # list which partitions exist on disk
-```
-Shows present years for `nav_daily`, present tickers for `benchmark_daily`, whether
-`scheme_master` and `risk_free_daily` are built, and which `as_of_date` partitions
-exist under `computed_metrics`.
-
-```bash
-uv run mfs validate                       # data-quality report
-```
-Sanity-checks: asserts NIFTY 50 TRI CAGR since 2010 > 12% (guards against accidentally
-ingesting Price Return), reports total NAV rows × scheme count.
-
-```bash
-uv run pytest                             # ~1 sec, 16 tests
-```
-Golden math tests for α/β/R²/capture/Sortino/IR + AMFI parser + manual-CSV loader +
-rank scoring.
-
-## Orchestrated targets (Makefile)
-
-```bash
-make backfill     # ingest navs --backfill + benchmarks + tbill + scheme-master
-make daily        # incremental: navs + benchmarks + tbill + scheme-master + compute + rank
-make rank         # rank only — fast iteration on weights without recomputing
-make qa           # validate
-make test         # pytest
-```
+**When the pipeline halts**, that is the system working as designed. The
+two halts that need operator judgment rather than a re-run:
+- *Category-relabel guard* (`PipelineError` naming the category + the
+  unmatched raw AMFI strings): extend `CATEGORY_RULES` in
+  `src/mfs/master/scheme_master.py` for the relabel (or confirm a genuine
+  category retirement) and re-run `mfs build scheme-master`.
+- *Freshness/Gate A breach*: fix the ingestion source; do not bypass the
+  gate.
 
 ## Methodology
 
-`/Users/suryavamseeayyagari/.claude/plans/kind-drifting-ullman.md`. Pipeline weights and
-thresholds live in `configs/pipeline.yaml`; per-category beta bands in
-`configs/category_thresholds.yaml`; canonical category → benchmark mapping in
-`configs/benchmarks.csv`.
+### Phase 1 metrics (NAV-only, per scheme vs mapped benchmark TRI)
 
-## Data sources
+Rolling 3y/5y windows, weekly step, one trailing-epoch convention across all
+metrics: rolling return distribution (median + p25 CAGR), Jensen's alpha
+(log-basis regression vs benchmark, T-bill risk-free), beta, R², Sortino
+(T-bill MAR), up/down capture + capture efficiency, information ratio, plus
+display-only max-drawdown depth/recovery columns.
 
-| Source | Purpose | Endpoint |
-|---|---|---|
-| AMFI bulk history | All scheme NAVs since 2008 | `portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx` |
-| AMFI NAVAll | Daily incremental NAVs | `amfiindia.com/spages/NAVAll.txt` |
-| NSE Indices | TRI benchmarks (NOT Yahoo PR) | `niftyindices.com/Backpage.aspx/getTotalReturnIndexString` |
-| FBIL / manual | 91-day T-bill yield | manual CSV in v1 |
+**Signed alpha (locked D1):** `alpha_3y_annualized` is the median over ALL
+rolling windows — negative alpha is stored and ranked as negative; there is
+no t-stat censoring. `alpha_confidence` (share of windows with |t| ≥ 1) is a
+display column, never a filter.
 
-## v2 (deferred)
+### The three-stage ranker (`mfs rank-deep`)
 
-AMC portfolio adapters → Active Share, pairwise ISIN overlap pruning at the shortlist
-stage, AUM drag, PTR, manager tenure. SEBI stress-test PDFs are v3.
+- **Stage 1** — full universe: relaxed hard filters (drop only
+  catastrophically broken funds: capture efficiency < 0.5, IR < −1, R²/beta
+  bands, stale NAV, insufficient history), then the **core-metric gate
+  (locked D2)**: funds missing any core Stage-1 metric are hard-dropped into
+  a visible `stage1/excluded.csv` with a contract-vocabulary
+  `exclusion_reason` — nulls never score as category-average. Legacy
+  bonus-option duplicates are deduped before z-scoring. Z-scores within
+  category, composite from `composite_weights_stage1` (alpha 0.25, 3y/5y
+  return medians 0.15 each, p25s 0.10 each, Sortino/IR/capture 0.10/0.10/0.05).
+- **Stage 2** — top-20 per category: Phase-2 compute (active share vs
+  derived constituents, style drift, PTR, AUM impact cost in
+  days-to-liquidate vs stock ADV) runs on just this pool. Stage-1's
+  full-universe z-scores are carried (never re-z-scored in the small pool);
+  Phase-2 metrics are z-scored within the pool. **Missing disclosures
+  (locked D3)** are soft-neutral: weight renormalization + a calibrated
+  fixed penalty (≈ median observed PTR penalty) + a `partial_disclosure`
+  flag — missing scores like average-bad, never better than disclosed-bad.
+  Soft penalties: PTR ramp above 150% turnover (arbitrage-mechanics
+  categories exempt), log-scale AUM-impact ramp, style-drift negative
+  weight.
+- **Stage 3** — pairwise holdings overlap on survivors. **Locked D4: keep
+  both funds and flag the breach** (overlap % + counterpart) — no
+  cross-category drops. Breaches land in `stage3/overlap_breaches.csv`;
+  a full `overlap_matrix.csv` supports subset buyers.
+
+Context columns ride along every output row: per-category benchmark-fit
+confidence (median R² < 0.80 ⇒ alpha is low-confidence in that category),
+`benchmark_is_synthetic` for hybrid categories, and the passive-alternative
+verdict (`passive_alternative.csv`: benchmark TRI vs category median fund,
+with the pick's margin over the investable index).
+
+### Validation
+
+`tools/backtest_ic.py` retro-backtests the Stage-1 composite quarterly from
+2016 (Spearman IC vs forward category-relative returns, weight sensitivity,
+pre-registered verdict thresholds). **Survivorship-biased by construction**
+(see limitations) — every IC it reports is an upper bound.
+`tools/cross_validate.py` + `docs/ops/spot_check.md` reconcile our numbers
+against external sources after every recompute.
+
+## Output artifacts
+
+`data/output/shortlist/<as_of>/`:
+
+| artifact | what it is |
+|---|---|
+| `stage1/<category>.csv` (+`.parquet`), `stage1/mf_report.csv` | full Stage-1 ranking per category; top-5 consolidated |
+| `stage1/excluded.csv` | D2 hard-drops with `exclusion_reason` (`INSUFFICIENT_HISTORY \| MISSING_CORE_METRIC:<name> \| STALE_NAV \| FILTER:<name>`) |
+| `stage2/…` | pool re-rank, coverage report, vestigial `dropped.csv` (structurally empty post-D3) |
+| `stage3/…` | final picks with overlap flags, `overlap_breaches.csv`, `overlap_pairs.csv`, `overlap_matrix.csv` |
+| `passive_alternative.csv` | per-category index-vs-funds verdict (D7) |
+| `manifest.json` | run provenance: git SHA + dirty flag, config SHA-256, `pipeline_version`, package version, per-table DB row counts, stage survivor counts |
+| `REPORT.md` | plain-language investor report rendered by `mfs report` over the run dir (report tooling is being actively extended) |
+
+Point-in-time history persists in Postgres: `rank_history` (every stage
+outcome per run, including exclusions with reasons) and
+`scheme_master_history` (universe snapshots). `mfs shortlist diff` gives
+run-to-run ENTERED/EXITED/RANK-MOVED monitoring from the artifacts alone.
+
+## CLI map
+
+| command | purpose |
+|---|---|
+| `mfs pipeline` | end-to-end run (stages above) |
+| `mfs ingest navs / benchmarks / tbill / amfi-aum / bhavcopy / constituents / managers / holdings` | individual ingest stages |
+| `mfs ingest ter` | manual-CSV TER path — deprecated (violates the no-manual-entry invariant); slated for removal/replacement pending the TER endpoint decision (`docs/audit/ter_endpoint_spike_2026-06.md`) |
+| `mfs build scheme-master` | rebuild the scheme dimension (diff-sync + relabel guard) |
+| `mfs compute phase1 / phase2 / metrics` | metric computation into `computed_metrics` |
+| `mfs rank` | Stage 1 only |
+| `mfs rank-deep` | Stage 1 + 2 + 3 (+ Phase-2 compute on the pool) |
+| `mfs report` | render `REPORT.md` for a shortlist run dir |
+| `mfs shortlist diff` | run-to-run diff, pure file comparison |
+| `mfs status` / `mfs db status` | row counts + date bounds per table |
+| `mfs db init` | create DB / apply schema (idempotent) |
+| `mfs db migrate` / `mfs db verify` | legacy parquet→Postgres one-shot tooling (retirement pending confirmation the parquet store is dead) |
+| `mfs db coverage` / `mfs missing-data` / `mfs validate` | diagnostics: trading-day coverage, gap inventory, TRI sanity |
+| `mfs audit-scheme` | one-off metric computation for a (scheme, benchmark) pair |
+
+Note: standalone commands (`mfs rank-deep`, `mfs compute …`) do NOT take the
+pipeline advisory lock; transactional writes bound the damage, but don't run
+them concurrently with `mfs pipeline`.
+
+## Development
+
+```bash
+uv sync                                  # install (uv.lock pinned)
+uv run pytest -q                         # full suite (needs data/raw for adapter value-pins)
+uv run pytest -m 'not local_data' -q     # the CI subset — no data/raw, no Postgres, no network
+uv run mypy                              # typed baseline: compute + rank (advisory until 0 errors)
+uv run ruff check src tests              # advisory; backlog being ratcheted down
+```
+
+Tests pinned to gitignored `data/raw` artifacts are auto-marked
+`local_data` (tests/conftest.py); committed PDF page-extracts keep the real
+parse paths covered in CI. GitHub Actions (`.github/workflows/ci.yml`) runs
+ruff + mypy (advisory), the `not local_data` suite (blocking), a pinned
+deselected-count tripwire (a new local-only test fails the build until
+consciously pinned), and pip-audit (blocking).
+
+Config single sources of truth: `configs/pipeline.yaml` (weights, filters,
+freshness thresholds, soft penalties, `pipeline_version` — required, no code
+default), `configs/category_thresholds.yaml`, `configs/benchmarks.csv`.
+
+## Ops
+
+- **Backups**: `scripts/backup.sh` (pg_dump -Fc with 7-daily/4-weekly
+  rotation + restic-or-tar of `data/raw`) and the monthly
+  `scripts/backup.sh restore-check` drill — runbook with cron/launchd
+  recipes at `docs/ops/backups.md`. Scheduling is deliberately an operator
+  decision.
+- **External spot-check**: `docs/ops/spot_check.md` — mandatory after every
+  recompute, before a shortlist is publishable; includes the recurring
+  Kotak holdings parity check.
+- **Scraping provenance**: `docs/ops/scraping_provenance.md` — every
+  non-public access path (extracted keys, browser mimicry, test hosts,
+  server-action ids) with rotation blast radius, ToS judgment, and an
+  accept/replace/drop decision awaiting user sign-off.
+
+## Known limitations
+
+- **Survivorship before 2026-06**: `scheme_master_history` /
+  `rank_history` only exist from June 2026; funds that died/merged earlier
+  are absent from NAV history entirely. Backtest ICs are upper bounds; the
+  diff-sync containment only protects the future.
+- **Synthetic hybrid benchmarks**: hybrid-category TRIs compound a 91-day
+  T-bill debt sleeve, systematically easier to beat than the real composite
+  debt indices (~35–140bp/yr one-sided at 35–70% debt weight). Hybrid
+  alpha/beat-rates are overstated; every affected row carries
+  `benchmark_is_synthetic=true`.
+- **TER is not a signal yet**: no clean automated source survived the
+  endpoint spike (`docs/audit/ter_endpoint_spike_2026-06.md`); the manual
+  path violates the no-manual-entry invariant and is deprecated. Expense
+  drag is currently unmodeled.
+- **active_share is dormant** until ≥3 matched (holdings, constituents)
+  months accrue (~2026-07); rank-deep prints an activation banner. Until
+  then Stage 2 renormalizes around it.
+- **Holdings adapter fixture coverage is 3/46**: most adapters are guarded
+  by runtime gates (weight-sum, statement-date, shrinkage) rather than
+  committed fixtures — a silent parse regression is unlikely but not
+  impossible.
+- **Kotak holdings provenance**: served from a `prodtest` host with no SLA
+  (see `docs/ops/scraping_provenance.md`); mitigated by a recurring manual
+  parity check.
+- **Static tax figures** in the report (STCG/LTCG/ELSS lock-in) are baked
+  as of FY2025-26 and go stale with the next Finance Act.
+- Full audit + remediation state: `docs/audit/2026-06-10_pipeline_audit.md`,
+  `docs/phase6/`.

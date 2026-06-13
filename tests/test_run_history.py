@@ -498,6 +498,11 @@ def test_rank_deep_persists_history_at_tail(monkeypatch):
         writers, "persist_rank_history",
         lambda df, as_of: persisted.append((df, as_of)) or df.height,
     )
+    # F-10: paths.shortlist_dir is NOT redirected in this test, so the
+    # manifest hook would otherwise write into the real data/output tree
+    # (and count live DB tables). Stub it out — the manifest has its own
+    # tests (test_provenance.py).
+    monkeypatch.setattr(shortlist, "_emit_manifest", lambda as_of, result: None)
 
     result = shortlist.rank_deep(as_of=AS_OF, skip_phase2_compute=True)
     assert result["as_of"] == AS_OF.isoformat()

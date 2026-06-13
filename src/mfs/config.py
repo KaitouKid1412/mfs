@@ -181,7 +181,11 @@ class PipelineConfig(BaseModel):
     composite_weights_stage1: dict[str, float]
     composite_weights_stage2: dict[str, float]
     soft_penalties: SoftPenaltiesConfig = Field(default_factory=SoftPenaltiesConfig)
-    pipeline_version: str = "v1.0.0"
+    # F-10: REQUIRED — configs/pipeline.yaml is the single source of truth for
+    # the version stamped into computed_metrics and the run manifest. A silent
+    # code-side default ("v1.0.0") contradicted the yaml and could mislabel a
+    # whole partition; a missing yaml key must fail loudly instead.
+    pipeline_version: str
 
 
 class Settings(BaseSettings):

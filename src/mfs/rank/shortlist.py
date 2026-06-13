@@ -11,7 +11,7 @@ from typing import Any
 
 import polars as pl
 
-from mfs import paths
+from mfs import paths, provenance
 from mfs.db import queries as q
 from mfs.db import writers as w
 from mfs.ingest.synthetic_hybrid import SYNTHETIC_BENCHMARK_TICKERS
@@ -449,6 +449,20 @@ def rank(
     return written
 
 
+def _emit_manifest(as_of: date, result: dict) -> None:
+    """F-10 run provenance: write ``manifest.json`` at the run's tail.
+
+    Best-effort — a provenance failure (missing git binary, unreachable DB
+    for the count section, read-only output dir) must never break a
+    completed ranking run. On success the manifest path is added to the
+    result dict as ``manifest_file``."""
+    try:
+        path = provenance.write_run_manifest(as_of, result)
+        result["manifest_file"] = str(path)
+    except Exception as e:  # noqa: BLE001
+        log.warning("rank.manifest_failed", err=str(e))
+
+
 def _top_n_per_category(scored: pl.DataFrame, n: int) -> pl.DataFrame:
     """Return the top-N rows per ``canonical_category`` from a scored frame."""
     if scored.is_empty():
@@ -848,7 +862,7 @@ def rank_deep(
         n_stage3_flagged=stage3_result["n_flagged"],
         n_stage3_breach_pairs=stage3_result["n_breach_pairs"],
     )
-    return {
+    result = {
         "as_of": as_of.isoformat(),
         "out_dir": str(out_dir),
         "n_excluded": excluded_stage1.height,
@@ -871,3 +885,7 @@ def rank_deep(
             "overlap_pairs_file": stage3_result["overlap_pairs_file"],
         },
     }
+    # F-10 run provenance: every rank_deep run (standalone or pipeline-driven)
+    # gets a manifest.json next to its stage directories.
+    _emit_manifest(as_of, result)
+    return result

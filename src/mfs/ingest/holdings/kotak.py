@@ -11,6 +11,23 @@ JSON API on a DIFFERENT host that is NOT bot-protected:
 (this is ``urlProxies.kotakapi`` in the bundle; the www.kotakmf.com ``/api``
 path is just a reverse-proxy of the same service.)
 
+PROVENANCE RISK (F-13, accepted-with-mitigation — see
+docs/ops/scraping_provenance.md): the host name says ``prodtest`` — a TEST
+endpoint with no freshness/correctness SLA feeding production rankings. It is,
+however, the host the LIVE www.kotakmf.com SPA itself is configured to call
+(``urlProxies.kotakapi`` in the production bundle), so it is serving real
+investor traffic; and the only known production-named alternative
+(``www.kotakmf.com/api`` — the reverse-proxy of this same service) sits behind
+the Radware bot challenge and is not usable. No other production host is
+derivable from the bundle without a live network probe (obvious variants like
+``vlbapiprod`` are unverified guesses). Mitigations: (1) recurring manual
+parity check — one Kotak scheme-month's top-10 holdings vs Kotak's public
+portfolio-disclosure page — is item 4 of docs/ops/spot_check.md; (2) at the
+next sanctioned ingest window, re-inspect the SPA bundle's urlProxies for a
+production kotakapi host and, if one answers, verify one scheme-month
+row-identical before switching ``_API``. Until then data from this host could
+silently diverge from the official disclosures.
+
 Discovery + download mirror the SPA's calls (reverse-engineered from the
 page's lazy chunk ``194.js``):
 
