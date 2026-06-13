@@ -510,6 +510,12 @@ def run_backtest(
     sens_acc: dict[str, list[tuple[float | None, float]]] = {
         name: [] for name in variants
     }
+    # Per-scheme top-5 persistence: in how many quarters was the fund in its
+    # category's top-5 (by the production Stage-1 composite), counting only
+    # quarters where the category had > TOP_N funds so "top-5" is actually
+    # selective. Independent of the forward horizon (membership is a
+    # point-in-time ranking fact). Survivorship-biased like every figure here.
+    persist: dict[str, dict] = {}
 
     for as_of in quarters:
         metric_rows = metric_rows_for_quarter(as_of, universe, caches, step)
@@ -517,6 +523,18 @@ def run_backtest(
         if scored.is_empty():
             print(f"[backtest] {as_of}: no scoreable funds — skipped")
             continue
+        # Top-5 persistence tally (horizon-independent; selective categories only).
+        for cat_t, grp in scored.group_by("canonical_category"):
+            if grp.height <= TOP_N:
+                continue
+            top5 = set(top_n_codes(grp, "composite_score"))
+            for code in grp["scheme_code"].to_list():
+                rec = persist.setdefault(
+                    code, {"cat": cat_t[0], "scored": 0, "top5": 0}
+                )
+                rec["scored"] += 1
+                if code in top5:
+                    rec["top5"] += 1
         for h in horizons:
             fwd = [
                 forward_simple_return(caches.nav(c), as_of, h)
@@ -657,6 +675,22 @@ def run_backtest(
     sensitivity = pl.DataFrame(sens_rows)
     sensitivity.write_csv(out_dir / "sensitivity.csv")
 
+    # ---- top-5 persistence (per-scheme; how consistently it ranked top-5) --
+    if persist:
+        prows = [
+            {
+                "scheme_code": c,
+                "canonical_category": v["cat"],
+                "n_quarters_eligible": v["scored"],
+                "n_top5": v["top5"],
+                "top5_pct": round(100.0 * v["top5"] / v["scored"], 1) if v["scored"] else 0.0,
+            }
+            for c, v in persist.items()
+        ]
+        pl.DataFrame(prows).sort(
+            ["n_top5", "top5_pct"], descending=[True, True]
+        ).write_csv(out_dir / "top5_persistence.csv")
+
     # ---- verdict (pooled 1y row per the pre-registered thresholds) ---------
     v1 = verdict_inputs.get("1y")
     if v1 is not None:
@@ -670,7 +704,7 @@ def run_backtest(
         detail = "no 1y horizon in this run — verdict requires --horizons 1y"
     print(SURVIVORSHIP_HEADER)
     print(f"VERDICT: {verdict} ({detail}; survivorship-biased upper bound)")
-    print(f"Artifacts: {out_dir}/ic_by_quarter.csv, ic_summary.csv, sensitivity.csv")
+    print(f"Artifacts: {out_dir}/ic_by_quarter.csv, ic_summary.csv, sensitivity.csv, top5_persistence.csv")
     return {
         "verdict": verdict,
         "out_dir": str(out_dir),

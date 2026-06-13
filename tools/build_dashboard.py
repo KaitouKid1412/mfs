@@ -44,6 +44,8 @@ STAGE2_COLS = [
     ("stage2_rank", "#", "rank"),
     ("scheme_name", "Fund", "text"),
     ("composite_score", "Score", "ratio"),
+    ("top5_hits", "Top-5 hits", "int"),
+    ("top5_pct", "Top-5 %", "pctraw"),
     ("ter_pct", "TER", "pctraw"),
     ("aum_crore", "AUM (Cr)", "cr"),
     ("ret_3y_median", "Ret 3y", "pct"),
@@ -65,6 +67,8 @@ STAGE1_COLS = [
     ("rank", "#", "rank"),
     ("scheme_name", "Fund", "text"),
     ("composite_score", "Score", "ratio"),
+    ("top5_hits", "Top-5 hits", "int"),
+    ("top5_pct", "Top-5 %", "pctraw"),
     ("ret_3y_median", "Ret 3y", "pct"),
     ("ret_3y_p25", "Ret 3y p25", "pct"),
     ("ret_5y_median", "Ret 5y", "pct"),
@@ -88,6 +92,8 @@ TIPS = {
     "stage2_rank": "Rank within the category (1 = best on our score).",
     "scheme_name": "Fund name — Direct plan, Growth option.",
     "composite_score": "Overall ranking score — combines every metric here. Higher = ranked higher.",
+    "top5_hits": "How many past quarters (since 2016) this fund ranked in its category's top-5 on the core composite — a consistency tally. Higher = more consistently strong. Older funds can rack up more, so check Top-5 % too. Survivorship-biased; blank for always-small categories where 'top-5' isn't selective.",
+    "top5_pct": "Share of its back-tested quarters the fund was top-5 (a hit-rate — fairer to younger funds than the raw count).",
     "ter_pct": "Annual fee (expense ratio). Lower is better.",
     "aum_crore": "Fund size, in ₹ crore.",
     "ret_3y_median": "Typical annual return over the last 3 years.",
@@ -154,12 +160,17 @@ def _flags(row: dict) -> list[dict]:
     return out
 
 
-def _rows(df: pl.DataFrame, cols: list[tuple], with_flags: bool) -> list[dict]:
+def _rows(df: pl.DataFrame, cols: list[tuple], with_flags: bool,
+          persist: dict) -> list[dict]:
     keys = [k for k, _, kind in cols if kind != "flags"]
     present = [k for k in keys if k in df.columns]
     out = []
     for r in df.iter_rows(named=True):
         rec = {k: _clean(r.get(k)) for k in present}
+        # top-5 persistence is sourced from the backtest, not the run parquet.
+        p = persist.get(r.get("scheme_code"))
+        rec["top5_hits"] = p["hits"] if p else None
+        rec["top5_pct"] = p["pct"] if p else None
         if with_flags:
             rec["flags"] = _flags(r)
         out.append(rec)
@@ -191,6 +202,34 @@ def _load_cat_ic() -> dict:
     return out
 
 
+def _load_top5_persistence() -> dict:
+    """Per-scheme top-5 persistence from the most recent backtest
+    (``data/output/backtest/<date>/top5_persistence.csv``): how many quarters
+    since 2016 the fund ranked in its category's top-5 (on the core Stage-1
+    composite, in quarters where the category had >5 funds). Returns {} if
+    absent. Keyed by scheme_code -> {hits, pct, q}."""
+    import csv
+
+    cands = sorted(glob.glob("data/output/backtest/*/top5_persistence.csv"))
+    if not cands:
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        with open(cands[-1], newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    out[row["scheme_code"]] = {
+                        "hits": int(row["n_top5"]),
+                        "pct": float(row["top5_pct"]),
+                        "q": int(row["n_quarters_eligible"]),
+                    }
+                except (ValueError, TypeError, KeyError):
+                    pass
+    except OSError:
+        return {}
+    return out
+
+
 def collect(as_of: str) -> dict:
     run = SHORTLIST_ROOT / as_of
     if not run.exists():
@@ -208,6 +247,7 @@ def collect(as_of: str) -> dict:
     s2 = (pl.concat([pl.read_parquet(p) for p in s2_files], how="diagonal_relaxed")
           if s2_files else pl.DataFrame())
 
+    persist = _load_top5_persistence()
     stage1: dict[str, list] = {}
     stage2: dict[str, list] = {}
     cats: set[str] = set()
@@ -215,12 +255,12 @@ def collect(as_of: str) -> dict:
         for cat, g in s1.group_by("canonical_category"):
             c = cat[0]
             cats.add(c)
-            stage1[c] = _rows(g.sort("rank"), STAGE1_COLS, with_flags=False)
+            stage1[c] = _rows(g.sort("rank"), STAGE1_COLS, with_flags=False, persist=persist)
     if not s2.is_empty():
         for cat, g in s2.group_by("canonical_category"):
             c = cat[0]
             cats.add(c)
-            stage2[c] = _rows(g.sort("stage2_rank"), STAGE2_COLS, with_flags=True)
+            stage2[c] = _rows(g.sort("stage2_rank"), STAGE2_COLS, with_flags=True, persist=persist)
 
     cat_list = sorted(cats)
     counts = {c: {"s1": len(stage1.get(c, [])), "s2": len(stage2.get(c, []))}
@@ -352,6 +392,7 @@ function fmt(val,kind){
   if(kind==='pctraw'){const n=+val;return [n.toFixed(2)+'%','',n];}
   if(kind==='ratio'){const n=+val;return [n.toFixed(2),'',n];}
   if(kind==='cr'){const n=+val;return [n.toLocaleString('en-IN',{maximumFractionDigits:0}),'',n];}
+  if(kind==='int'){return [String(+val),'',+val];}
   if(kind==='rank'){return [String(+val),'rk',+val];}
   if(kind==='text'){const s=String(val);return [esc(s),'',s.toLowerCase()];}
   return [esc(String(val)),'',val];
