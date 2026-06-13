@@ -1,4 +1,27 @@
-# Stage 2 execution state — updated 2026-06-12 ~17:30 IST
+# Stage 2 execution state — STAGE 2 COMPLETE (2026-06-13)
+
+**Status: DONE.** All ~84 plan tasks shipped across 16 commits (fcd8600..9c12381).
+Suite 1234 passing (was 701). Close-out full pipeline run green on the remediated
+stack at as_of 2026-06-13: Gate A passed honestly, manifest written, REPORT.md
+generated. The sections below are the historical resume log; nothing pending in
+Stage 2 except the operator follow-ups listed at the bottom.
+
+## Operator follow-ups deferred BY DESIGN (each has a memo)
+- D6 hybrid debt-sleeve: PATH-B chosen; ~30-min network probe to confirm a real
+  NIFTY debt index is scrapeable, then PATH-A swap. Memo: docs/audit/hybrid_debt_sleeve_spike.md
+- D8 TER: recommendation is BUILD the AMFI TER scraper after a ~30-min endpoint
+  verification. Memo: docs/audit/ter_endpoint_spike_2026-06.md
+- D3 backtest: tools/backtest_ic.py is runnable + smoke-verified; the full 2016+
+  run (hours) is the weight-judging run — not yet executed.
+- D5 Energy: re-evaluate NIFTY Infrastructure TRI vs the now-ingested NIFTY
+  Commodities TRI (command in docs/audit/benchmark_refit_2026-06.md).
+- F-13/F-15: scraping-provenance ToS inventory awaits USER sign-off
+  (docs/ops/scraping_provenance.md).
+- Backups: scripts/backup.sh + docs/ops/backups.md written, NOT scheduled
+  (operator cron/launchd decision).
+
+---
+# Historical resume log (Stage-2 build, 2026-06-12..13)
 
 Single source of truth for resuming the Stage-2 build after any interruption.
 Plan: `stage2_full_remediation.md` (this dir). Working tree may hold uncommitted
