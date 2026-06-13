@@ -59,6 +59,18 @@ def test_stale_cutoff_days_uses_calendar_days():
     assert cutoff == date(2026, 5, 25)  # 14 calendar days back
 
 
+def test_ter_contract_registered_advisory_monthly():
+    """C2: scheme_ter_monthly is an ADVISORY Gate-B monthly contract over the
+    rankable entity set, keyed to the max_ter_lag_days freshness lag."""
+    c = next(c for c in cov.CONTRACTS if c.table == "scheme_ter_monthly")
+    assert c.severity == cov.ADVISORY
+    assert c.gate == "B"
+    assert c.cadence == cov.MONTHLY
+    assert c.date_col == "as_of_month"
+    assert c.entity_set == "rankable"
+    assert c.lag_attr == "max_ter_lag_days"
+
+
 def test_stale_cutoff_falls_back_to_default_when_lag_none():
     # A monthly contract whose configured lag is None must fall back to the
     # cadence default (45d), not crash.

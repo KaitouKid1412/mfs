@@ -496,6 +496,22 @@ def _build_aum_map(
     return aum_map
 
 
+def _build_ter_map(
+    scored: pl.DataFrame, as_of: date | None = None,
+) -> dict[str, float]:
+    """Latest direct-plan TER (%) per scheme, bounded to months on or before
+    ``as_of`` (no future-month leak into a historical ranking). Used as the
+    Stage-2 display column + exact-composite-tie tiebreaker (lower TER wins)."""
+    if scored.is_empty():
+        return {}
+    ter_map: dict[str, float] = {}
+    for code in scored["scheme_code"].unique().to_list():
+        row = q.latest_scheme_ter(code, on_or_before=as_of)
+        if row is not None:
+            ter_map[code] = float(row[1])
+    return ter_map
+
+
 def _latest_holdings_loader() -> Callable[[str], pl.DataFrame]:
     def loader(scheme_code: str) -> pl.DataFrame:
         h = q.holdings_for_scheme(scheme_code)
@@ -796,9 +812,11 @@ def rank_deep(
         )
         scored_pool = candidates_with_phase2.join(carried, on="scheme_code", how="left")
         aum_map = _build_aum_map(scored_pool, as_of=as_of)
+        ter_map = _build_ter_map(scored_pool, as_of=as_of)
         stage2_result = stage2_mod.run(
             scored_pool, aum_map, out_dir,
             pool_size=pool_size, final_size=final_size,
+            ter_map=ter_map,
         )
 
     # D9 activation banner: surface how close the dormant active_share signal

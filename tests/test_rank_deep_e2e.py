@@ -202,6 +202,13 @@ def harness(monkeypatch, tmp_path):
         q, "latest_scheme_aum",
         lambda code, on_or_before=None: (date(2025, 12, 31), 1000.0),
     )
+    # C2: every fund gets the SAME TER, so ter_pct populates the stage-2 outputs
+    # (display column) while the lower-TER tiebreak stays a no-op — ties still
+    # resolve by scheme_code, exactly as the pins below expect.
+    monkeypatch.setattr(
+        q, "latest_scheme_ter",
+        lambda code, on_or_before=None: (date(2026, 1, 31), 0.75),
+    )
     monkeypatch.setattr(q, "holdings_for_scheme", _holdings)
     monkeypatch.setattr(
         w, "persist_rank_history",

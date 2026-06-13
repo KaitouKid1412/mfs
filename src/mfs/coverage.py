@@ -166,6 +166,13 @@ CONTRACTS: list[Contract] = [
         remediation="mfs ingest amfi-aum",
     ),
     Contract(
+        table="scheme_ter_monthly", date_col="as_of_month", cadence=MONTHLY,
+        severity=ADVISORY, gate="B", label="TER (scheme_ter_monthly)",
+        need_back=("months", 6), lag_attr="max_ter_lag_days", lag_unit="days",
+        entity_col="scheme_code", entity_set="rankable",
+        remediation="mfs ingest ter",
+    ),
+    Contract(
         table="index_constituents_monthly", date_col="as_of_month", cadence=MONTHLY,
         severity=ADVISORY, gate="B", label="Constituents (index_constituents_monthly)",
         need_back=("months", 12), lag_attr="max_constituents_lag_days", lag_unit="days",

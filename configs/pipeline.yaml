@@ -90,6 +90,11 @@ freshness:
   # (lag 104d at calibration is nominal). 150d halts only if an entire
   # quarterly publication is skipped.
   max_aum_lag_days: 150
+  # TER: AMFI publishes the monthly disclosure ~30-45d after month start; the
+  # latest as_of_month is stamped at month-start, so the freshest snapshot is
+  # ~1.5 months old. 75d (monthly + 1 missed cycle, like holdings/PTR) flags a
+  # stalled scraper without false-positives on the normal publication lag.
+  max_ter_lag_days: 75
 
 filters:
   plan_type: DIRECT

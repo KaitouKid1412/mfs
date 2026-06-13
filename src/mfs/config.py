@@ -85,6 +85,7 @@ class FreshnessConfig(BaseModel):
     # Phase 2.3
     max_stock_adv_lag_days: Optional[int] = 10       # NSE bhavcopy daily; holiday + weekend slack
     max_aum_lag_days: Optional[int] = 150            # AMFI AAUM quarterly (~45d after quarter end)
+    max_ter_lag_days: Optional[int] = 75             # AMFI TER monthly (~45d) + 1 missed cycle (C2)
 
 
 class FiltersConfig(BaseModel):

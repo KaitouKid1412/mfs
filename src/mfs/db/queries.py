@@ -476,6 +476,36 @@ def latest_scheme_aum(
     return (m.date() if hasattr(m, "date") else m, float(a))
 
 
+def latest_scheme_ter(
+    scheme_code: str, on_or_before: date | None = None
+) -> tuple[date, float] | None:
+    """Return (as_of_month, ter_direct_pct) for the most recent TER snapshot.
+
+    TER comes exclusively from AMFI's monthly disclosure (mfs.ingest.amfi_ter).
+    When ``on_or_before`` is given, only months on or before that date are
+    considered (so attaching TER to a historical ``as_of`` cannot leak a future
+    month); None returns the globally-latest month."""
+    sql = "SELECT as_of_month, ter_direct_pct FROM scheme_ter_monthly WHERE scheme_code = %s "
+    params: tuple = (scheme_code,)
+    if on_or_before is not None:
+        sql += "AND as_of_month <= %s "
+        params = (scheme_code, on_or_before)
+    sql += "ORDER BY as_of_month DESC LIMIT 1"
+    with connect() as c:
+        row = c.execute(sql, params).fetchone()
+    if not row:
+        return None
+    m, t = row
+    return (m.date() if hasattr(m, "date") else m, float(t))
+
+
+def latest_ter_date() -> date | None:
+    with connect() as c:
+        row = c.execute("SELECT MAX(as_of_month) FROM scheme_ter_monthly").fetchone()
+    val = row[0] if row else None
+    return (val.date() if val and hasattr(val, "date") else val)
+
+
 def latest_stock_adv_date() -> date | None:
     with connect() as c:
         row = c.execute("SELECT MAX(date) FROM stock_adv_daily").fetchone()
@@ -743,6 +773,7 @@ MANIFEST_COUNT_TABLES: tuple[str, ...] = (
     "holdings_monthly",
     "portfolio_turnover_monthly",
     "scheme_aum_monthly",
+    "scheme_ter_monthly",
     "index_constituents_monthly",
 )
 

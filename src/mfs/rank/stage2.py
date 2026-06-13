@@ -100,11 +100,27 @@ def _attach_latest_aum(df: pl.DataFrame, aum_map: dict[str, float]) -> pl.DataFr
     return df.with_columns(aum_col.alias("aum_crore"))
 
 
+def _attach_latest_ter(df: pl.DataFrame, ter_map: dict[str, float]) -> pl.DataFrame:
+    """Attach the latest direct-plan TER (%) as ``ter_pct`` — a display column
+    and the Stage-2 tiebreaker key. Always present (null when unmatched/absent)
+    so the tiebreak sort has a stable column; an all-null ``ter_pct`` is a
+    no-op (the sort falls through to scheme_code, exactly as before TER)."""
+    if df.is_empty():
+        return df.with_columns(pl.lit(None, dtype=pl.Float64).alias("ter_pct"))
+    if "ter_pct" in df.columns:
+        return df
+    ter_col = pl.col("scheme_code").map_elements(
+        lambda c: ter_map.get(c), return_dtype=pl.Float64,
+    )
+    return df.with_columns(ter_col.alias("ter_pct"))
+
+
 def apply_stage2(
     scored: pl.DataFrame,
     aum_map: dict[str, float],
     pool_size: int = DEFAULT_POOL_SIZE,
     final_size: int = DEFAULT_FINAL_SIZE,
+    ter_map: dict[str, float] | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Pure function: pass Stage 1's scored frame, return (survivors,
     dropped, coverage) as polars frames. Disk-free for unit-testability.
@@ -121,6 +137,7 @@ def apply_stage2(
         return pl.DataFrame(), pl.DataFrame(), pl.DataFrame()
 
     scored = _attach_latest_aum(scored, aum_map)
+    scored = _attach_latest_ter(scored, ter_map or {})
     # Preserve the Stage 1 number under a stable name before Stage 2 overwrites
     # ``composite_score``.
     if "composite_score" in scored.columns and "composite_score_stage1" not in scored.columns:
@@ -191,11 +208,15 @@ def apply_stage2(
                 pl.lit(0.0).alias(f"z_{m}") for m in POOL_Z_METRICS
             )
         re_scored = composite_score_stage2(pool_z)
-        # A2-11 determinism: composite desc, scheme_code asc.
+        # A2-11 determinism + C2 TER tiebreak: composite desc, then LOWER TER
+        # wins an (exact) composite tie, then scheme_code asc as the final
+        # backstop. ter_pct is null when TER is unmatched/absent and sorts last
+        # within a tie group, so an all-null ter_pct reproduces the prior
+        # (composite, scheme_code) order exactly.
         cat_survivors = (
             re_scored.sort(
-                ["composite_score", "scheme_code"],
-                descending=[True, False], nulls_last=True,
+                ["composite_score", "ter_pct", "scheme_code"],
+                descending=[True, False, False], nulls_last=True,
             )
             .head(final_size)
             .with_row_index("stage2_rank", offset=1)
@@ -254,6 +275,7 @@ def run(
     output_dir: Path,
     pool_size: int = DEFAULT_POOL_SIZE,
     final_size: int = DEFAULT_FINAL_SIZE,
+    ter_map: dict[str, float] | None = None,
 ) -> dict:
     """End-to-end Stage 2: re-rank + write artifacts.
 
@@ -264,6 +286,7 @@ def run(
     """
     survivors, dropped, coverage = apply_stage2(
         scored, aum_map, pool_size=pool_size, final_size=final_size,
+        ter_map=ter_map,
     )
     stage2_dir = output_dir / "stage2"
     stage2_dir.mkdir(parents=True, exist_ok=True)

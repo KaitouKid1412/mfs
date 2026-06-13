@@ -122,13 +122,28 @@ def ingest_tbill(
 
 
 @ingest_app.command("ter")
-def ingest_ter():
-    """Ingest user-provided TER CSVs (data/raw/amfi_ter/manual/*.csv)."""
+def ingest_ter(
+    month: str | None = typer.Option(
+        None, "--month",
+        help="MonthNumber 'MM-YYYY' (e.g. '05-2026'); default: latest published.",
+    ),
+):
+    """Ingest AMFI's monthly direct-plan TER disclosure into scheme_ter_monthly.
+
+    One request set per month (all AMICs/categories), deduped to each scheme's
+    month-end prevailing direct TER, matched to DIRECT+GROWTH scheme_master by
+    name. Fail-fast on network failure or a zero-match month.
+    """
     configure_logging()
     from mfs.ingest import amfi_ter
 
-    n = amfi_ter.ingest_from_manual_csvs()
-    typer.echo(f"TER rows ingested: {n}")
+    result = amfi_ter.ingest_month(month)
+    typer.echo(
+        f"amfi_ter {result['month']} (as_of={result['as_of_month']}): "
+        f"matched={result['matched']} written={result['rows_written']} "
+        f"(clean_names={result['clean_names']}, ambiguous={result['ambiguous']}, "
+        f"nomatch={result['nomatch']})"
+    )
 
 
 @ingest_app.command("amfi-aum")

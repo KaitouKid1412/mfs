@@ -220,6 +220,23 @@ CREATE TABLE IF NOT EXISTS scheme_aum_monthly (
 );
 CREATE INDEX IF NOT EXISTS idx_aum_scheme ON scheme_aum_monthly (scheme_code);
 
+-- Phase 7 (C2): monthly per-scheme direct-plan Total Expense Ratio (%).
+-- Sourced exclusively from AMFI's monthly TER disclosure (see
+-- mfs.ingest.amfi_ter); the prevailing direct-plan TER at month end. Used as a
+-- display column and a deterministic Stage-2 tiebreaker (lower TER breaks an
+-- exact composite tie) — NOT a composite-weighted score term. The CHECK
+-- enforces the no-half-data band: a write outside 0 < ter <= 3.0 is rejected.
+CREATE TABLE IF NOT EXISTS scheme_ter_monthly (
+    scheme_code         TEXT             NOT NULL,
+    as_of_month         DATE             NOT NULL,
+    ter_direct_pct      DOUBLE PRECISION NOT NULL,  -- direct-plan total TER, %
+    source              TEXT             NOT NULL DEFAULT 'amfi',
+    computed_at         TIMESTAMP        NOT NULL,
+    PRIMARY KEY (scheme_code, as_of_month),
+    CONSTRAINT chk_scheme_ter_range CHECK (ter_direct_pct > 0 AND ter_direct_pct <= 3.0)
+);
+CREATE INDEX IF NOT EXISTS idx_ter_scheme ON scheme_ter_monthly (scheme_code);
+
 -- D2 point-in-time snapshots: one full copy of scheme_master per build() run,
 -- keyed by snapshot_date. Captures universe membership, plan/option/category
 -- assignments AND the benchmark map (benchmark_ticker) as of each run, so

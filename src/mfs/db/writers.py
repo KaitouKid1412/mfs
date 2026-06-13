@@ -467,6 +467,19 @@ def upsert_portfolio_turnover(df: pl.DataFrame, conn: psycopg.Connection | None 
         return _copy_upsert(c, "portfolio_turnover_monthly", cols, out.iter_rows(), pk=pk)
 
 
+def upsert_scheme_ter(df: pl.DataFrame) -> int:
+    """Upsert scheme_ter_monthly. Expected columns: scheme_code, as_of_month,
+    ter_direct_pct, source, computed_at. PK (scheme_code, as_of_month). The DB
+    CHECK rejects any ter_direct_pct outside 0 < ter <= 3.0 (no-half-data)."""
+    if df.is_empty():
+        return 0
+    cols = ["scheme_code", "as_of_month", "ter_direct_pct", "source", "computed_at"]
+    out = df.select(cols)
+    pk = ("scheme_code", "as_of_month")
+    with connect() as c:
+        return _copy_upsert(c, "scheme_ter_monthly", cols, out.iter_rows(), pk=pk)
+
+
 # ---------------------------------------------------------------------------
 # Phase 2.3: stock ADV / AUM
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ from mfs.compute import orchestrator
 from mfs.db import connection
 from mfs.errors import CoverageError, IngestError, PipelineError
 from mfs.ingest import (
-    amfi_aum, amfi_nav, benchmarks, bhavcopy, constituents,
+    amfi_aum, amfi_nav, amfi_ter, benchmarks, bhavcopy, constituents,
     fbil_tbill, holdings, managers, synthetic_hybrid,
 )
 from mfs.master import scheme_master
@@ -34,13 +34,13 @@ AS_OF = date(2026, 6, 11)
 # ingested — both stages run after holdings and before Gate B.
 FULL_ORDER = [
     "navs", "benchmarks", "hybrids", "tbill", "scheme_master", "gate_A",
-    "amfi_aum", "managers", "bhavcopy", "holdings", "derive_constituents",
-    "constituents", "gate_B",
+    "amfi_aum", "amfi_ter", "managers", "bhavcopy", "holdings",
+    "derive_constituents", "constituents", "gate_B",
     "freshness", "phase1", "rank_deep",
 ]
 PHASE2_STAGES = [
-    "amfi_aum", "managers", "bhavcopy", "holdings", "derive_constituents",
-    "constituents", "gate_B",
+    "amfi_aum", "amfi_ter", "managers", "bhavcopy", "holdings",
+    "derive_constituents", "constituents", "gate_B",
 ]
 
 RANK_RESULT = {
@@ -121,6 +121,7 @@ def wired(monkeypatch) -> Harness:
     monkeypatch.setattr(fbil_tbill, "ingest", make("tbill", 0))
     monkeypatch.setattr(scheme_master, "build", make("scheme_master"))
     monkeypatch.setattr(amfi_aum, "ingest_quarter", make("amfi_aum", {}))
+    monkeypatch.setattr(amfi_ter, "ingest_month", make("amfi_ter", {}))
     monkeypatch.setattr(managers, "run_all", make("managers", {}))
     monkeypatch.setattr(bhavcopy, "ingest_recent", make("bhavcopy", {}))
     monkeypatch.setattr(constituents, "run_all", make("constituents", {}))
@@ -227,8 +228,9 @@ def test_derive_constituents_is_required_and_halts(wired):
         pipeline.run(AS_OF, echo=wired.echo)
 
     assert wired.calls == ["navs", "benchmarks", "hybrids", "tbill",
-                           "scheme_master", "gate_A", "amfi_aum", "managers",
-                           "bhavcopy", "holdings", "derive_constituents"]
+                           "scheme_master", "gate_A", "amfi_aum", "amfi_ter",
+                           "managers", "bhavcopy", "holdings",
+                           "derive_constituents"]
     assert wired.lock.exited
     assert any(
         "FAIL at derive constituents (latest month)" in m
@@ -268,8 +270,8 @@ def test_required_stage_raw_4xx_halts_cleanly_as_pipeline_error(wired):
     assert isinstance(excinfo.value.__cause__, httpx.HTTPStatusError)
     # Halted at bhavcopy; nothing after it ran. Lock released.
     assert wired.calls == ["navs", "benchmarks", "hybrids", "tbill",
-                           "scheme_master", "gate_A", "amfi_aum", "managers",
-                           "bhavcopy"]
+                           "scheme_master", "gate_A", "amfi_aum", "amfi_ter",
+                           "managers", "bhavcopy"]
     assert wired.lock.exited
     fail = [m for m in wired.err_lines() if "FAIL at ingest bhavcopy" in m]
     assert fail and "HTTPStatusError" in fail[0]

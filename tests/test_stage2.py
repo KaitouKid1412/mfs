@@ -605,6 +605,39 @@ def test_tied_composites_order_by_scheme_code():
         assert len(scores) == 1
 
 
+# ---------------------------------------------------------------------------
+# C2 — TER breaks an exact composite tie (lower TER wins), display column
+# ---------------------------------------------------------------------------
+
+
+def test_ter_breaks_exact_composite_tie():
+    """Two funds with an identical Stage 2 composite are ordered by LOWER TER
+    first, overriding the scheme_code backstop. T9 has the LARGER scheme_code
+    (would lose on scheme_code) but the LOWER TER (so it must win)."""
+    twin_a = _scored_row("T1", composite_score=0.5)  # smaller code, higher TER
+    twin_b = _scored_row("T9", composite_score=0.5)  # larger code, lower TER
+    twin_b["scheme_name"] = twin_a["scheme_name"]
+    ter_map = {"T1": 1.50, "T9": 0.40}
+    for rows in ([twin_a, twin_b], [twin_b, twin_a]):
+        survivors, _, _ = apply_stage2(_df(rows), aum_map={}, ter_map=ter_map)
+        ordered = survivors.sort("stage2_rank")["scheme_code"].to_list()
+        assert ordered == ["T9", "T1"]
+        by = _by_code(survivors)
+        assert by["T9"]["ter_pct"] == 0.40
+        assert by["T1"]["ter_pct"] == 1.50
+
+
+def test_ter_absent_keeps_scheme_code_order():
+    """An all-null ter_pct (no ter_map / unmatched) is a no-op: the column is
+    present for display but ordering falls through to scheme_code as before."""
+    twin_a = _scored_row("T1", composite_score=0.5)
+    twin_b = _scored_row("T9", composite_score=0.5)
+    twin_b["scheme_name"] = twin_a["scheme_name"]
+    survivors, _, _ = apply_stage2(_df([twin_b, twin_a]), aum_map={}, ter_map={})
+    assert survivors.sort("stage2_rank")["scheme_code"].to_list() == ["T1", "T9"]
+    assert survivors["ter_pct"].null_count() == survivors.height
+
+
 def _csv_bytes(stage_dir: Path) -> dict[str, bytes]:
     return {p.name: p.read_bytes() for p in sorted(stage_dir.glob("*.csv"))}
 

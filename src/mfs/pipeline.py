@@ -146,8 +146,8 @@ def run(
     from mfs.db.connection import pipeline_lock
     from mfs.freshness import check_freshness
     from mfs.ingest import (
-        amfi_aum, amfi_nav, benchmarks, bhavcopy as bhavcopy_mod, constituents,
-        fbil_tbill, holdings, managers, synthetic_hybrid,
+        amfi_aum, amfi_nav, amfi_ter, benchmarks, bhavcopy as bhavcopy_mod,
+        constituents, fbil_tbill, holdings, managers, synthetic_hybrid,
     )
     from mfs.master import scheme_master
     from mfs.rank import shortlist
@@ -254,6 +254,16 @@ def run(
             _stage(
                 "ingest amfi aaum (latest quarter)",
                 lambda: amfi_aum.ingest_quarter(_latest_amfi_quarter_label(d)),
+            )
+
+            # ----- AMFI monthly TER (latest published month, all AMCs) -----
+            # Display column + Stage-2 tiebreaker only (C2). Advisory: a TER
+            # fetch miss must not halt the run (it never gates ranking), unlike
+            # the Gate-A base data.
+            _stage(
+                "ingest amfi ter (latest month)",
+                lambda: amfi_ter.ingest_month(),
+                required=False,
             )
 
             # ----- Factsheet ingest: holdings + PTR (AUM now sourced from AMFI) -----

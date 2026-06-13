@@ -133,10 +133,6 @@ def scheme_master_file() -> Path:
     return curated_dir() / "scheme_master" / "scheme_master.parquet"
 
 
-def ter_daily_dataset() -> Path:
-    return curated_dir() / "ter_daily"
-
-
 def computed_metrics_dataset() -> Path:
     return metrics_dir() / "computed_metrics"
 
