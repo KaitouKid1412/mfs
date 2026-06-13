@@ -81,6 +81,43 @@ STAGE1_COLS = [
 ]
 
 
+# Plain-English, one-line explanation per column (shown on hover + in the
+# on-screen "what the columns mean" panel).
+TIPS = {
+    "rank": "Rank within the category (1 = best on our score).",
+    "stage2_rank": "Rank within the category (1 = best on our score).",
+    "scheme_name": "Fund name — Direct plan, Growth option.",
+    "composite_score": "Overall ranking score — combines every metric here. Higher = ranked higher.",
+    "ter_pct": "Annual fee (expense ratio). Lower is better.",
+    "aum_crore": "Fund size, in ₹ crore.",
+    "ret_3y_median": "Typical annual return over the last 3 years.",
+    "ret_5y_median": "Typical annual return over the last 5 years.",
+    "ret_3y_p25": "A cautious 'bad-spell' version of the 3-year return (lower-quartile of rolling periods).",
+    "ret_5y_p25": "A cautious 'bad-spell' version of the 5-year return (lower-quartile of rolling periods).",
+    "alpha_3y_annualized": "Return above what the benchmark index explains — the manager's yearly value-add. Higher is better (trust it only when R² is high).",
+    "alpha_confidence": "How statistically reliable the Alpha figure is, 0–1. Higher = more reliable.",
+    "sortino_3y": "Return earned per unit of downside risk. Higher is better.",
+    "info_ratio_3y": "How consistently the fund beats its benchmark. Higher is better.",
+    "capture_efficiency": "Gains kept in up-markets vs losses taken in down-markets. Above 1 is good.",
+    "r_squared_3y": "How closely the fund tracks its benchmark, 0–1. If low, the Alpha number isn't trustworthy.",
+    "beta_3y": "Market sensitivity. ~1 moves with the index; below 1 is calmer, above 1 is racier.",
+    "max_dd_3y_pct": "Worst peak-to-trough fall in the last 3 years. Smaller is better.",
+    "ptr_latest": "Portfolio turnover — how much the manager trades per year. Very high can add hidden cost.",
+    "active_share_median_1y": "How different the holdings are from the index (high = genuinely active). Blank until ~10 Jul 2026.",
+    "data_quality_flag": "Data-quality status for this fund's metrics.",
+    "flags": "Caveat tags — hover each badge for what it means.",
+}
+
+# Plain-English meaning of each flag badge (shown in the on-screen panel).
+FLAG_GLOSSARY = [
+    {"t": "partial", "h": "Some disclosure data for this fund (e.g. turnover or liquidity) is missing."},
+    {"t": "thin cohort", "h": "Fewer than 5 funds qualified in this category, so the shortlist is thin."},
+    {"t": "low R²", "h": "The fund doesn't track its benchmark closely, so its Alpha is unreliable."},
+    {"t": "synth-bm", "h": "This hybrid category is measured against a stand-in benchmark, so its Alpha is likely overstated."},
+    {"t": "liq:HIGH / SEVERE", "h": "Could take a while to sell out of without moving the price (liquidity risk)."},
+]
+
+
 def _clean(v):
     """JSON-safe scalar: NaN/inf -> None (so the JS renders an em-dash)."""
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
@@ -193,10 +230,11 @@ def collect(as_of: str) -> dict:
         "categories": cat_list,
         "counts": counts,
         "cat_ic": _load_cat_ic(),
+        "flag_glossary": FLAG_GLOSSARY,
         "n_s1": sum(len(v) for v in stage1.values()),
         "n_s2": sum(len(v) for v in stage2.values()),
-        "stage1_cols": [{"k": k, "l": l, "kind": kind} for k, l, kind in STAGE1_COLS],
-        "stage2_cols": [{"k": k, "l": l, "kind": kind} for k, l, kind in STAGE2_COLS],
+        "stage1_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, "")} for k, l, kind in STAGE1_COLS],
+        "stage2_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, "")} for k, l, kind in STAGE2_COLS],
         "stage1": stage1,
         "stage2": stage2,
     }
@@ -223,8 +261,21 @@ _TEMPLATE = r"""<!doctype html>
          position:sticky;top:0;z-index:5}
   h1{margin:0 0 2px;font-size:17px}
   .sub{color:var(--mut);font-size:12px}
-  .banner{margin:10px 0 0;padding:8px 12px;border-radius:6px;font-size:12px;
-          background:#2a210f;border:1px solid #5a4412;color:#f0d68a}
+  .banner{margin:10px 0 0;padding:9px 12px;border-radius:6px;font-size:12.5px;line-height:1.5;
+          background:#16202b;border:1px solid #243240;color:#cdd9e5;max-width:1100px}
+  .banner b{color:#e6edf3}
+  .banner .note{display:block;margin-top:6px;color:var(--mut);font-size:11.5px}
+  details{margin-top:6px}
+  details summary{cursor:pointer;color:var(--accent);font-size:11.5px;outline:none}
+  details .body{margin-top:5px;padding:7px 10px;background:var(--head);border-radius:5px;
+                color:var(--mut);font-size:11.5px;line-height:1.55}
+  .gloss{margin-top:8px;max-width:1100px}
+  .gloss .grid{display:grid;grid-template-columns:160px 1fr;gap:3px 14px;margin-top:6px;
+               background:var(--head);padding:9px 12px;border-radius:6px}
+  .gloss .k{color:var(--fg);font-weight:600;font-size:12px}
+  .gloss .v{color:var(--mut);font-size:12px}
+  .gloss h4{margin:10px 0 2px;color:var(--accent);font-size:11.5px;font-weight:600}
+  .tech{color:var(--mut);font-size:11px}
   .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
   select,input{background:var(--head);color:var(--fg);border:1px solid var(--line);
                border-radius:6px;padding:6px 9px;font-size:13px}
@@ -244,6 +295,7 @@ _TEMPLATE = r"""<!doctype html>
            padding:8px 10px;text-align:right;cursor:pointer;white-space:nowrap;user-select:none}
   thead th:first-child,thead th.lft{text-align:left}
   thead th:hover{color:var(--accent)}
+  thead th.tip{text-decoration:underline dotted rgba(139,152,169,.6);text-underline-offset:4px}
   th .arr{color:var(--accent);font-size:10px}
   td{padding:6px 10px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
   td.lft{text-align:left;max-width:360px;overflow:hidden;text-overflow:ellipsis}
@@ -263,8 +315,14 @@ _TEMPLATE = r"""<!doctype html>
 <header>
   <h1>Mutual-fund rankings <span class="mut" id="asof"></span></h1>
   <div class="sub">Indian equity/hybrid funds (Direct + Growth), ranked per category. Click a column header to sort; type to filter.</div>
-  <div class="banner">⚠ <b>Descriptive quality screen, not a validated forecast.</b>
-    The composite weights were <b>not validated as forward-predictive</b> (2026-06 retro-IC backtest: pooled 1-year IC −0.05, verdict REFUTED — survivorship-biased upper bound). Treat ranks as a low-cost / consistent / risk-adjusted screen, not a performance prediction. Active-share is dormant (activates ~2026-07-10).</div>
+  <div class="banner">
+    <b>How to read this:</b> funds are ranked within each category by their <b>past</b> numbers — low fees, steady performance, and good risk-adjusted returns. Think of it as a <b>quality shortlist, not a prediction</b> of next year's winner. When we tested it, ranking near the top did <b>not</b> reliably lead to better future returns — so use it to narrow the field to solid, low-cost, consistent funds, then dig deeper before deciding.
+    <details><summary>Why we say it's "not a prediction" (the technical bit)</summary>
+      <div class="body">We replayed this ranking back to 2016 and checked whether higher-ranked funds went on to beat lower-ranked ones. The match was about <b>zero / slightly negative</b> (a rank-vs-future-return correlation, or "IC", of −0.05 over 1 year) — i.e. no better than chance. The test can only include funds that still exist today; closed funds (usually the poor ones) have vanished from the data, so the real figure is, if anything, a bit worse. Bottom line: the scoring is a sound <i>quality screen</i> but is <b>not validated as a performance forecast.</b></div>
+    </details>
+    <span class="note">The “Active Share” column is blank until ~10 Jul 2026 — that data isn't ready yet, it's not a fund problem.</span>
+  </div>
+  <details class="gloss" id="gloss"><summary>ℹ︎ What the columns &amp; flags mean (plain English)</summary></details>
   <div class="controls">
     <div class="toggle">
       <button id="btnS2" class="on" onclick="setView('stage2')">Top picks</button>
@@ -326,11 +384,11 @@ function render(){
   const ic=(D.cat_ic||{})[cat];
   if(ic===undefined){cw.style.display='none';}
   else if(ic<=0){cw.className='catwarn neg';cw.style.display='block';
-    cw.innerHTML=`⚠ Backtest: <b>${esc(cat)}</b> composite had a <b>negative 1-year IC (${ic.toFixed(3)})</b> on the survivor backtest — its top-ranked funds <b>historically underperformed the category median</b>. Treat this ranking as anti-predictive.`;}
+    cw.innerHTML=`⚠ <b>Be careful with the order in ${esc(cat)}.</b> In our back-test, the funds ranked near the top of this category tended to do <b>slightly worse</b> than a typical ${esc(cat)} fund afterwards — so this isn't a reliable best-to-worst list here. Use it as a rough shortlist only. <span class="tech">(rank-vs-future-return correlation ${ic.toFixed(2)})</span>`;}
   else if(ic<0.05){cw.className='catwarn wk';cw.style.display='block';
-    cw.innerHTML=`• Backtest: <b>${esc(cat)}</b> composite 1-year IC ${ic.toFixed(3)} — weak / inconclusive predictive value.`;}
+    cw.innerHTML=`• <b>${esc(cat)}:</b> the ranking only loosely matched what happened next — treat the order as approximate. <span class="tech">(correlation ${ic.toFixed(2)})</span>`;}
   else {cw.className='catwarn pos';cw.style.display='block';
-    cw.innerHTML=`✓ Backtest: <b>${esc(cat)}</b> composite 1-year IC <b>${ic.toFixed(3)}</b> — ranking was forward-predictive on the survivor backtest.`;}
+    cw.innerHTML=`✓ <b>The order is more trustworthy in ${esc(cat)}.</b> Historically, funds ranked near the top here did tend to do better afterwards. <span class="tech">(correlation +${ic.toFixed(2)})</span>`;}
   let rows=(dataFor(view)[cat]||[]).slice();
   if(q) rows=rows.filter(r=>String(r.scheme_name||'').toLowerCase().includes(q));
   if(sortKey){
@@ -347,8 +405,9 @@ function render(){
   // header
   document.getElementById('head').innerHTML = cols.map(c=>{
     const lft=(c.kind==='text'||c.kind==='flags')?'lft':'';
+    const tc=c.tip?'tip':''; const tip=c.tip?` title="${esc(c.tip)}"`:'';
     const arr=sortKey===c.k?`<span class="arr">${sortDir<0?'▼':'▲'}</span>`:'';
-    return `<th class="${lft}" onclick="sortBy('${c.k}')">${c.l} ${arr}</th>`;
+    return `<th class="${lft} ${tc}" onclick="sortBy('${c.k}')"${tip}>${esc(c.l)} ${arr}</th>`;
   }).join('');
   // body
   document.getElementById('body').innerHTML = rows.map(r=>'<tr>'+cols.map(c=>{
@@ -363,17 +422,22 @@ function render(){
     `${rows.length} funds · ${view==='stage2'?'Top picks (Stage 2, enriched)':'Full ranking (Stage 1)'}`;
 }
 
+function initGloss(){
+  const seen={}, cols=[...D.stage2_cols, ...D.stage1_cols];
+  let rows='';
+  cols.forEach(c=>{ if(c.tip && !seen[c.l]){seen[c.l]=1; rows+=`<div class="k">${esc(c.l)}</div><div class="v">${esc(c.tip)}</div>`; }});
+  const flags=(D.flag_glossary||[]).map(f=>`<div class="k">${esc(f.t)}</div><div class="v">${esc(f.h)}</div>`).join('');
+  document.getElementById('gloss').insertAdjacentHTML('beforeend',
+    `<div class="grid">${rows}</div><h4>Flag badges (the coloured tags in the Flags column)</h4><div class="grid">${flags}</div>`);
+}
+
 document.getElementById('asof').textContent = '· run '+D.as_of;
 document.getElementById('foot').innerHTML =
-  `Run <code>${D.as_of}</code> · ${D.categories.length} categories · `+
-  `${D.n_s2} top picks (Stage 2) · ${D.n_s1} ranked funds (Stage 1). `+
-  `Generated by <code>tools/build_dashboard.py</code> from <code>data/output/shortlist/${D.as_of}/</code>. `+
-  `Returns/alpha/PTR/active-share are annualised fractions shown as %; Max-DD &amp; TER are already %; `+
-  `Sortino/Info-Ratio/Capture/R²/Beta/Score are ratios. `+
-  `<b>α conf</b> (0–1) = share of rolling-3y windows where alpha was statistically significant (|t|≥1) — display-only, not a filter. `+
-  `Per-category backtest notes (when shown) come from the latest retro-IC run. `+
-  `“—” = not available (e.g. active-share while dormant, or a fund outside the Stage-2 enrichment pool).`;
-initCats(); setView('stage2');
+  `Run <code>${D.as_of}</code> · ${D.categories.length} categories · ${D.n_s2} shortlisted picks · ${D.n_s1} ranked funds. `+
+  `<b>Hover any column heading</b> for what it means, or open “What the columns &amp; flags mean” near the top. `+
+  `“—” means we don't have that number yet (e.g. Active Share until ~10 Jul 2026). `+
+  `Built by <code>tools/build_dashboard.py</code>.`;
+initGloss(); initCats(); setView('stage2');
 </script>
 </body>
 </html>
