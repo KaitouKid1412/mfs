@@ -85,3 +85,71 @@ flag. The alternative — silently shipping a hybrid benchmark from an
 unverified endpoint or a manual CSV — violates the no-manual-entry invariant.
 The NIFTY 50 TRI constituents derivation (D9) does not help here: that is
 the *equity* sleeve; the gap is the *debt* sleeve series.
+
+---
+
+## C5 close-out (Phase 7, 2026-06-13) — PATH-A probe RUN; PATH B kept
+
+The operator probe above was executed (network, in-session). **Decision
+(user, 2026-06-13): keep PATH B.** A real debt index *is* scrapeable, but no
+*faithful, full-history* substitute for the recipe's named sleeves exists, so
+swapping in an approximate proxy would trade a known, disclosed, one-sided bias
+for a different undisclosed modelling error plus a hybrid-alpha discontinuity —
+for a marginal, unverified beat-rate gain. The `benchmark_is_synthetic`
+disclosure stays on every hybrid row.
+
+### What the probe found
+
+* **`IndexMapping.json` is reachable** and lists ~255 indices including a deep
+  fixed-income family (G-Sec by tenor, AAA corporate bond, target-maturity).
+* **The equity TRI endpoint does NOT serve debt indices.** Replaying
+  `benchmarks.fetch_tri_window` (the `getTotalReturnIndexString` method) for
+  `Nifty Composite G-sec Index`, `Nifty 10 yr Benchmark G-Sec`, and
+  `NIFTY AAA Short-Term Corporate Bond` each returned **0 rows** — so PATH-A's
+  best-case (equity endpoint serves it directly) is ruled out.
+* **A separate fixed-income method works without auth:**
+  `POST https://www.niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString`
+  with the same single-quoted `cinfo` payload returns
+  `{"d":"[{...,\"INDEX_NAME\":...,\"HistoricalDate\":...,\"OPEN/HIGH/LOW/CLOSE\":...}]"}`.
+  The `CLOSE` level is **total return** (Composite G-sec 1744→2627 over
+  2018-2024 ≈ 7.0%/yr; 10yr G-Sec 1158→2436 over 2013-2024 ≈ 6.4%/yr — both
+  coupon-inclusive, not clean price).
+
+### Why no proxy cleanly substitutes
+
+* **The recipe's exact sleeves are not published on this endpoint:** neither
+  `NIFTY Composite Debt Index` (65:35 / 50:50) nor `NIFTY Short Duration Debt`
+  (Equity Savings) appears in `IndexMapping.json` (searched case-insensitively).
+* **`Nifty Composite G-sec Index`** (right-ish composition, diversified G-sec)
+  **only starts 2018** — it cannot backfill the 2013+ span the synthetic
+  hybrid TRIs (and the C1 hybrid backtest quarters from 2016) require, and is
+  G-sec-only (no corporate credit).
+* **`Nifty 10 yr Benchmark G-Sec`** reaches 2013 but is a single long-duration
+  point (~10yr), not a composite — it injects duration volatility the official
+  Composite Debt sleeve blends away, and its ~6.4%/yr CAGR is only marginally
+  above the 91-day T-bill over the period, so the central beat-rate reduction
+  is uncertain while the added volatility distorts alpha/IR unpredictably.
+
+Every available option therefore (a) needs its own disclosed modelling
+assumption (keep `benchmark_is_synthetic` anyway), (b) reshuffles 84 hybrid
+funds, and (c) introduces an alpha/IR/capture discontinuity at the swap run —
+all for an unverified improvement. PATH B (disclosed T-bill) remains the
+honest choice.
+
+### If a future operator opts into PATH A (clean single-session recipe)
+
+1. Add a fixed-income fetch branch to `ingest/benchmarks.py` using
+   `getHistoricaldatatabletoString` (NOT `getTotalReturnIndexString`); parse
+   `d` → `HistoricalDate` + `CLOSE` (total-return level), chunk by ≤365d like
+   the equity path.
+2. Pick the sleeve: `Nifty 10 yr Benchmark G-Sec`
+   (`name='NIFTY GS 10YR'`, `indexName='Nifty 10 yr Benchmark G-Sec'`) for full
+   2013+ history, or `Nifty Composite G-sec Index`
+   (`name='NIFTY GS COMPSITE'`, `indexName='Nifty Composite G-sec Index'`) if a
+   post-2018 hybrid history is acceptable.
+3. Rebuild the 65:35 / 50:50 sleeves in `ingest/synthetic_hybrid.py` to compose
+   `w_debt × debt_index_daily_log_ret` instead of `rf_daily`; keep Equity
+   Savings' 30% debt sleeve on the same index (Short Duration unavailable).
+4. Re-synthesize, recompute, verify hybrid beat-rates fall to a realistic band,
+   and KEEP `benchmark_is_synthetic=True` (still our composition, not NSE's
+   published hybrid). Expect an alpha/IR discontinuity at that run (like D5).
