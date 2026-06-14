@@ -46,6 +46,8 @@ STAGE2_COLS = [
     ("composite_score", "Score", "ratio"),
     ("top5_hits", "Top-5 hits", "int"),
     ("top5_pct", "Top-5 %", "pctraw"),
+    ("top10_hits", "Top-10 hits", "int"),
+    ("top10_pct", "Top-10 %", "pctraw"),
     ("ter_pct", "TER", "pctraw"),
     ("aum_crore", "AUM (Cr)", "cr"),
     ("ret_3y_median", "Ret 3y", "pct"),
@@ -69,6 +71,8 @@ STAGE1_COLS = [
     ("composite_score", "Score", "ratio"),
     ("top5_hits", "Top-5 hits", "int"),
     ("top5_pct", "Top-5 %", "pctraw"),
+    ("top10_hits", "Top-10 hits", "int"),
+    ("top10_pct", "Top-10 %", "pctraw"),
     ("ret_3y_median", "Ret 3y", "pct"),
     ("ret_3y_p25", "Ret 3y p25", "pct"),
     ("ret_5y_median", "Ret 5y", "pct"),
@@ -94,6 +98,8 @@ TIPS = {
     "composite_score": "Overall ranking score — combines every metric here. Higher = ranked higher.",
     "top5_hits": "Shown as hits / eligible-quarters (e.g. 28 / 33): of the back-tested quarters since 2016 where this fund's category had a meaningful top-5, how many it ranked in the top-5 on the core composite. Higher = more consistently strong; the denominator differs per fund (newer funds have fewer quarters — check Top-5 % for a fair rate). Survivorship-biased; '—' for always-small categories.",
     "top5_pct": "Share of its back-tested quarters the fund was top-5 (a hit-rate — fairer to younger funds than the raw count).",
+    "top10_hits": "Like Top-5 hits but for the top-10 — shown as hits / eligible-quarters. Counted only in quarters where the category had MORE than 10 funds, so its denominator is smaller than Top-5's, and it's '—' for categories that rarely exceeded 10 funds.",
+    "top10_pct": "Share of its top-10-eligible quarters the fund ranked in the top-10 (hit-rate).",
     "ter_pct": "Annual fee (expense ratio). Lower is better.",
     "aum_crore": "Fund size, in ₹ crore.",
     "ret_3y_median": "Typical annual return over the last 3 years.",
@@ -170,9 +176,15 @@ def _rows(df: pl.DataFrame, cols: list[tuple], with_flags: bool,
         rec["canonical_category"] = _clean(r.get("canonical_category"))  # for the All-categories view
         # top-5 persistence is sourced from the backtest, not the run parquet.
         p = persist.get(r.get("scheme_code"))
-        rec["top5_hits"] = p["hits"] if p else None
-        rec["top5_pct"] = p["pct"] if p else None
-        rec["top5_q"] = p["q"] if p else None  # denominator (eligible quarters)
+        rec["top5_hits"] = p["hits5"] if p else None
+        rec["top5_pct"] = p["pct5"] if p else None
+        rec["top5_q"] = p["q5"] if p else None  # top-5 eligible-quarter denominator
+        # top-10 has its own (smaller) denominator: only quarters where the
+        # category had >10 funds. None when the category never exceeded 10.
+        has10 = bool(p and p["q10"])
+        rec["top10_hits"] = p["hits10"] if has10 else None
+        rec["top10_pct"] = p["pct10"] if has10 else None
+        rec["top10_q"] = p["q10"] if has10 else None
         if with_flags:
             rec["flags"] = _flags(r)
         out.append(rec)
@@ -221,9 +233,12 @@ def _load_top5_persistence() -> dict:
             for row in csv.DictReader(f):
                 try:
                     out[row["scheme_code"]] = {
-                        "hits": int(row["n_top5"]),
-                        "pct": float(row["top5_pct"]),
-                        "q": int(row["n_quarters_eligible"]),
+                        "hits5": int(row["n_top5"]),
+                        "pct5": float(row["top5_pct"]),
+                        "q5": int(row["n_quarters_eligible_top5"]),
+                        "hits10": int(row["n_top10"]),
+                        "pct10": float(row["top10_pct"]),
+                        "q10": int(row["n_quarters_eligible_top10"]),
                     }
                 except (ValueError, TypeError, KeyError):
                     pass
@@ -462,9 +477,9 @@ function render(){
   // body
   document.getElementById('body').innerHTML = rows.map(r=>'<tr>'+cols.map(c=>{
     if(c.kind==='flags') return `<td class="lft">${flagHtml(r.flags)}</td>`;
-    if(c.k==='top5_hits'){           // show "hits / eligible-quarters"; sort by hits
-      const h=r.top5_hits;
-      return `<td>${(h===null||h===undefined)?'<span class="mut">—</span>':h+' <span class="mut">/ '+r.top5_q+'</span>'}</td>`;
+    if(c.k==='top5_hits'||c.k==='top10_hits'){   // show "hits / eligible-quarters"; sort by hits
+      const h=r[c.k], q=(c.k==='top5_hits')?r.top5_q:r.top10_q;
+      return `<td>${(h===null||h===undefined)?'<span class="mut">—</span>':h+' <span class="mut">/ '+q+'</span>'}</td>`;
     }
     const [txt,cls,_n]=fmt(r[c.k],c.kind);
     let extra=cls; const lft=(c.kind==='text')?'lft':'';

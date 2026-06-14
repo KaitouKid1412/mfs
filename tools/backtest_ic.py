@@ -79,6 +79,7 @@ MAX_FORWARD_GAP_DAYS = 14
 NONOVERLAP_QUARTERS = {1: 4, 3: 12}
 
 TOP_N = 5
+TOP10 = 10
 
 SURVIVORSHIP_HEADER = (
     "=" * 76 + "\n"
@@ -523,18 +524,31 @@ def run_backtest(
         if scored.is_empty():
             print(f"[backtest] {as_of}: no scoreable funds — skipped")
             continue
-        # Top-5 persistence tally (horizon-independent; selective categories only).
+        # Top-5 / Top-10 persistence tally (horizon-independent). Each cut is
+        # counted only in quarters where the category was big enough for it to
+        # be selective — >5 funds for top-5, >10 for top-10 — so each metric
+        # carries its own eligible-quarter denominator.
         for cat_t, grp in scored.group_by("canonical_category"):
-            if grp.height <= TOP_N:
-                continue
-            top5 = set(top_n_codes(grp, "composite_score"))
-            for code in grp["scheme_code"].to_list():
-                rec = persist.setdefault(
-                    code, {"cat": cat_t[0], "scored": 0, "top5": 0}
-                )
-                rec["scored"] += 1
-                if code in top5:
-                    rec["top5"] += 1
+            cat, n = cat_t[0], grp.height
+            codes = grp["scheme_code"].to_list()
+            if n > TOP_N:
+                top5 = set(top_n_codes(grp, "composite_score", n=TOP_N))
+                for code in codes:
+                    rec = persist.setdefault(
+                        code, {"cat": cat, "q5": 0, "top5": 0, "q10": 0, "top10": 0}
+                    )
+                    rec["q5"] += 1
+                    if code in top5:
+                        rec["top5"] += 1
+            if n > TOP10:
+                top10 = set(top_n_codes(grp, "composite_score", n=TOP10))
+                for code in codes:
+                    rec = persist.setdefault(
+                        code, {"cat": cat, "q5": 0, "top5": 0, "q10": 0, "top10": 0}
+                    )
+                    rec["q10"] += 1
+                    if code in top10:
+                        rec["top10"] += 1
         for h in horizons:
             fwd = [
                 forward_simple_return(caches.nav(c), as_of, h)
@@ -681,14 +695,17 @@ def run_backtest(
             {
                 "scheme_code": c,
                 "canonical_category": v["cat"],
-                "n_quarters_eligible": v["scored"],
+                "n_quarters_eligible_top5": v["q5"],
                 "n_top5": v["top5"],
-                "top5_pct": round(100.0 * v["top5"] / v["scored"], 1) if v["scored"] else 0.0,
+                "top5_pct": round(100.0 * v["top5"] / v["q5"], 1) if v["q5"] else 0.0,
+                "n_quarters_eligible_top10": v["q10"],
+                "n_top10": v["top10"],
+                "top10_pct": round(100.0 * v["top10"] / v["q10"], 1) if v["q10"] else 0.0,
             }
             for c, v in persist.items()
         ]
         pl.DataFrame(prows).sort(
-            ["n_top5", "top5_pct"], descending=[True, True]
+            ["n_top5", "n_top10"], descending=[True, True]
         ).write_csv(out_dir / "top5_persistence.csv")
 
     # ---- verdict (pooled 1y row per the pre-registered thresholds) ---------
