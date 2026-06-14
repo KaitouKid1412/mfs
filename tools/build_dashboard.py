@@ -167,6 +167,7 @@ def _rows(df: pl.DataFrame, cols: list[tuple], with_flags: bool,
     out = []
     for r in df.iter_rows(named=True):
         rec = {k: _clean(r.get(k)) for k in present}
+        rec["canonical_category"] = _clean(r.get("canonical_category"))  # for the All-categories view
         # top-5 persistence is sourced from the backtest, not the run parquet.
         p = persist.get(r.get("scheme_code"))
         rec["top5_hits"] = p["hits"] if p else None
@@ -310,13 +311,10 @@ _TEMPLATE = r"""<!doctype html>
   details summary{cursor:pointer;color:var(--accent);font-size:11.5px;outline:none}
   details .body{margin-top:5px;padding:7px 10px;background:var(--head);border-radius:5px;
                 color:var(--mut);font-size:11.5px;line-height:1.55}
-  .gloss{margin-top:8px;max-width:1100px}
-  .gloss .grid{display:grid;grid-template-columns:160px 1fr;gap:3px 14px;margin-top:6px;
-               background:var(--head);padding:9px 12px;border-radius:6px}
-  .gloss .k{color:var(--fg);font-weight:600;font-size:12px}
-  .gloss .v{color:var(--mut);font-size:12px}
-  .gloss h4{margin:10px 0 2px;color:var(--accent);font-size:11.5px;font-weight:600}
   .tech{color:var(--mut);font-size:11px}
+  #tip{position:fixed;z-index:50;max-width:340px;background:#0b0f14;color:#e6edf3;
+       border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:12px;
+       line-height:1.45;box-shadow:0 6px 24px rgba(0,0,0,.55);display:none;pointer-events:none}
   .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
   select,input{background:var(--head);color:var(--fg);border:1px solid var(--line);
                border-radius:6px;padding:6px 9px;font-size:13px}
@@ -330,8 +328,8 @@ _TEMPLATE = r"""<!doctype html>
   .catwarn.neg{background:#2a1311;border:1px solid #5a1d1a;color:#f0a39c}
   .catwarn.wk{background:#241f0d;border:1px solid #5a4412;color:#e8cf86}
   .catwarn.pos{background:#10231a;border:1px solid #1f5133;color:#8fe3b0}
-  .wrap{padding:0 0 40px}
-  table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+  .scroll{overflow:auto}              /* ONLY the table scrolls (both axes), not the page */
+  table{border-collapse:collapse;min-width:100%;font-variant-numeric:tabular-nums}
   thead th{position:sticky;top:0;background:var(--head);border-bottom:2px solid var(--line);
            padding:8px 10px;text-align:right;cursor:pointer;white-space:nowrap;user-select:none}
   thead th:first-child,thead th.lft{text-align:left}
@@ -358,12 +356,11 @@ _TEMPLATE = r"""<!doctype html>
   <div class="sub">Indian equity/hybrid funds (Direct + Growth), ranked per category. Click a column header to sort; type to filter.</div>
   <div class="banner">
     <b>How to read this:</b> funds are ranked within each category by their <b>past</b> numbers — low fees, steady performance, and good risk-adjusted returns. Think of it as a <b>quality shortlist, not a prediction</b> of next year's winner. When we tested it, ranking near the top did <b>not</b> reliably lead to better future returns — so use it to narrow the field to solid, low-cost, consistent funds, then dig deeper before deciding.
-    <details><summary>Why we say it's "not a prediction" (the technical bit)</summary>
+    <details ontoggle="fit()"><summary>Why we say it's "not a prediction" (the technical bit)</summary>
       <div class="body">We replayed this ranking back to 2016 and checked whether higher-ranked funds went on to beat lower-ranked ones. The match was about <b>zero / slightly negative</b> (a rank-vs-future-return correlation, or "IC", of −0.05 over 1 year) — i.e. no better than chance. The test can only include funds that still exist today; closed funds (usually the poor ones) have vanished from the data, so the real figure is, if anything, a bit worse. Bottom line: the scoring is a sound <i>quality screen</i> but is <b>not validated as a performance forecast.</b></div>
     </details>
-    <span class="note">The “Active Share” column is blank until ~10 Jul 2026 — that data isn't ready yet, it's not a fund problem.</span>
+    <span class="note">Tip: <b>hover any column heading</b> (dotted underline) for what it means. The “Active Share” column is blank until ~10 Jul 2026 — that data isn't ready yet, it's not a fund problem.</span>
   </div>
-  <details class="gloss" id="gloss"><summary>ℹ︎ What the columns &amp; flags mean (plain English)</summary></details>
   <div class="controls">
     <div class="toggle">
       <button id="btnS2" class="on" onclick="setView('stage2')">Top picks</button>
@@ -375,13 +372,13 @@ _TEMPLATE = r"""<!doctype html>
   </div>
   <div class="catwarn" id="catwarn"></div>
 </header>
-<div class="wrap"><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table>
-  <div class="empty" id="empty" style="display:none">No funds match.</div>
-</div>
+<div class="scroll" id="scroll"><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
+<div class="empty" id="empty" style="display:none">No funds match.</div>
+<div id="tip"></div>
 <footer id="foot"></footer>
 <script>
 const D = /*__DATA__*/;
-let view='stage2', sortKey=null, sortDir=-1;
+let view='stage1', sortKey='composite_score', sortDir=-1;  // open on all funds, sorted by score
 
 function colsFor(v){return v==='stage2'?D.stage2_cols:D.stage1_cols;}
 function dataFor(v){return v==='stage2'?D.stage2:D.stage1;}
@@ -399,17 +396,20 @@ function fmt(val,kind){
   return [esc(String(val)),'',val];
 }
 function flagHtml(arr){if(!arr||!arr.length)return '<span class="mut">—</span>';
-  return arr.map(f=>`<span class="badge ${f.c}" title="${esc(f.h||'')}">${esc(f.t)}</span>`).join('');}
+  return arr.map(f=>`<span class="badge ${f.c}" data-tip="${esc(f.h||'')}">${esc(f.t)}</span>`).join('');}
 
 function initCats(){
   const sel=document.getElementById('cat');
-  sel.innerHTML = D.categories.map(c=>{
+  const total=view==='stage2'?D.n_s2:D.n_s1;
+  let html=`<option value="__all__">All categories (${total})</option>`;
+  html+=D.categories.map(c=>{
     const n=D.counts[c]; const k=view==='stage2'?n.s2:n.s1;
     return `<option value="${esc(c)}">${esc(c)} (${k})</option>`;
   }).join('');
+  sel.innerHTML=html;
 }
 function setView(v){
-  view=v; sortKey=null; sortDir=-1;
+  view=v; sortKey='composite_score'; sortDir=-1;
   document.getElementById('btnS2').classList.toggle('on',v==='stage2');
   document.getElementById('btnS1').classList.toggle('on',v==='stage1');
   const cur=document.getElementById('cat').value; initCats();
@@ -419,7 +419,8 @@ function setView(v){
 function sortBy(k){ if(sortKey===k){sortDir*=-1;} else {sortKey=k; sortDir= (k==='rank'||k==='stage2_rank')?1:-1;} render(); }
 
 function render(){
-  const cols=colsFor(view), cat=document.getElementById('cat').value;
+  let cols=colsFor(view).slice();
+  const cat=document.getElementById('cat').value;
   const q=document.getElementById('q').value.trim().toLowerCase();
   // Per-category honesty caveat from the retro-IC backtest (C1).
   const cw=document.getElementById('catwarn');
@@ -431,7 +432,14 @@ function render(){
     cw.innerHTML=`• <b>${esc(cat)}:</b> the ranking only loosely matched what happened next — treat the order as approximate. <span class="tech">(correlation ${ic.toFixed(2)})</span>`;}
   else {cw.className='catwarn pos';cw.style.display='block';
     cw.innerHTML=`✓ <b>The order is more trustworthy in ${esc(cat)}.</b> Historically, funds ranked near the top here did tend to do better afterwards. <span class="tech">(correlation +${ic.toFixed(2)})</span>`;}
-  let rows=(dataFor(view)[cat]||[]).slice();
+  let rows;
+  if(cat==='__all__'){
+    rows=Object.values(dataFor(view)).flat();
+    cols=[{k:'canonical_category',l:'Category',kind:'text',
+           tip:'Which category this fund is ranked within. Scores are relative WITHIN a category, so a high score = stands out in its own category (not directly comparable across categories).'}, ...cols];
+  } else {
+    rows=(dataFor(view)[cat]||[]).slice();
+  }
   if(q) rows=rows.filter(r=>String(r.scheme_name||'').toLowerCase().includes(q));
   if(sortKey){
     const kind=(cols.find(c=>c.k===sortKey)||{}).kind;
@@ -447,7 +455,7 @@ function render(){
   // header
   document.getElementById('head').innerHTML = cols.map(c=>{
     const lft=(c.kind==='text'||c.kind==='flags')?'lft':'';
-    const tc=c.tip?'tip':''; const tip=c.tip?` title="${esc(c.tip)}"`:'';
+    const tc=c.tip?'tip':''; const tip=c.tip?` data-tip="${esc(c.tip)}"`:'';
     const arr=sortKey===c.k?`<span class="arr">${sortDir<0?'▼':'▲'}</span>`:'';
     return `<th class="${lft} ${tc}" onclick="sortBy('${c.k}')"${tip}>${esc(c.l)} ${arr}</th>`;
   }).join('');
@@ -464,26 +472,44 @@ function render(){
     return `<td class="${lft} ${extra}">${txt}</td>`;
   }).join('')+'</tr>').join('');
   document.getElementById('empty').style.display = rows.length?'none':'block';
+  const vlabel = view==='stage2'?'Top picks (Stage 2, enriched)':'Full ranking (Stage 1)';
   document.getElementById('meta').textContent =
-    `${rows.length} funds · ${view==='stage2'?'Top picks (Stage 2, enriched)':'Full ranking (Stage 1)'}`;
+    `${rows.length} funds · ${cat==='__all__'?'All categories':cat} · ${vlabel}`;
+  fit();
 }
 
-function initGloss(){
-  const seen={}, cols=[...D.stage2_cols, ...D.stage1_cols];
-  let rows='';
-  cols.forEach(c=>{ if(c.tip && !seen[c.l]){seen[c.l]=1; rows+=`<div class="k">${esc(c.l)}</div><div class="v">${esc(c.tip)}</div>`; }});
-  const flags=(D.flag_glossary||[]).map(f=>`<div class="k">${esc(f.t)}</div><div class="v">${esc(f.h)}</div>`).join('');
-  document.getElementById('gloss').insertAdjacentHTML('beforeend',
-    `<div class="grid">${rows}</div><h4>Flag badges (the coloured tags in the Flags column)</h4><div class="grid">${flags}</div>`);
+// Size the table's scroll box to the space below the header, so ONLY the table
+// scrolls (both axes) — the page itself never scrolls sideways.
+function fit(){
+  const s=document.getElementById('scroll'); if(!s) return;
+  const top=s.getBoundingClientRect().top;
+  s.style.maxHeight=Math.max(220,Math.floor(window.innerHeight-top-8))+'px';
 }
+window.addEventListener('resize',fit);
+
+// Instant styled tooltip for anything with data-tip (column headers, flag badges).
+(function(){
+  const tip=document.getElementById('tip');
+  document.addEventListener('mouseover',e=>{
+    const t=e.target.closest&&e.target.closest('[data-tip]'); if(!t) return;
+    tip.textContent=t.getAttribute('data-tip'); tip.style.display='block';
+    const r=t.getBoundingClientRect();
+    tip.style.left=Math.max(6,Math.min(r.left,window.innerWidth-tip.offsetWidth-8))+'px';
+    tip.style.top=(r.bottom+6)+'px';
+  });
+  document.addEventListener('mouseout',e=>{
+    if(e.target.closest&&e.target.closest('[data-tip]')) tip.style.display='none';
+  });
+})();
 
 document.getElementById('asof').textContent = '· run '+D.as_of;
 document.getElementById('foot').innerHTML =
   `Run <code>${D.as_of}</code> · ${D.categories.length} categories · ${D.n_s2} shortlisted picks · ${D.n_s1} ranked funds. `+
-  `<b>Hover any column heading</b> for what it means, or open “What the columns &amp; flags mean” near the top. `+
+  `Opens on <b>all funds, highest score first</b>; pick one category from the dropdown, or use the toggle for the top-5 shortlist. `+
+  `<b>Hover any column heading</b> (dotted underline) for what it means. `+
   `“—” means we don't have that number yet (e.g. Active Share until ~10 Jul 2026). `+
   `Built by <code>tools/build_dashboard.py</code>.`;
-initGloss(); initCats(); setView('stage2');
+initCats(); setView('stage1');
 </script>
 </body>
 </html>
