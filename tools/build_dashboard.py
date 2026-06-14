@@ -120,6 +120,51 @@ TIPS = {
     "flags": "Caveat tags — hover each badge for what it means.",
 }
 
+# One-line, plain-English description of each fund category (shown on hover —
+# on the category dropdown and the Category column).
+CATEGORY_DESC = {
+    "Large Cap": "Invests mainly in India's ~100 largest companies (SEBI: ≥80% large-caps) — relatively stable blue-chips.",
+    "Large & Mid Cap": "Holds both large-caps and mid-caps (≥35% each) — balances stability and growth.",
+    "Mid Cap": "Mainly mid-sized companies (ranks 101–250 by market cap; ≥65% mid-caps) — more growth and volatility.",
+    "Small Cap": "Mainly small companies (rank 251+; ≥65% small-caps) — highest growth potential and risk.",
+    "Multi Cap": "Spreads across large, mid and small caps with ≥25% in each — diversified across the size spectrum.",
+    "Flexi Cap": "Invests across any market-cap with no fixed split — the manager moves freely between large/mid/small.",
+    "Focused": "A concentrated portfolio of at most 30 stocks — high conviction, higher single-stock risk.",
+    "ELSS": "Tax-saving equity fund (Section 80C) with a 3-year lock-in; invests across market caps.",
+    "Value": "Buys undervalued / out-of-favour stocks expecting them to re-rate — a value tilt.",
+    "Contra": "Contrarian strategy — buys beaten-down stocks the market dislikes, betting on a turnaround.",
+    "Dividend Yield": "Focuses on high-dividend-paying companies — income plus modest growth.",
+    "Aggressive Hybrid": "Equity-heavy hybrid (~65–80% equity, rest debt) — growth with a debt cushion.",
+    "Balanced Advantage": "Dynamically shifts between equity and debt based on market valuations — a smoother ride.",
+    "Equity Savings": "Conservative hybrid of equity + arbitrage + debt (~30–40% net equity) — lower volatility, equity taxation.",
+    "Banking & Financial Services": "Sector fund investing in banks, NBFCs and financial-services companies.",
+    "IT": "Sector fund investing in information-technology / software companies.",
+    "Pharma & Healthcare": "Sector fund investing in pharmaceutical and healthcare companies.",
+    "FMCG": "Sector fund investing in fast-moving consumer-goods companies.",
+    "Auto": "Sector fund investing in automobile and auto-component companies.",
+    "Energy": "Thematic fund investing in energy / natural-resources companies (power, oil & gas, etc.).",
+    "Infrastructure": "Thematic fund investing in infrastructure — construction, capital goods, power, transport.",
+    "PSU": "Invests in public-sector / government-owned enterprises.",
+    "Consumption": "Thematic fund investing in consumption-driven businesses (consumer goods, retail, autos, etc.).",
+    "MNC": "Invests in Indian-listed multinational companies.",
+    "ESG": "Invests using environmental, social and governance (ESG) screens.",
+    "Manufacturing": "Thematic fund investing in manufacturing / 'Make in India' companies.",
+    "Thematic": "Broad thematic/sectoral funds with varied mandates that don't map to a single standard theme.",
+}
+
+# Why a cell may be empty ("—"), per column — shown on hover of the dash.
+MISSING = {
+    "ter_pct": "No TER match — this fund's name didn't match AMFI's monthly TER disclosure (~9% of funds don't), or it's outside the scored pool.",
+    "aum_crore": "Fund size not available from AMFI's quarterly AAUM data for this scheme.",
+    "ptr_latest": "Portfolio turnover not disclosed — its AMC's factsheet wasn't parsed this month, or it reports turnover only annually.",
+    "active_share_median_1y": "Not computed yet — Active Share needs 3 monthly holdings + index snapshots and turns on ~10 Jul 2026 (not a fund problem).",
+    "top5_hits": "No back-tested top-5 history — its category never had more than 5 funds (so 'top-5' isn't a real cut), or the fund is too new to have a 3-year track record in any back-tested quarter.",
+    "top5_pct": "No eligible back-tested quarter for a top-5 cut in this fund's category (see Top-5 hits).",
+    "top10_hits": "No back-tested top-10 history — its category rarely had more than 10 funds, so a 'top-10' cut isn't meaningful for it.",
+    "top10_pct": "No eligible back-tested quarter for a top-10 cut in this fund's category (see Top-10 hits).",
+    "alpha_confidence": "Alpha-confidence unavailable — alpha couldn't be reliably estimated for this fund.",
+}
+
 # Plain-English meaning of each flag badge (shown in the on-screen panel).
 FLAG_GLOSSARY = [
     {"t": "partial", "h": "Some disclosure data for this fund (e.g. turnover or liquidity) is missing."},
@@ -287,6 +332,8 @@ def collect(as_of: str) -> dict:
         "categories": cat_list,
         "counts": counts,
         "cat_ic": _load_cat_ic(),
+        "cat_desc": CATEGORY_DESC,
+        "missing": MISSING,
         "flag_glossary": FLAG_GLOSSARY,
         "n_s1": sum(len(v) for v in stage1.values()),
         "n_s2": sum(len(v) for v in stage2.values()),
@@ -412,6 +459,11 @@ function fmt(val,kind){
 }
 function flagHtml(arr){if(!arr||!arr.length)return '<span class="mut">—</span>';
   return arr.map(f=>`<span class="badge ${f.c}" data-tip="${esc(f.h||'')}">${esc(f.t)}</span>`).join('');}
+// A "—" cell that explains, on hover, WHY it has no data (per column).
+function miss(k){
+  const why=(D.missing&&D.missing[k])||'Not available for this fund (insufficient history or data).';
+  return `<span class="mut" data-tip="${esc(why)}">—</span>`;
+}
 
 function initCats(){
   const sel=document.getElementById('cat');
@@ -447,6 +499,10 @@ function render(){
     cw.innerHTML=`• <b>${esc(cat)}:</b> the ranking only loosely matched what happened next — treat the order as approximate. <span class="tech">(correlation ${ic.toFixed(2)})</span>`;}
   else {cw.className='catwarn pos';cw.style.display='block';
     cw.innerHTML=`✓ <b>The order is more trustworthy in ${esc(cat)}.</b> Historically, funds ranked near the top here did tend to do better afterwards. <span class="tech">(correlation +${ic.toFixed(2)})</span>`;}
+  // Category description on hover of the dropdown (when one category is picked).
+  const sel=document.getElementById('cat');
+  const cdesc=(cat!=='__all__'&&D.cat_desc)?D.cat_desc[cat]:'';
+  if(cdesc) sel.setAttribute('data-tip',cdesc); else sel.removeAttribute('data-tip');
   let rows;
   if(cat==='__all__'){
     rows=Object.values(dataFor(view)).flat();
@@ -476,14 +532,25 @@ function render(){
   }).join('');
   // body
   document.getElementById('body').innerHTML = rows.map(r=>'<tr>'+cols.map(c=>{
-    if(c.kind==='flags') return `<td class="lft">${flagHtml(r.flags)}</td>`;
-    if(c.k==='top5_hits'||c.k==='top10_hits'){   // show "hits / eligible-quarters"; sort by hits
-      const h=r[c.k], q=(c.k==='top5_hits')?r.top5_q:r.top10_q;
-      return `<td>${(h===null||h===undefined)?'<span class="mut">—</span>':h+' <span class="mut">/ '+q+'</span>'}</td>`;
+    if(c.kind==='flags'){
+      const a=r.flags;
+      return a&&a.length ? `<td class="lft">${flagHtml(a)}</td>`
+        : `<td class="lft"><span class="mut" data-tip="No data-quality caveats flagged for this fund — a good thing.">—</span></td>`;
     }
-    const [txt,cls,_n]=fmt(r[c.k],c.kind);
+    if(c.k==='canonical_category'){            // All-categories view: hover shows what the category is
+      const cc=r.canonical_category||'', dsc=(D.cat_desc&&D.cat_desc[cc])||'';
+      return `<td class="lft"${dsc?` data-tip="${esc(dsc)}"`:''}>${esc(cc)}</td>`;
+    }
+    const v=r[c.k], isnull=(v===null||v===undefined||v==='');
+    if(c.k==='top5_hits'||c.k==='top10_hits'){   // "hits / eligible-quarters"; sort by hits
+      if(isnull) return `<td>${miss(c.k)}</td>`;
+      const q=(c.k==='top5_hits')?r.top5_q:r.top10_q;
+      return `<td>${v} <span class="mut">/ ${q}</span></td>`;
+    }
+    if(isnull) return `<td class="${(c.kind==='text')?'lft':''}">${miss(c.k)}</td>`;
+    const [txt,cls,_n]=fmt(v,c.kind);
     let extra=cls; const lft=(c.kind==='text')?'lft':'';
-    if(c.k==='alpha_3y_annualized'&&typeof r[c.k]==='number') extra=r[c.k]>=0?'pos':'neg';
+    if(c.k==='alpha_3y_annualized'&&typeof v==='number') extra=v>=0?'pos':'neg';
     return `<td class="${lft} ${extra}">${txt}</td>`;
   }).join('')+'</tr>').join('');
   document.getElementById('empty').style.display = rows.length?'none':'block';
