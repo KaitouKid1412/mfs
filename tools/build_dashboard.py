@@ -30,7 +30,45 @@ from pathlib import Path
 
 import polars as pl
 
+from mfs.config import get_pipeline_config
+from mfs.rank.score import STAGE1_WEIGHT_TO_COL, STAGE2_WEIGHT_TO_COL
+
 SHORTLIST_ROOT = Path("data") / "output" / "shortlist"
+
+# Non-weighted columns: their role in the ranking (shown under the heading in
+# place of a weight). Anything not here and not weighted shows nothing.
+COL_ROLE = {
+    "composite_score": "Σ weighted z",
+    "ter_pct": "tiebreaker",
+    "ptr_latest": "soft penalty",
+    "aum_crore": "display only",
+    "alpha_confidence": "display only",
+    "max_dd_3y_pct": "display only",
+    "data_quality_flag": "display only",
+    "top5_hits": "track record", "top5_pct": "track record",
+    "top10_hits": "track record", "top10_pct": "track record",
+}
+
+
+def _col_weights(weights: dict, key_to_col: dict) -> dict:
+    """Map a composite weights dict (keyed by weight-name) to {dashboard column
+    key: weight}, via the weight→z-column mapping (the dashboard column key is
+    the z-column with the 'z_' prefix stripped)."""
+    out: dict[str, float] = {}
+    for k, w in weights.items():
+        zc = key_to_col.get(k)
+        if zc and zc.startswith("z_"):
+            out[zc[2:]] = float(w)
+    return out
+
+
+def _sub_label(col_key: str, wmap: dict) -> str:
+    """Sub-heading text: the composite weight if the metric is scored, else its
+    role (tiebreaker / penalty / display)."""
+    if col_key in wmap:
+        w = wmap[col_key]
+        return f"wt {w:+.2f}" if w < 0 else f"wt {w:.2f}"
+    return COL_ROLE.get(col_key, "")
 
 # (key, header label, kind). kind drives JS formatting + sort type:
 #   pct    -> fraction × 100, 2dp + '%'    (returns, alpha, PTR, active-share)
@@ -51,7 +89,9 @@ STAGE2_COLS = [
     ("ter_pct", "TER", "pctraw"),
     ("aum_crore", "AUM (Cr)", "cr"),
     ("ret_3y_median", "Ret 3y", "pct"),
+    ("ret_3y_p25", "Ret 3y p25", "pct"),
     ("ret_5y_median", "Ret 5y", "pct"),
+    ("ret_5y_p25", "Ret 5y p25", "pct"),
     ("alpha_3y_annualized", "Alpha 3y", "pct"),
     ("alpha_confidence", "α conf", "ratio"),
     ("sortino_3y", "Sortino", "ratio"),
@@ -327,6 +367,9 @@ def collect(as_of: str) -> dict:
     cat_list = sorted(cats)
     counts = {c: {"s1": len(stage1.get(c, [])), "s2": len(stage2.get(c, []))}
               for c in cat_list}
+    cfg = get_pipeline_config()
+    w1 = _col_weights(dict(cfg.composite_weights_stage1), STAGE1_WEIGHT_TO_COL)
+    w2 = _col_weights(dict(cfg.composite_weights_stage2), STAGE2_WEIGHT_TO_COL)
     return {
         "as_of": as_of,
         "categories": cat_list,
@@ -337,8 +380,8 @@ def collect(as_of: str) -> dict:
         "flag_glossary": FLAG_GLOSSARY,
         "n_s1": sum(len(v) for v in stage1.values()),
         "n_s2": sum(len(v) for v in stage2.values()),
-        "stage1_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, "")} for k, l, kind in STAGE1_COLS],
-        "stage2_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, "")} for k, l, kind in STAGE2_COLS],
+        "stage1_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, ""), "sub": _sub_label(k, w1)} for k, l, kind in STAGE1_COLS],
+        "stage2_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, ""), "sub": _sub_label(k, w2)} for k, l, kind in STAGE2_COLS],
         "stage1": stage1,
         "stage2": stage2,
     }
@@ -398,6 +441,7 @@ _TEMPLATE = r"""<!doctype html>
   thead th:hover{color:var(--accent)}
   thead th.tip{text-decoration:underline dotted rgba(139,152,169,.6);text-underline-offset:4px}
   th .arr{color:var(--accent);font-size:10px}
+  th .wt{font-size:10px;color:var(--mut);font-weight:400;margin-top:2px;letter-spacing:.2px}
   td{padding:6px 10px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
   td.lft{text-align:left;max-width:360px;overflow:hidden;text-overflow:ellipsis}
   tbody tr:hover{background:#1b222c}
@@ -421,7 +465,13 @@ _TEMPLATE = r"""<!doctype html>
     <details ontoggle="fit()"><summary>Why we say it's "not a prediction" (the technical bit)</summary>
       <div class="body">We replayed this ranking back to 2016 and checked whether higher-ranked funds went on to beat lower-ranked ones. The match was about <b>zero / slightly negative</b> (a rank-vs-future-return correlation, or "IC", of −0.05 over 1 year) — i.e. no better than chance. The test can only include funds that still exist today; closed funds (usually the poor ones) have vanished from the data, so the real figure is, if anything, a bit worse. Bottom line: the scoring is a sound <i>quality screen</i> but is <b>not validated as a performance forecast.</b></div>
     </details>
-    <span class="note">Tip: <b>hover any column heading</b> (dotted underline) for what it means. The “Active Share” column is blank until ~10 Jul 2026 — that data isn't ready yet, it's not a fund problem.</span>
+    <details ontoggle="fit()"><summary>How the Score is calculated</summary>
+      <div class="body"><b>1. Put every metric on the same scale.</b> Within each category, each metric is turned into a <b>z-score</b> = (this fund's value − the category average) ÷ the category's standard deviation, then capped at ±3. So a z-score reads as “how many standard deviations above/below the category average,” which makes a return %, a Sortino ratio and an alpha % directly comparable.<br>
+      <b>2. Add them up with weights.</b> Score = the weighted sum of those z-scores — <b>the weight for each metric is shown in grey under its column heading</b> (Full-ranking weights sum to 1.0). Higher = better. A missing metric counts as 0; a fund with no 5-year history reuses its 3-year figure so it isn't penalised for being young.<br>
+      <b>3. Top-picks view only.</b> Also adds Active Share, subtracts a style-drift penalty, and applies soft penalties for high turnover (PTR) and poor liquidity. TER is a tiebreaker, not a weighted term.<br>
+      Because z-scores are category-relative, <b>Score compares funds within a category, not across them.</b></div>
+    </details>
+    <span class="note">Tip: <b>hover any column heading</b> (dotted underline) for what it means; the grey line under each heading is its <b>weight in the Score</b>. The “Active Share” column is blank until ~10 Jul 2026 — that data isn't ready yet, it's not a fund problem.</span>
   </div>
   <div class="controls">
     <div class="toggle">
@@ -528,7 +578,8 @@ function render(){
     const lft=(c.kind==='text'||c.kind==='flags')?'lft':'';
     const tc=c.tip?'tip':''; const tip=c.tip?` data-tip="${esc(c.tip)}"`:'';
     const arr=sortKey===c.k?`<span class="arr">${sortDir<0?'▼':'▲'}</span>`:'';
-    return `<th class="${lft} ${tc}" onclick="sortBy('${c.k}')"${tip}>${esc(c.l)} ${arr}</th>`;
+    const sub=c.sub?`<div class="wt">${esc(c.sub)}</div>`:'';
+    return `<th class="${lft} ${tc}" onclick="sortBy('${c.k}')"${tip}>${esc(c.l)} ${arr}${sub}</th>`;
   }).join('');
   // body
   document.getElementById('body').innerHTML = rows.map(r=>'<tr>'+cols.map(c=>{
