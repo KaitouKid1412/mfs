@@ -562,8 +562,7 @@ _TEMPLATE = r"""<!doctype html>
   <div class="sub">Indian equity &amp; hybrid funds (Direct-Growth), ranked within each category — a quality shortlist, <b>not</b> a prediction. Click a heading to sort, type to filter. <a class="hlink" href="#help">How to read this &amp; how the Score works ↓</a></div>
   <div class="controls">
     <div class="toggle">
-      <button id="btnS2" class="on" onclick="setView('stage2')">Top picks</button>
-      <button id="btnS1" onclick="setView('stage1')">Full ranking</button>
+      <button id="btnS1" class="on" onclick="setView('stage1')">Ranking</button>
       <button id="btnAVI" onclick="setView('avi')">Active vs Index</button>
     </div>
     <select id="cat" onchange="render()"></select>
@@ -582,7 +581,7 @@ _TEMPLATE = r"""<!doctype html>
     <div class="body">Funds are ranked within each category on past <b>cost, consistency and risk-adjusted returns</b> — a quality shortlist, <b>not</b> a prediction. Our 2016→ backtest found a high rank did <b>not</b> reliably beat going forward (rank-vs-future correlation ≈ 0, survivorship-biased) — so use it to narrow the field, then dig deeper. “Active Share” is blank until ~10 Jul 2026 (data not ready, not a fund problem). Hover any column heading for its meaning; the grey line under it is its <b>weight in the Score</b>.</div>
   </details>
   <details><summary>How the Score is calculated</summary>
-    <div class="body"><b>1.</b> Each metric → a within-category <b>z-score</b> = (fund value − category average) ÷ category std-dev, capped ±3 (puts %s and ratios on one scale). <b>2.</b> Score = weighted sum of those z-scores (weights under each heading; Full-ranking sums to 1.0; higher = better; a fund with no 5-yr history reuses its 3-yr figure). <b>3.</b> Top-picks also adds Active Share, a style-drift penalty and PTR/liquidity penalties; TER only breaks ties. Scores are category-relative — compare <b>within</b> a category, not across.</div>
+    <div class="body"><b>1.</b> Each metric → a within-category <b>z-score</b> = (fund value − category average) ÷ category std-dev, capped ±3 (puts %s and ratios on one scale). <b>2.</b> Score = weighted sum of those z-scores (weights under each heading sum to 1.0; higher = better; a fund with no 5-yr history reuses its 3-yr figure). Scores are category-relative — compare <b>within</b> a category, not across.</div>
   </details>
 </section>
 <script>
@@ -624,7 +623,6 @@ function initCats(){
 }
 function setView(v){
   view=v; sortKey=(v==='avi')?'beat_3y':'composite_score'; sortDir=-1;
-  document.getElementById('btnS2').classList.toggle('on',v==='stage2');
   document.getElementById('btnS1').classList.toggle('on',v==='stage1');
   document.getElementById('btnAVI').classList.toggle('on',v==='avi');
   if(v!=='avi'){
@@ -723,7 +721,7 @@ function render(){
     return `<td class="${lft} ${extra}">${txt}</td>`;
   }).join('')+'</tr>').join('');
   document.getElementById('empty').style.display = rows.length?'none':'block';
-  const vlabel = isAvi?'Active vs Index (per category)':(view==='stage2'?'Top picks (Stage 2, enriched)':'Full ranking (Stage 1)');
+  const vlabel = isAvi?'Active vs Index (per category)':'Ranking';
   const scope = isAvi?`${rows.length} categories`:`${rows.length} funds · ${catEl.value==='__all__'?'All categories':catEl.value}`;
   document.getElementById('meta').textContent = `${scope} · ${vlabel}`;
   fit();
@@ -755,7 +753,7 @@ window.addEventListener('resize',fit);
 
 document.getElementById('asof').textContent = '· run '+D.as_of;
 document.getElementById('foot').innerHTML =
-  `Run <code>${D.as_of}</code> · ${D.categories.length} categories · ${D.n_s2} picks · ${D.n_s1} ranked funds · `+
+  `Run <code>${D.as_of}</code> · ${D.categories.length} categories · ${D.n_s1} ranked funds · `+
   `hover a heading for its meaning &amp; weight · built by <code>tools/build_dashboard.py</code>.`;
 initCats(); setView('stage1');
 </script>
