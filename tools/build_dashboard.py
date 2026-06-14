@@ -510,6 +510,9 @@ _TEMPLATE = r"""<!doctype html>
   details .body{margin-top:5px;padding:7px 10px;background:var(--head);border-radius:5px;
                 color:var(--mut);font-size:11.5px;line-height:1.55}
   .tech{color:var(--mut);font-size:11px}
+  .hlink{color:var(--accent);text-decoration:none;font-size:11.5px;white-space:nowrap}
+  .help{padding:8px 18px 40px;max-width:1100px}
+  .help details{margin-top:6px}
   #tip{position:fixed;z-index:50;max-width:340px;background:#0b0f14;color:#e6edf3;
        border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:12px;
        line-height:1.45;box-shadow:0 6px 24px rgba(0,0,0,.55);display:none;pointer-events:none}
@@ -556,20 +559,7 @@ _TEMPLATE = r"""<!doctype html>
 <body>
 <header>
   <h1>Mutual-fund rankings <span class="mut" id="asof"></span></h1>
-  <div class="sub">Indian equity/hybrid funds (Direct + Growth), ranked per category. Click a column header to sort; type to filter.</div>
-  <div class="banner">
-    <b>How to read this:</b> funds are ranked within each category by their <b>past</b> numbers — low fees, steady performance, and good risk-adjusted returns. Think of it as a <b>quality shortlist, not a prediction</b> of next year's winner. When we tested it, ranking near the top did <b>not</b> reliably lead to better future returns — so use it to narrow the field to solid, low-cost, consistent funds, then dig deeper before deciding.
-    <details ontoggle="fit()"><summary>Why we say it's "not a prediction" (the technical bit)</summary>
-      <div class="body">We replayed this ranking back to 2016 and checked whether higher-ranked funds went on to beat lower-ranked ones. The match was about <b>zero / slightly negative</b> (a rank-vs-future-return correlation, or "IC", of −0.05 over 1 year) — i.e. no better than chance. The test can only include funds that still exist today; closed funds (usually the poor ones) have vanished from the data, so the real figure is, if anything, a bit worse. Bottom line: the scoring is a sound <i>quality screen</i> but is <b>not validated as a performance forecast.</b></div>
-    </details>
-    <details ontoggle="fit()"><summary>How the Score is calculated</summary>
-      <div class="body"><b>1. Put every metric on the same scale.</b> Within each category, each metric is turned into a <b>z-score</b> = (this fund's value − the category average) ÷ the category's standard deviation, then capped at ±3. So a z-score reads as “how many standard deviations above/below the category average,” which makes a return %, a Sortino ratio and an alpha % directly comparable.<br>
-      <b>2. Add them up with weights.</b> Score = the weighted sum of those z-scores — <b>the weight for each metric is shown in grey under its column heading</b> (Full-ranking weights sum to 1.0). Higher = better. A missing metric counts as 0; a fund with no 5-year history reuses its 3-year figure so it isn't penalised for being young.<br>
-      <b>3. Top-picks view only.</b> Also adds Active Share, subtracts a style-drift penalty, and applies soft penalties for high turnover (PTR) and poor liquidity. TER is a tiebreaker, not a weighted term.<br>
-      Because z-scores are category-relative, <b>Score compares funds within a category, not across them.</b></div>
-    </details>
-    <span class="note">Tip: <b>hover any column heading</b> (dotted underline) for what it means; the grey line under each heading is its <b>weight in the Score</b>. The “Active Share” column is blank until ~10 Jul 2026 — that data isn't ready yet, it's not a fund problem.</span>
-  </div>
+  <div class="sub">Indian equity &amp; hybrid funds (Direct-Growth), ranked within each category — a quality shortlist, <b>not</b> a prediction. Click a heading to sort, type to filter. <a class="hlink" href="#help">How to read this &amp; how the Score works ↓</a></div>
   <div class="controls">
     <div class="toggle">
       <button id="btnS2" class="on" onclick="setView('stage2')">Top picks</button>
@@ -587,6 +577,14 @@ _TEMPLATE = r"""<!doctype html>
 <div class="empty" id="empty" style="display:none">No funds match.</div>
 <div id="tip"></div>
 <footer id="foot"></footer>
+<section class="help" id="help">
+  <details><summary>How to read this</summary>
+    <div class="body">Funds are ranked within each category on past <b>cost, consistency and risk-adjusted returns</b> — a quality shortlist, <b>not</b> a prediction. Our 2016→ backtest found a high rank did <b>not</b> reliably beat going forward (rank-vs-future correlation ≈ 0, survivorship-biased) — so use it to narrow the field, then dig deeper. “Active Share” is blank until ~10 Jul 2026 (data not ready, not a fund problem). Hover any column heading for its meaning; the grey line under it is its <b>weight in the Score</b>.</div>
+  </details>
+  <details><summary>How the Score is calculated</summary>
+    <div class="body"><b>1.</b> Each metric → a within-category <b>z-score</b> = (fund value − category average) ÷ category std-dev, capped ±3 (puts %s and ratios on one scale). <b>2.</b> Score = weighted sum of those z-scores (weights under each heading; Full-ranking sums to 1.0; higher = better; a fund with no 5-yr history reuses its 3-yr figure). <b>3.</b> Top-picks also adds Active Share, a style-drift penalty and PTR/liquidity penalties; TER only breaks ties. Scores are category-relative — compare <b>within</b> a category, not across.</div>
+  </details>
+</section>
 <script>
 const D = /*__DATA__*/;
 let view='stage1', sortKey='composite_score', sortDir=-1;  // open on all funds, sorted by score
@@ -648,7 +646,7 @@ function render(){
     cols=D.avi_cols.slice();
     rows=(D.avi||[]).slice();
     document.getElementById('avinote').innerHTML =
-      `<b>Active vs Index</b> — per category: the index's 3-year CAGR, the median active fund, the middle-50% spread of fund returns, and the <b>share of funds that beat the index</b> (which the median alone hides). High % beating <i>with</i> a tight spread → active reliably adds value; ~50% with a wide spread → a coin-flip where the index is the safer default (and our ranking can't reliably pick the winner). Survivorship-biased (failed funds excluded → reality a bit worse for active); hybrids use a synthetic benchmark; compares returns only, not risk-adjusted. Sort “% beat” or “Fund p25→p75” to judge picking risk.`;
+      `Per category: <b>% of funds that beat the index</b> (3y &amp; 5y) and the fund-return spread. High % + tight spread → active adds value; ~50% + wide spread → index is the safer bet. <span class="tech">Survivorship-biased; hybrids synthetic; returns-only.</span>`;
   } else {
     cols=colsFor(view).slice();
     const cat=catEl.value;
@@ -757,11 +755,8 @@ window.addEventListener('resize',fit);
 
 document.getElementById('asof').textContent = '· run '+D.as_of;
 document.getElementById('foot').innerHTML =
-  `Run <code>${D.as_of}</code> · ${D.categories.length} categories · ${D.n_s2} shortlisted picks · ${D.n_s1} ranked funds. `+
-  `Opens on <b>all funds, highest score first</b>; pick one category from the dropdown, or use the toggle for the top-5 shortlist. `+
-  `<b>Hover any column heading</b> (dotted underline) for what it means. `+
-  `“—” means we don't have that number yet (e.g. Active Share until ~10 Jul 2026). `+
-  `Built by <code>tools/build_dashboard.py</code>.`;
+  `Run <code>${D.as_of}</code> · ${D.categories.length} categories · ${D.n_s2} picks · ${D.n_s1} ranked funds · `+
+  `hover a heading for its meaning &amp; weight · built by <code>tools/build_dashboard.py</code>.`;
 initCats(); setView('stage1');
 </script>
 </body>
