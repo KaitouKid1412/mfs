@@ -28,6 +28,8 @@ import os
 import webbrowser
 from pathlib import Path
 
+from datetime import date
+
 import polars as pl
 
 from mfs.config import get_pipeline_config
@@ -128,6 +130,19 @@ STAGE1_COLS = [
     ("data_quality_flag", "Quality", "text"),
 ]
 
+# "Active vs Index" tab — one row per category (not per fund).
+AVI_COLS = [
+    ("canonical_category", "Category", "text"),
+    ("n3", "n (3y record)", "int"),
+    ("idx_3y", "Index 3y", "pct"),
+    ("fund_med_3y", "Median fund 3y", "pct"),
+    ("spread_3y", "Fund p25→p75 (3y)", "range"),
+    ("beat_3y", "% beat (3y)", "pctraw"),
+    ("beat_5y", "% beat (5y)", "pctraw"),
+    ("excess_3y", "Median excess (3y)", "pct"),
+    ("verdict", "Active vs Index", "verdict"),
+]
+
 
 # Plain-English, one-line explanation per column (shown on hover + in the
 # on-screen "what the columns mean" panel).
@@ -158,6 +173,16 @@ TIPS = {
     "active_share_median_1y": "How different the holdings are from the index (high = genuinely active). Blank until ~10 Jul 2026.",
     "data_quality_flag": "Data-quality status for this fund's metrics.",
     "flags": "Caveat tags — hover each badge for what it means.",
+    # Active-vs-Index tab
+    "canonical_category": "The fund category.",
+    "n3": "Funds in the category with a 3-year track record (the basis for the 3-year stats).",
+    "idx_3y": "The index (benchmark TRI) median rolling 3-year CAGR — what a near-costless index fund would have tracked.",
+    "fund_med_3y": "The category's median fund's 3-year CAGR (net of fees).",
+    "spread_3y": "Middle-50% spread of fund 3-year returns (p25→p75). Wider = it matters more which fund you pick. Sort by this for picking risk.",
+    "beat_3y": "Share of the category's funds whose 3-year return beat the index. ~50% = a coin flip.",
+    "beat_5y": "Share of funds whose 5-year return beat the index.",
+    "excess_3y": "Median fund's 3-year CAGR minus the index.",
+    "verdict": "Rough active-vs-index call from the hit-rate + dispersion. Survivorship-biased (failed funds excluded), so reality is a bit worse for active; hybrids use a synthetic benchmark.",
 }
 
 # One-line, plain-English description of each fund category (shown on hover —
@@ -332,6 +357,72 @@ def _load_top5_persistence() -> dict:
     return out
 
 
+def _verdict(beat3, n3: int, synthetic: bool) -> tuple[str, str]:
+    """Active-vs-index call from the 3y hit-rate + sample/quality, with a css class."""
+    if synthetic:
+        return ("n/a — synthetic benchmark", "mut")
+    if n3 < 8:
+        return ("too few funds", "mut")
+    if beat3 is None:
+        return ("—", "mut")
+    if beat3 >= 75:
+        return ("active edge", "pos")
+    if beat3 >= 60:
+        return ("lean active", "pos")
+    if beat3 >= 45:
+        return ("coin-flip → index", "wk")
+    return ("index wins", "neg")
+
+
+def _load_active_vs_index(as_of: str) -> list[dict]:
+    """Per-category active-vs-index comparison: index CAGR, the category fund
+    return distribution (median + p25/p75 spread), the share of funds beating
+    the index (3y & 5y), and a verdict. Benchmark medians come from the run's
+    passive_alternative.csv; the fund dispersion is computed from the full
+    computed_metrics population (the same basis passive.py uses). Returns []
+    (tab hidden) if either source is unavailable."""
+    try:
+        from mfs.db import queries as q
+
+        pcsv = SHORTLIST_ROOT / as_of / "passive_alternative.csv"
+        if not pcsv.exists():
+            return []
+        pa = pl.read_csv(pcsv, comment_prefix="#")
+        bench = {r["canonical_category"]: r for r in pa.iter_rows(named=True)}
+        m = q.computed_metrics_at(date.fromisoformat(as_of))
+        if m.is_empty():
+            return []
+        m = m.select(["canonical_category", "ret_3y_median", "ret_5y_median"])
+        out: list[dict] = []
+        for cat_t, g in m.group_by("canonical_category"):
+            cat = cat_t[0]
+            b = bench.get(cat)
+            if not b:
+                continue
+            b3, b5 = b["benchmark_ret_3y_median"], b["benchmark_ret_5y_median"]
+            r3 = g["ret_3y_median"].drop_nulls()
+            if r3.len() < 4 or b3 is None:
+                continue
+            p25, p50, p75 = (float(r3.quantile(0.25)), float(r3.median()), float(r3.quantile(0.75)))
+            beat3 = round(float((r3 > b3).sum()) / r3.len() * 100.0)
+            r5 = g["ret_5y_median"].drop_nulls()
+            beat5 = round(float((r5 > b5).sum()) / r5.len() * 100.0) if (b5 is not None and r5.len()) else None
+            syn = bool(b["benchmark_is_synthetic"])
+            vt, vc = _verdict(beat3, r3.len(), syn)
+            out.append({
+                "canonical_category": cat, "n3": r3.len(),
+                "idx_3y": b3, "fund_med_3y": p50,
+                "p25_3y": p25, "p75_3y": p75, "spread_3y": p75 - p25,
+                "beat_3y": beat3, "beat_5y": beat5,
+                "excess_3y": p50 - b3, "verdict": vt, "verdict_c": vc,
+                "synthetic": syn,
+            })
+        out.sort(key=lambda r: (r["beat_3y"] if r["beat_3y"] is not None else -1), reverse=True)
+        return out
+    except Exception:  # noqa: BLE001 — tab is best-effort; degrade to hidden
+        return []
+
+
 def collect(as_of: str) -> dict:
     run = SHORTLIST_ROOT / as_of
     if not run.exists():
@@ -382,6 +473,8 @@ def collect(as_of: str) -> dict:
         "n_s2": sum(len(v) for v in stage2.values()),
         "stage1_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, ""), "sub": _sub_label(k, w1)} for k, l, kind in STAGE1_COLS],
         "stage2_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, ""), "sub": _sub_label(k, w2)} for k, l, kind in STAGE2_COLS],
+        "avi_cols": [{"k": k, "l": l, "kind": kind, "tip": TIPS.get(k, ""), "sub": ""} for k, l, kind in AVI_COLS],
+        "avi": _load_active_vs_index(as_of),
         "stage1": stage1,
         "stage2": stage2,
     }
@@ -433,6 +526,10 @@ _TEMPLATE = r"""<!doctype html>
   .catwarn.neg{background:#2a1311;border:1px solid #5a1d1a;color:#f0a39c}
   .catwarn.wk{background:#241f0d;border:1px solid #5a4412;color:#e8cf86}
   .catwarn.pos{background:#10231a;border:1px solid #1f5133;color:#8fe3b0}
+  .avinote{margin-top:9px;padding:8px 12px;border-radius:6px;font-size:12px;display:none;line-height:1.5;
+           background:#16202b;border:1px solid #243240;color:#cdd9e5;max-width:1100px}
+  .vb{font-weight:600}
+  .vb.pos{color:var(--good)} .vb.wk{color:var(--warn)} .vb.neg{color:var(--bad)} .vb.mut{color:var(--mut)}
   .scroll{overflow:auto}              /* ONLY the table scrolls (both axes), not the page */
   table{border-collapse:collapse;min-width:100%;font-variant-numeric:tabular-nums}
   thead th{position:sticky;top:0;background:var(--head);border-bottom:2px solid var(--line);
@@ -477,12 +574,14 @@ _TEMPLATE = r"""<!doctype html>
     <div class="toggle">
       <button id="btnS2" class="on" onclick="setView('stage2')">Top picks</button>
       <button id="btnS1" onclick="setView('stage1')">Full ranking</button>
+      <button id="btnAVI" onclick="setView('avi')">Active vs Index</button>
     </div>
     <select id="cat" onchange="render()"></select>
     <input id="q" type="search" placeholder="Filter funds… (name)" oninput="render()"/>
     <span class="meta" id="meta"></span>
   </div>
   <div class="catwarn" id="catwarn"></div>
+  <div class="avinote" id="avinote"></div>
 </header>
 <div class="scroll" id="scroll"><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
 <div class="empty" id="empty" style="display:none">No funds match.</div>
@@ -526,42 +625,55 @@ function initCats(){
   sel.innerHTML=html;
 }
 function setView(v){
-  view=v; sortKey='composite_score'; sortDir=-1;
+  view=v; sortKey=(v==='avi')?'beat_3y':'composite_score'; sortDir=-1;
   document.getElementById('btnS2').classList.toggle('on',v==='stage2');
   document.getElementById('btnS1').classList.toggle('on',v==='stage1');
-  const cur=document.getElementById('cat').value; initCats();
-  if([...document.getElementById('cat').options].some(o=>o.value===cur)) document.getElementById('cat').value=cur;
+  document.getElementById('btnAVI').classList.toggle('on',v==='avi');
+  if(v!=='avi'){
+    const cur=document.getElementById('cat').value; initCats();
+    if([...document.getElementById('cat').options].some(o=>o.value===cur)) document.getElementById('cat').value=cur;
+  }
   render();
 }
 function sortBy(k){ if(sortKey===k){sortDir*=-1;} else {sortKey=k; sortDir= (k==='rank'||k==='stage2_rank')?1:-1;} render(); }
 
 function render(){
-  let cols=colsFor(view).slice();
-  const cat=document.getElementById('cat').value;
-  const q=document.getElementById('q').value.trim().toLowerCase();
-  // Per-category honesty caveat from the retro-IC backtest (C1).
-  const cw=document.getElementById('catwarn');
-  const ic=(D.cat_ic||{})[cat];
-  if(ic===undefined){cw.style.display='none';}
-  else if(ic<=0){cw.className='catwarn neg';cw.style.display='block';
-    cw.innerHTML=`⚠ <b>Be careful with the order in ${esc(cat)}.</b> In our back-test, the funds ranked near the top of this category tended to do <b>slightly worse</b> than a typical ${esc(cat)} fund afterwards — so this isn't a reliable best-to-worst list here. Use it as a rough shortlist only. <span class="tech">(rank-vs-future-return correlation ${ic.toFixed(2)})</span>`;}
-  else if(ic<0.05){cw.className='catwarn wk';cw.style.display='block';
-    cw.innerHTML=`• <b>${esc(cat)}:</b> the ranking only loosely matched what happened next — treat the order as approximate. <span class="tech">(correlation ${ic.toFixed(2)})</span>`;}
-  else {cw.className='catwarn pos';cw.style.display='block';
-    cw.innerHTML=`✓ <b>The order is more trustworthy in ${esc(cat)}.</b> Historically, funds ranked near the top here did tend to do better afterwards. <span class="tech">(correlation +${ic.toFixed(2)})</span>`;}
-  // Category description on hover of the dropdown (when one category is picked).
-  const sel=document.getElementById('cat');
-  const cdesc=(cat!=='__all__'&&D.cat_desc)?D.cat_desc[cat]:'';
-  if(cdesc) sel.setAttribute('data-tip',cdesc); else sel.removeAttribute('data-tip');
-  let rows;
-  if(cat==='__all__'){
-    rows=Object.values(dataFor(view)).flat();
-    cols=[{k:'canonical_category',l:'Category',kind:'text',
-           tip:'Which category this fund is ranked within. Scores are relative WITHIN a category, so a high score = stands out in its own category (not directly comparable across categories).'}, ...cols];
+  const isAvi = view==='avi';
+  const catEl=document.getElementById('cat'), qEl=document.getElementById('q');
+  catEl.style.display=isAvi?'none':''; qEl.style.display=isAvi?'none':'';
+  document.getElementById('catwarn').style.display=isAvi?'none':'';
+  document.getElementById('avinote').style.display=isAvi?'block':'none';
+  let cols, rows;
+  if(isAvi){
+    cols=D.avi_cols.slice();
+    rows=(D.avi||[]).slice();
+    document.getElementById('avinote').innerHTML =
+      `<b>Active vs Index</b> — per category: the index's 3-year CAGR, the median active fund, the middle-50% spread of fund returns, and the <b>share of funds that beat the index</b> (which the median alone hides). High % beating <i>with</i> a tight spread → active reliably adds value; ~50% with a wide spread → a coin-flip where the index is the safer default (and our ranking can't reliably pick the winner). Survivorship-biased (failed funds excluded → reality a bit worse for active); hybrids use a synthetic benchmark; compares returns only, not risk-adjusted. Sort “% beat” or “Fund p25→p75” to judge picking risk.`;
   } else {
-    rows=(dataFor(view)[cat]||[]).slice();
+    cols=colsFor(view).slice();
+    const cat=catEl.value;
+    const q=qEl.value.trim().toLowerCase();
+    // Per-category honesty caveat from the retro-IC backtest (C1).
+    const cw=document.getElementById('catwarn');
+    const ic=(D.cat_ic||{})[cat];
+    if(ic===undefined){cw.style.display='none';}
+    else if(ic<=0){cw.className='catwarn neg';cw.style.display='block';
+      cw.innerHTML=`⚠ <b>Be careful with the order in ${esc(cat)}.</b> In our back-test, the funds ranked near the top of this category tended to do <b>slightly worse</b> than a typical ${esc(cat)} fund afterwards — so this isn't a reliable best-to-worst list here. Use it as a rough shortlist only. <span class="tech">(rank-vs-future-return correlation ${ic.toFixed(2)})</span>`;}
+    else if(ic<0.05){cw.className='catwarn wk';cw.style.display='block';
+      cw.innerHTML=`• <b>${esc(cat)}:</b> the ranking only loosely matched what happened next — treat the order as approximate. <span class="tech">(correlation ${ic.toFixed(2)})</span>`;}
+    else {cw.className='catwarn pos';cw.style.display='block';
+      cw.innerHTML=`✓ <b>The order is more trustworthy in ${esc(cat)}.</b> Historically, funds ranked near the top here did tend to do better afterwards. <span class="tech">(correlation +${ic.toFixed(2)})</span>`;}
+    const cdesc=(cat!=='__all__'&&D.cat_desc)?D.cat_desc[cat]:'';
+    if(cdesc) catEl.setAttribute('data-tip',cdesc); else catEl.removeAttribute('data-tip');
+    if(cat==='__all__'){
+      rows=Object.values(dataFor(view)).flat();
+      cols=[{k:'canonical_category',l:'Category',kind:'text',
+             tip:'Which category this fund is ranked within. Scores are relative WITHIN a category, so a high score = stands out in its own category (not directly comparable across categories).'}, ...cols];
+    } else {
+      rows=(dataFor(view)[cat]||[]).slice();
+    }
+    if(q) rows=rows.filter(r=>String(r.scheme_name||'').toLowerCase().includes(q));
   }
-  if(q) rows=rows.filter(r=>String(r.scheme_name||'').toLowerCase().includes(q));
   if(sortKey){
     const kind=(cols.find(c=>c.k===sortKey)||{}).kind;
     rows.sort((a,b)=>{
@@ -575,7 +687,7 @@ function render(){
   }
   // header
   document.getElementById('head').innerHTML = cols.map(c=>{
-    const lft=(c.kind==='text'||c.kind==='flags')?'lft':'';
+    const lft=(c.kind==='text'||c.kind==='flags'||c.kind==='verdict')?'lft':'';
     const tc=c.tip?'tip':''; const tip=c.tip?` data-tip="${esc(c.tip)}"`:'';
     const arr=sortKey===c.k?`<span class="arr">${sortDir<0?'▼':'▲'}</span>`:'';
     const sub=c.sub?`<div class="wt">${esc(c.sub)}</div>`:'';
@@ -588,9 +700,17 @@ function render(){
       return a&&a.length ? `<td class="lft">${flagHtml(a)}</td>`
         : `<td class="lft"><span class="mut" data-tip="No data-quality caveats flagged for this fund — a good thing.">—</span></td>`;
     }
-    if(c.k==='canonical_category'){            // All-categories view: hover shows what the category is
+    if(c.k==='canonical_category'){            // hover shows what the category is
       const cc=r.canonical_category||'', dsc=(D.cat_desc&&D.cat_desc[cc])||'';
       return `<td class="lft"${dsc?` data-tip="${esc(dsc)}"`:''}>${esc(cc)}</td>`;
+    }
+    if(c.k==='verdict'){                        // Active-vs-Index call, colour-coded
+      return `<td class="lft"><span class="vb ${r.verdict_c||'mut'}">${esc(r.verdict||'—')}</span></td>`;
+    }
+    if(c.k==='spread_3y'){                      // p25→p75 range; sort key is the IQR width
+      const a=r.p25_3y, b=r.p75_3y;
+      if(a===null||a===undefined) return `<td>${miss('spread_3y')}</td>`;
+      return `<td>${(a*100).toFixed(1)}%<span class="mut"> → </span>${(b*100).toFixed(1)}%</td>`;
     }
     const v=r[c.k], isnull=(v===null||v===undefined||v==='');
     if(c.k==='top5_hits'||c.k==='top10_hits'){   // "hits / eligible-quarters"; sort by hits
@@ -601,13 +721,13 @@ function render(){
     if(isnull) return `<td class="${(c.kind==='text')?'lft':''}">${miss(c.k)}</td>`;
     const [txt,cls,_n]=fmt(v,c.kind);
     let extra=cls; const lft=(c.kind==='text')?'lft':'';
-    if(c.k==='alpha_3y_annualized'&&typeof v==='number') extra=v>=0?'pos':'neg';
+    if((c.k==='alpha_3y_annualized'||c.k==='excess_3y')&&typeof v==='number') extra=v>=0?'pos':'neg';
     return `<td class="${lft} ${extra}">${txt}</td>`;
   }).join('')+'</tr>').join('');
   document.getElementById('empty').style.display = rows.length?'none':'block';
-  const vlabel = view==='stage2'?'Top picks (Stage 2, enriched)':'Full ranking (Stage 1)';
-  document.getElementById('meta').textContent =
-    `${rows.length} funds · ${cat==='__all__'?'All categories':cat} · ${vlabel}`;
+  const vlabel = isAvi?'Active vs Index (per category)':(view==='stage2'?'Top picks (Stage 2, enriched)':'Full ranking (Stage 1)');
+  const scope = isAvi?`${rows.length} categories`:`${rows.length} funds · ${catEl.value==='__all__'?'All categories':catEl.value}`;
+  document.getElementById('meta').textContent = `${scope} · ${vlabel}`;
   fit();
 }
 
