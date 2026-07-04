@@ -2,7 +2,7 @@
 
 The site's historical TRI section makes this call when you click "Get Data":
 
-    POST https://www.niftyindices.com/Backpage.aspx/getTotalReturnIndexString
+    POST https://www.niftyindices.com/BackPage/getTotalReturnIndexString
     Content-Type: application/json; charset=UTF-8
     {"cinfo": "{'name':'<TRADING_NAME_UPPER>','startDate':'<dd-Mon-yyyy>','endDate':'<dd-Mon-yyyy>','indexName':'<long_name>'}"}
 
@@ -41,7 +41,10 @@ from mfs.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-NIFTY_TRI_URL = "https://www.niftyindices.com/Backpage.aspx/getTotalReturnIndexString"
+# niftyindices moved this endpoint from the legacy /Backpage.aspx/ path (which now
+# 302-redirects to a Sitefinity login) to /BackPage/ (no .aspx) in 2026-07. The new
+# path serves the same JSON with no auth/cookies required.
+NIFTY_TRI_URL = "https://www.niftyindices.com/BackPage/getTotalReturnIndexString"
 INDEX_MAPPING_URL = "https://iislliveblob.niftyindices.com/assets/json/IndexMapping.json"
 TRI_WINDOW_DAYS = 360  # endpoint caps at 365; leave headroom
 
@@ -189,6 +192,16 @@ def fetch_tri_window(trading_name_upper: str, long_name: str, start: date, end: 
                 f"NSE Indices {r.status_code} for {long_name!r} at {NIFTY_TRI_URL}"
             ) from e
         outer = r.json()
+    # The new /BackPage/ endpoint returns the records as a bare JSON array (or, in
+    # some cases, a JSON-encoded string of one). The legacy /Backpage.aspx/ endpoint
+    # wrapped them in an ASP.NET {"d": <array-or-string>} envelope — still handled below.
+    if isinstance(outer, list):
+        return outer
+    if isinstance(outer, str):
+        try:
+            return json.loads(outer)
+        except json.JSONDecodeError as e:
+            raise TransientHttpError(f"Bad bare JSON: {e}") from e
     if not isinstance(outer, dict) or "d" not in outer:
         raise TransientHttpError(f"Unexpected NSE envelope: {type(outer).__name__}")
     inner_str = outer["d"]
