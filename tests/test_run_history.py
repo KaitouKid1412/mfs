@@ -448,6 +448,7 @@ def test_build_snapshots_scheme_master_after_sync(monkeypatch):
     assert calls[1][1] == date.today()
 
 
+@pytest.mark.db
 def test_rank_deep_persists_history_at_tail(monkeypatch):
     """rank_deep must hand ONE batch to persist_rank_history covering all
     three stages, with included/exclusion_reason populated."""

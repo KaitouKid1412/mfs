@@ -381,6 +381,7 @@ def test_holdings_force_true_redownloads_and_parses_new_bytes(monkeypatch, tmp_p
     assert all(n.startswith("NewCo") for n in names)   # NEW bytes parsed in
 
 
+@pytest.mark.db
 def test_holdings_force_false_serves_cache_without_download(monkeypatch, tmp_path):
     downloads, written = _setup_holdings_force(monkeypatch, tmp_path)
     res = holdings_run.run_for_amc("forceh", ym=_YM, force=False)

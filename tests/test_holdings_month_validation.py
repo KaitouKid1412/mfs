@@ -76,6 +76,7 @@ def _fake_scheme_master() -> pl.DataFrame:
     })
 
 
+@pytest.mark.db
 def test_wrong_month_artifact_aborts_amc_evicts_cache_never_writes(
     tmp_path, monkeypatch,
 ):
@@ -160,6 +161,7 @@ class _StubBespokeAdapter(_StubAprilAdapter):
             wb.close()
 
 
+@pytest.mark.db
 def test_bespoke_adapter_flows_through_central_screen(tmp_path, monkeypatch):
     stub = _StubBespokeAdapter(tmp_path)
     monkeypatch.setattr(holdings_run, "get_adapter", lambda slug: stub)
@@ -180,6 +182,7 @@ def test_bespoke_adapter_flows_through_central_screen(tmp_path, monkeypatch):
     assert not stub.fetched[0].exists()  # evicted, never pinned
 
 
+@pytest.mark.db
 def test_bespoke_adapter_right_month_parses(tmp_path, monkeypatch):
     stub = _StubBespokeAdapter(tmp_path)
     written = []
@@ -214,6 +217,7 @@ def test_bespoke_adapter_right_month_parses(tmp_path, monkeypatch):
     assert written and written[0]["isin"].to_list() == ["INE040A01034"]
 
 
+@pytest.mark.db
 def test_per_adapter_override_hook_wins(tmp_path, monkeypatch):
     # An AMC whose banner is nonstandard can supply its own extraction; the
     # orchestrator must consult it INSTEAD of the generic sniffing scan.

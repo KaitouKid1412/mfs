@@ -18,6 +18,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import openpyxl
+import pytest
 import polars as pl
 from structlog.testing import capture_logs
 
@@ -181,6 +182,7 @@ def _fake_connect(autocommit=False):
     yield _Conn()
 
 
+@pytest.mark.db
 def test_runner_skips_breaching_scheme_writes_the_rest(tmp_path, monkeypatch):
     # G1 sums ~99 (ok); G2 sums 186 (mis-scaled) → only G1's rows written,
     # G2 counted in the run summary.
@@ -206,6 +208,7 @@ def test_runner_skips_breaching_scheme_writes_the_rest(tmp_path, monkeypatch):
     assert res["rows_written"] == 5
 
 
+@pytest.mark.db
 def test_runner_skips_too_few_holdings_scheme(tmp_path, monkeypatch):
     # G2 is an active equity fund carrying exactly 4 rows (the contaminated
     # Motilal shape) → skipped + counted.

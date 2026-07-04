@@ -2,7 +2,9 @@
 # no data/raw, no Postgres, no network services. Adapter value-pin tests
 # that need local artifacts are auto-marked `local_data` (tests/conftest.py)
 # and deselected here; committed PDF extracts keep the parse paths covered
-# (tests/test_managers_fixture_extracts.py).
+# (tests/test_managers_fixture_extracts.py). Tests that need a live
+# PostgreSQL connection are marked `db` and deselected here too — they are
+# run locally against a real DB (there is no Postgres service in CI).
 name: CI
 
 on:
@@ -16,6 +18,11 @@ env:
   # tools/make_fixture_pdf.py) or bump this pin consciously in the same
   # change. If it shrinks (tests migrated off local_data), lower the pin.
   EXPECTED_LOCAL_DATA_DESELECTED: "333"
+  # Tripwire: number of tests deselected by -m 'not db' (need a live Postgres).
+  # If this GROWS, someone added a DB-dependent test that silently never runs
+  # in CI — either mock the connection (see the _fake_connect patterns) or bump
+  # this pin consciously in the same change.
+  EXPECTED_DB_DESELECTED: "11"
 
 jobs:
   ci:
@@ -45,8 +52,8 @@ jobs:
         run: uv run mypy
         continue-on-error: true
 
-      - name: Tests (excluding local_data)
-        run: uv run pytest tests/ -m "not local_data"
+      - name: Tests (excluding local_data + db)
+        run: uv run pytest tests/ -m "not local_data and not db"
 
       - name: local_data deselection tripwire
         run: |
@@ -60,6 +67,21 @@ jobs:
           echo "deselected=${actual} (pinned ${EXPECTED_LOCAL_DATA_DESELECTED})"
           if [ "${actual}" -gt "${EXPECTED_LOCAL_DATA_DESELECTED}" ]; then
             echo "::error::local_data deselected count grew from ${EXPECTED_LOCAL_DATA_DESELECTED} to ${actual}: new tests depend on gitignored data/raw and will never run in CI. Add a committed fixture extract or bump EXPECTED_LOCAL_DATA_DESELECTED deliberately."
+            exit 1
+          fi
+
+      - name: db deselection tripwire
+        run: |
+          line=$(uv run pytest tests/ -m "not db" --collect-only | tail -1)
+          echo "collect summary: ${line}"
+          actual=$(echo "${line}" | sed -nE 's/.*\(([0-9]+) deselected\).*/\1/p')
+          if [ -z "${actual}" ]; then
+            echo "::error::could not parse deselected count from pytest collect output"
+            exit 1
+          fi
+          echo "deselected=${actual} (pinned ${EXPECTED_DB_DESELECTED})"
+          if [ "${actual}" -gt "${EXPECTED_DB_DESELECTED}" ]; then
+            echo "::error::db deselected count grew from ${EXPECTED_DB_DESELECTED} to ${actual}: new tests need a live Postgres and will never run in CI. Mock the connection or bump EXPECTED_DB_DESELECTED deliberately."
             exit 1
           fi
 

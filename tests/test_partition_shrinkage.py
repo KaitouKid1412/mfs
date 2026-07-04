@@ -122,6 +122,7 @@ def _setup_holdings(monkeypatch, tmp_path, n_incoming: int, existing: int):
     return conn, written
 
 
+@pytest.mark.db
 def test_holdings_10_to_7_refused_db_untouched(tmp_path, monkeypatch):
     conn, written = _setup_holdings(monkeypatch, tmp_path, n_incoming=7, existing=10)
     with pytest.raises(IngestError, match="partition shrinkage"):
@@ -130,6 +131,7 @@ def test_holdings_10_to_7_refused_db_untouched(tmp_path, monkeypatch):
     assert written == []
 
 
+@pytest.mark.db
 def test_holdings_10_to_10_proceeds(tmp_path, monkeypatch):
     conn, written = _setup_holdings(monkeypatch, tmp_path, n_incoming=10, existing=10)
     res = holdings_run.run_for_amc("shrinkamc", ym="2026-05")
@@ -137,6 +139,7 @@ def test_holdings_10_to_10_proceeds(tmp_path, monkeypatch):
     assert res["rows_written"] == len(written[0])
 
 
+@pytest.mark.db
 def test_holdings_7_to_10_growth_proceeds(tmp_path, monkeypatch):
     conn, written = _setup_holdings(monkeypatch, tmp_path, n_incoming=10, existing=7)
     holdings_run.run_for_amc("shrinkamc", ym="2026-05")

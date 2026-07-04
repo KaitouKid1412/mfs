@@ -78,4 +78,5 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
   "local_data: test depends on gitignored artifacts under data/raw (auto-applied by tests/conftest.py; deselected in CI via -m 'not local_data')",
+  "db: test needs a live PostgreSQL connection (CI has no Postgres; deselected via -m 'not db'). Run locally with a real DB.",
 ]
