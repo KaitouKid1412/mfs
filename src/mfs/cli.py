@@ -502,10 +502,12 @@ def rank_cmd(
 def rank_deep_cmd(
     as_of: str | None = typer.Option(None, help="YYYY-MM-DD; default = latest computed"),
     pool_size: int = typer.Option(
-        20, help="Top-N per category considered for Stage 2 (default 20)."
+        0, help="Top-N per category considered for Stage 2. 0 = all funds "
+        "(default). Pass e.g. 20 for the classic top-20 pool."
     ),
     final_size: int = typer.Option(
-        5, help="Top-N per category in Stage 2 survivors output (default 5)."
+        0, help="Top-N per category in Stage 2 survivors output. 0 = all funds "
+        "(default). Pass e.g. 5 for the classic top-5 output."
     ),
     overlap_threshold: float = typer.Option(
         30.0,
@@ -534,8 +536,8 @@ def rank_deep_cmd(
     d = _parse_date(as_of)
     result = shortlist.rank_deep(
         as_of=d,
-        pool_size=pool_size,
-        final_size=final_size,
+        pool_size=pool_size or None,   # 0 (CLI sentinel) → None = all funds
+        final_size=final_size or None,
         overlap_threshold_pct=overlap_threshold,
         skip_phase2_compute=skip_phase2_compute,
     )

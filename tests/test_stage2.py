@@ -447,6 +447,19 @@ def test_no_partial_flag_when_survivors_fill_to_final_size():
     assert not any(survivors["partial_coverage_flag"].to_list())
 
 
+def test_pool_and_final_none_keep_every_fund():
+    """pool_size=None / final_size=None → the full-universe default: no fund is
+    trimmed and the 'thin cohort' partial flag never fires."""
+    rows = [_scored_row(f"S{i}", composite_score=0.9 - i * 0.01) for i in range(30)]
+    survivors, _, _ = apply_stage2(
+        _df(rows), aum_map={}, pool_size=None, final_size=None,
+    )
+    assert survivors.height == 30  # nothing dropped
+    assert not any(survivors["partial_coverage_flag"].to_list())
+    # stage2_rank is dense 1..N over the whole category.
+    assert sorted(survivors["stage2_rank"].to_list()) == list(range(1, 31))
+
+
 def test_aum_attached_from_aum_map():
     rows = [_scored_row("S_with_aum"), _scored_row("S_no_aum")]
     aum_map = {"S_with_aum": 1234.5}

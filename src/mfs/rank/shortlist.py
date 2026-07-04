@@ -463,9 +463,13 @@ def _emit_manifest(as_of: date, result: dict) -> None:
         log.warning("rank.manifest_failed", err=str(e))
 
 
-def _top_n_per_category(scored: pl.DataFrame, n: int) -> pl.DataFrame:
-    """Return the top-N rows per ``canonical_category`` from a scored frame."""
-    if scored.is_empty():
+def _top_n_per_category(scored: pl.DataFrame, n: int | None) -> pl.DataFrame:
+    """Return the top-N rows per ``canonical_category`` from a scored frame.
+
+    ``n=None`` means no cap — every fund proceeds (the full-universe Stage 2
+    default).
+    """
+    if scored.is_empty() or n is None:
         return scored
     return (
         scored.sort(
@@ -711,8 +715,8 @@ def build_rank_history(
 
 def rank_deep(
     as_of: date | None = None,
-    pool_size: int = 20,
-    final_size: int = 5,
+    pool_size: int | None = None,
+    final_size: int | None = None,
     overlap_threshold_pct: float = 30.0,
     *,
     skip_phase2_compute: bool = False,
@@ -721,8 +725,9 @@ def rank_deep(
 
     Stage 1: load computed_metrics, hard-filter, z-score, ``composite_score_stage1``,
     dedupe; write ``<as_of>/stage1/``.
-    Stage 2: take top ``pool_size`` per category from Stage 1, run Phase 2
-    compute on just those schemes (unless ``skip_phase2_compute=True``), carry
+    Stage 2: take top ``pool_size`` per category from Stage 1 (``pool_size=None``
+    → every fund, the default), run Phase 2 compute on just those schemes
+    (unless ``skip_phase2_compute=True``), carry
     Stage 1's full-universe z-scores, z-score the Phase 2 metrics within each
     pool and re-composite with Stage 2 weights (D3: disclosure nulls are
     flagged + penalized, never dropped); write ``<as_of>/stage2/``.

@@ -6,9 +6,11 @@ picks: TER / AUM / PTR / active-share / flags) outputs from
 ``data/output/shortlist/<as_of>/`` and emits a single
 ``dashboard.html`` — no server, no CDN, no build step. Open it in any browser.
 
-The page has two views (Top Picks = Stage 2, Full Ranking = Stage 1), a
-category selector, a free-text filter, and click-to-sort columns (numeric-aware,
-nulls last). All numbers are formatted to their real units. Honesty banners
+The page has two tabs: "Ranking" (the full universe with the combined Stage-1 +
+Stage-2 metric set — TER/AUM/PTR/Active-Share — ordered by the Stage-2
+composite) and "Active vs Index". Plus a category selector, a free-text filter,
+and click-to-sort columns (numeric-aware, nulls last). All numbers are formatted
+to their real units. Honesty banners
 carry the C1 backtest caveat (weights not validated as forward-predictive) and
 the dormant-active-share note so the page can never overstate the ranking.
 
@@ -104,6 +106,7 @@ STAGE2_COLS = [
     ("max_dd_3y_pct", "Max DD 3y", "pctraw"),
     ("ptr_latest", "PTR", "pct"),
     ("active_share_median_1y", "Active Share", "pct"),
+    ("data_quality_flag", "Quality", "text"),
     ("flags", "Flags", "flags"),
 ]
 
@@ -140,6 +143,7 @@ AVI_COLS = [
     ("beat_3y", "% beat (3y)", "pctraw"),
     ("beat_5y", "% beat (5y)", "pctraw"),
     ("excess_3y", "Median excess (3y)", "pct"),
+    ("excess_5y", "Median excess (5y)", "pct"),
     ("verdict", "Active vs Index", "verdict"),
 ]
 
@@ -182,7 +186,8 @@ TIPS = {
     "beat_3y": "Share of the category's funds whose 3-year return beat the index. ~50% = a coin flip.",
     "beat_5y": "Share of funds whose 5-year return beat the index.",
     "excess_3y": "Median fund's 3-year CAGR minus the index.",
-    "verdict": "Rough active-vs-index call from the hit-rate + dispersion. Survivorship-biased (failed funds excluded), so reality is a bit worse for active; hybrids use a synthetic benchmark.",
+    "excess_5y": "Median fund's 5-year CAGR minus the index. Survivorship-biased — dead/merged funds are excluded, so the surviving median is flattered (read as an optimistic upper bound).",
+    "verdict": "Active-vs-index call synthesizing ALL columns: % of funds beating the index (breadth) + median excess CAGR (magnitude), across BOTH 3y and 5y. 'mixed' = the two horizons disagree; '· wide spread' = the best-vs-worst fund gap is large, so picking the right fund matters more than the active/index call. Survivorship-biased (failed funds excluded → optimistic for active); hybrids use a synthetic benchmark and get no call.",
 }
 
 # One-line, plain-English description of each fund category (shown on hover —
@@ -357,21 +362,64 @@ def _load_top5_persistence() -> dict:
     return out
 
 
-def _verdict(beat3, n3: int, synthetic: bool) -> tuple[str, str]:
-    """Active-vs-index call from the 3y hit-rate + sample/quality, with a css class."""
+def _horizon_strength(beat, excess):
+    """One window's active-vs-index strength in [-1, 1], blending BREADTH (share
+    of funds beating the index) with MAGNITUDE (median fund excess CAGR). 50%
+    beat / 0% excess = neutral (0.0). ``excess`` is a fraction (0.06 = +6pp).
+    Returns None when either input is missing."""
+    if beat is None or excess is None:
+        return None
+    breadth = math.tanh((beat - 50.0) / 15.0)        # ±15pp of hit-rate ≈ ±0.76
+    magnitude = math.tanh((excess * 100.0) / 1.5)    # ±1.5pp of excess ≈ ±0.76
+    return 0.5 * breadth + 0.5 * magnitude
+
+
+def _avi_score(beat3, beat5, excess3, excess5):
+    """Blended active strength across both horizons (mean of the available
+    windows) — drives both the verdict and the tab's sort order."""
+    parts = [h for h in (_horizon_strength(beat3, excess3),
+                         _horizon_strength(beat5, excess5)) if h is not None]
+    return sum(parts) / len(parts) if parts else None
+
+
+def _verdict(beat3, beat5, excess3, excess5, spread3, n3: int,
+             synthetic: bool) -> tuple[str, str]:
+    """Exhaustive active-vs-index call. Synthesizes ALL the row's signals:
+    breadth (% beat) + magnitude (median excess) over BOTH the 3y and 5y
+    windows, an explicit 'mixed' verdict when the two horizons disagree in
+    direction, and a 'wide spread' tag when p25→p75 dispersion is large enough
+    that picking the right fund matters more than the active/index call.
+    Gated by sample size and benchmark quality. NB: 5y inputs are
+    survivorship-biased (optimistic for active)."""
     if synthetic:
         return ("n/a — synthetic benchmark", "mut")
     if n3 < 8:
         return ("too few funds", "mut")
-    if beat3 is None:
+    h3 = _horizon_strength(beat3, excess3)
+    h5 = _horizon_strength(beat5, excess5)
+    if h3 is None and h5 is None:
         return ("—", "mut")
-    if beat3 >= 75:
-        return ("active edge", "pos")
-    if beat3 >= 60:
-        return ("lean active", "pos")
-    if beat3 >= 45:
-        return ("coin-flip → index", "wk")
-    return ("index wins", "neg")
+    score = _avi_score(beat3, beat5, excess3, excess5)
+
+    # Selection-matters tag: wide p25→p75 spread means the gap between the best
+    # and worst funds dwarfs the active-vs-index gap — choose the fund carefully.
+    tag = " · wide spread" if (spread3 is not None and spread3 >= 0.04) else ""
+
+    # Horizons disagree in direction AND both are non-trivial → say so explicitly
+    # rather than letting the blend average them into a misleading single call.
+    if h3 is not None and h5 is not None and h3 * h5 < 0 \
+            and min(abs(h3), abs(h5)) >= 0.30:
+        recent = "active" if h3 > 0 else "index"
+        longrun = "active" if h5 > 0 else "index"
+        return (f"mixed — {recent} 3y / {longrun} 5y{tag}", "wk")
+
+    if score >= 0.60:
+        return ("active edge" + tag, "pos")
+    if score >= 0.20:
+        return ("lean active" + tag, "pos")
+    if score > -0.20:
+        return ("toss-up" + tag, "wk")
+    return ("index wins" + tag, "neg")
 
 
 def _load_active_vs_index(as_of: str) -> list[dict]:
@@ -407,17 +455,23 @@ def _load_active_vs_index(as_of: str) -> list[dict]:
             beat3 = round(float((r3 > b3).sum()) / r3.len() * 100.0)
             r5 = g["ret_5y_median"].drop_nulls()
             beat5 = round(float((r5 > b5).sum()) / r5.len() * 100.0) if (b5 is not None and r5.len()) else None
+            # Median fund 5y CAGR minus the index — same basis as excess_3y.
+            excess5 = (float(r5.median()) - b5) if (b5 is not None and r5.len()) else None
             syn = bool(b["benchmark_is_synthetic"])
-            vt, vc = _verdict(beat3, r3.len(), syn)
+            excess3 = p50 - b3
+            vt, vc = _verdict(beat3, beat5, excess3, excess5, p75 - p25, r3.len(), syn)
             out.append({
                 "canonical_category": cat, "n3": r3.len(),
                 "idx_3y": b3, "fund_med_3y": p50,
                 "p25_3y": p25, "p75_3y": p75, "spread_3y": p75 - p25,
                 "beat_3y": beat3, "beat_5y": beat5,
-                "excess_3y": p50 - b3, "verdict": vt, "verdict_c": vc,
+                "excess_3y": excess3, "excess_5y": excess5,
+                "verdict": vt, "verdict_c": vc,
                 "synthetic": syn,
+                # Hidden: blended active strength, used only for sort ordering.
+                "_avi_score": (-9.0 if syn else (_avi_score(beat3, beat5, excess3, excess5) or -9.0)),
             })
-        out.sort(key=lambda r: (r["beat_3y"] if r["beat_3y"] is not None else -1), reverse=True)
+        out.sort(key=lambda r: r["_avi_score"], reverse=True)
         return out
     except Exception:  # noqa: BLE001 — tab is best-effort; degrade to hidden
         return []
@@ -454,6 +508,17 @@ def collect(as_of: str) -> dict:
             c = cat[0]
             cats.add(c)
             stage2[c] = _rows(g.sort("stage2_rank"), STAGE2_COLS, with_flags=True, persist=persist)
+
+    # The Ranking tab renders the combined (Stage-2) view. With the full-universe
+    # default every category is enriched; this is a safety net for a stale run
+    # made with an explicit top-N — fall back to the Stage-1 rows (enrichment
+    # columns simply render as "—") so the tab is never blank.
+    for c in cats:
+        if not stage2.get(c) and stage1.get(c):
+            stage2[c] = _rows(
+                s1.filter(pl.col("canonical_category") == c).sort("rank"),
+                STAGE2_COLS, with_flags=True, persist=persist,
+            )
 
     cat_list = sorted(cats)
     counts = {c: {"s1": len(stage1.get(c, [])), "s2": len(stage2.get(c, []))}
@@ -562,7 +627,7 @@ _TEMPLATE = r"""<!doctype html>
   <div class="sub">Indian equity &amp; hybrid funds (Direct-Growth), ranked within each category — a quality shortlist, <b>not</b> a prediction. Click a heading to sort, type to filter. <a class="hlink" href="#help">How to read this &amp; how the Score works ↓</a></div>
   <div class="controls">
     <div class="toggle">
-      <button id="btnS1" class="on" onclick="setView('stage1')">Ranking</button>
+      <button id="btnS1" class="on" onclick="setView('stage2')">Ranking</button>
       <button id="btnAVI" onclick="setView('avi')">Active vs Index</button>
     </div>
     <select id="cat" onchange="render()"></select>
@@ -586,7 +651,7 @@ _TEMPLATE = r"""<!doctype html>
 </section>
 <script>
 const D = /*__DATA__*/;
-let view='stage1', sortKey='composite_score', sortDir=-1;  // open on all funds, sorted by score
+let view='stage2', sortKey='composite_score', sortDir=-1;  // open on all funds (combined metrics), sorted by score
 
 function colsFor(v){return v==='stage2'?D.stage2_cols:D.stage1_cols;}
 function dataFor(v){return v==='stage2'?D.stage2:D.stage1;}
@@ -623,7 +688,7 @@ function initCats(){
 }
 function setView(v){
   view=v; sortKey=(v==='avi')?'beat_3y':'composite_score'; sortDir=-1;
-  document.getElementById('btnS1').classList.toggle('on',v==='stage1');
+  document.getElementById('btnS1').classList.toggle('on',v==='stage2');
   document.getElementById('btnAVI').classList.toggle('on',v==='avi');
   if(v!=='avi'){
     const cur=document.getElementById('cat').value; initCats();
@@ -717,7 +782,7 @@ function render(){
     if(isnull) return `<td class="${(c.kind==='text')?'lft':''}">${miss(c.k)}</td>`;
     const [txt,cls,_n]=fmt(v,c.kind);
     let extra=cls; const lft=(c.kind==='text')?'lft':'';
-    if((c.k==='alpha_3y_annualized'||c.k==='excess_3y')&&typeof v==='number') extra=v>=0?'pos':'neg';
+    if((c.k==='alpha_3y_annualized'||c.k==='excess_3y'||c.k==='excess_5y')&&typeof v==='number') extra=v>=0?'pos':'neg';
     return `<td class="${lft} ${extra}">${txt}</td>`;
   }).join('')+'</tr>').join('');
   document.getElementById('empty').style.display = rows.length?'none':'block';
@@ -780,7 +845,7 @@ def main(argv=None) -> int:
     html = render(payload).replace("__TITLE__", as_of)
     out = SHORTLIST_ROOT / as_of / "dashboard.html"
     out.write_text(html, encoding="utf-8")
-    print(f"dashboard: {out}  ({payload['n_s2']} top picks, {payload['n_s1']} ranked funds, "
+    print(f"dashboard: {out}  ({payload['n_s2']} funds enriched, {payload['n_s1']} ranked funds, "
           f"{len(payload['categories'])} categories, {out.stat().st_size//1024} KB)")
     if args.open:
         webbrowser.open(out.resolve().as_uri())

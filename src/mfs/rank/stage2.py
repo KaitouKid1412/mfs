@@ -118,8 +118,8 @@ def _attach_latest_ter(df: pl.DataFrame, ter_map: dict[str, float]) -> pl.DataFr
 def apply_stage2(
     scored: pl.DataFrame,
     aum_map: dict[str, float],
-    pool_size: int = DEFAULT_POOL_SIZE,
-    final_size: int = DEFAULT_FINAL_SIZE,
+    pool_size: int | None = DEFAULT_POOL_SIZE,
+    final_size: int | None = DEFAULT_FINAL_SIZE,
     ter_map: dict[str, float] | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Pure function: pass Stage 1's scored frame, return (survivors,
@@ -154,14 +154,13 @@ def apply_stage2(
         # Tag with Stage 1 rank within the pool. A2-11 determinism:
         # (composite desc, scheme_code asc) so tied composites don't inherit
         # arbitrary row order.
-        pool = (
-            grp.sort(
-                ["composite_score_stage1", "scheme_code"],
-                descending=[True, False], nulls_last=True,
-            )
-            .head(pool_size)
-            .with_row_index("stage1_rank", offset=1)
+        pool = grp.sort(
+            ["composite_score_stage1", "scheme_code"],
+            descending=[True, False], nulls_last=True,
         )
+        if pool_size is not None:  # None → every fund proceeds (full-universe)
+            pool = pool.head(pool_size)
+        pool = pool.with_row_index("stage1_rank", offset=1)
         # D3: every pool fund proceeds. Missing disclosures are flagged
         # (regardless of pool liveness) and soft-penalized in the composite.
         miss_lists: list[list[str]] = [
@@ -213,15 +212,15 @@ def apply_stage2(
         # backstop. ter_pct is null when TER is unmatched/absent and sorts last
         # within a tie group, so an all-null ter_pct reproduces the prior
         # (composite, scheme_code) order exactly.
-        cat_survivors = (
-            re_scored.sort(
-                ["composite_score", "ter_pct", "scheme_code"],
-                descending=[True, False, False], nulls_last=True,
-            )
-            .head(final_size)
-            .with_row_index("stage2_rank", offset=1)
+        cat_survivors = re_scored.sort(
+            ["composite_score", "ter_pct", "scheme_code"],
+            descending=[True, False, False], nulls_last=True,
         )
-        partial = cat_survivors.height < final_size
+        if final_size is not None:  # None → keep every re-scored fund
+            cat_survivors = cat_survivors.head(final_size)
+        cat_survivors = cat_survivors.with_row_index("stage2_rank", offset=1)
+        # 'thin cohort' is meaningless when we deliberately keep every fund.
+        partial = final_size is not None and cat_survivors.height < final_size
         n_survived = int(cat_survivors.height)
         cat_survivors = cat_survivors.with_columns(
             pl.lit(partial).alias("partial_coverage_flag"),
@@ -273,8 +272,8 @@ def run(
     scored: pl.DataFrame,
     aum_map: dict[str, float],
     output_dir: Path,
-    pool_size: int = DEFAULT_POOL_SIZE,
-    final_size: int = DEFAULT_FINAL_SIZE,
+    pool_size: int | None = DEFAULT_POOL_SIZE,
+    final_size: int | None = DEFAULT_FINAL_SIZE,
     ter_map: dict[str, float] | None = None,
 ) -> dict:
     """End-to-end Stage 2: re-rank + write artifacts.

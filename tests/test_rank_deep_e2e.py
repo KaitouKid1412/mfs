@@ -218,7 +218,13 @@ def harness(monkeypatch, tmp_path):
     def run(name: str = "run") -> tuple[dict, Path]:
         base = tmp_path / name
         monkeypatch.setattr(paths_mod, "shortlist_dir", lambda s: base / s)
-        result = shortlist.rank_deep(as_of=AS_OF, skip_phase2_compute=True)
+        # Pin the classic top-20 pool / top-5 output: this regression lock
+        # validates the trim + final_size-cut behavior. (The full-universe
+        # default — pool_size/final_size=None — is covered by test_stage2.py's
+        # test_pool_and_final_none_keep_every_fund.)
+        result = shortlist.rank_deep(
+            as_of=AS_OF, pool_size=20, final_size=5, skip_phase2_compute=True,
+        )
         return result, base / AS_OF.isoformat()
 
     return run, captured
